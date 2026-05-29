@@ -1,7 +1,7 @@
 use crate::native_engine::anthropic_client::{AnthropicClient, AnthropicContent, AnthropicMessage};
 use crate::native_engine::openai_client::{OpenAIClient, OpenAIContent, OpenAIMessage};
 use crate::native_engine::provider_manager::{ApiFormat, ResolvedProvider};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;

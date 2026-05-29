@@ -1,21 +1,31 @@
 use crate::clipboard::ClipboardManager;
 use crate::config::{AppConfig, ConfigManager};
 use crate::db::DbManager;
-use crate::engine::{EnginePool, EngineState};
-use crate::fs::FileOperations;
+use crate::engine::{EnginePool};
 use crate::git::GitIntegration;
 use crate::logger::Logger;
-use crate::mcp::{McpServerManager, McpServerConfig, McpServerStatus, McpResource, McpResourceContent};
+
+macro_rules! log_to_file {
+    ($($arg:tt)*) => {
+        let msg = format!($($arg)*);
+        let log_path = std::env::current_dir().unwrap_or_default().join("chat_debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] {}", chrono::Utc::now().format("%H:%M:%S%.3f"), msg);
+        }
+    };
+}
+
+use crate::mcp::{McpServerManager, McpServerConfig};
 use crate::native_engine::{NativeEngine, ProviderManager};
 use crate::notification::NotificationManager;
 use crate::permissions::{AuditLogger, PermissionManager, PermissionMode};
 use crate::process::ProcessManager;
-use crate::prompt::{build_self_hosted_system_prompt, resolve_requested_model_for_mode};
 use crate::research::{ResearchEvent, ResearchOrchestrator, ResearchRequest};
-use crate::multiagent::{MultiAgentOrchestrator as PipelineOrchestrator, OrchestratorConfig, OrchestratorEvent};
+use crate::multiagent::{MultiAgentOrchestrator as PipelineOrchestrator, OrchestratorConfig};
 use crate::orchestration::{MultiAgentOrchestrator, OrchestratorConfigFile};
 use crate::skills::{Skill, SkillsManager, SkillExecutionContext};
-use crate::streaming::{StreamEvent, StreamManager};
+use crate::streaming::{StreamManager};
 use crate::task::{TaskExecutor, TaskRequest, TaskResult};
 use crate::terminal::PtyManager;
 use crate::updater::AutoUpdater;
@@ -28,14 +38,13 @@ use axum::{
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
-use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast};
-use tower_http::cors::{Any, CorsLayer, AllowOrigin};
+use tower_http::cors::{CorsLayer, AllowOrigin};
 use axum::response::IntoResponse;
 use axum::http::header::{HeaderName, ORIGIN, CONTENT_TYPE, AUTHORIZATION, ACCEPT};
 use axum::http::Method;
@@ -154,10 +163,10 @@ pub struct StreamQuery {
 
 impl BridgeServer {
     pub fn new(data_dir: PathBuf) -> Self {
-        let skills_dir = data_dir.join("skills");
+        let _skills_dir = data_dir.join("skills");
         let log_dir = data_dir.join("logs");
 
-        let mut skill_manager = SkillsManager::new();
+        let skill_manager = SkillsManager::new();
         if let Err(e) = skill_manager.install_bundled_skills() {
             eprintln!("[Bridge] Failed to install bundled skills: {}", e);
         }
@@ -271,9 +280,11 @@ impl BridgeServer {
             "http://localhost:1420".parse::<axum::http::HeaderValue>().unwrap(),
             "http://localhost:3456".parse::<axum::http::HeaderValue>().unwrap(),
             "http://localhost:5173".parse::<axum::http::HeaderValue>().unwrap(),
+            "http://localhost:5175".parse::<axum::http::HeaderValue>().unwrap(),
             "http://127.0.0.1:1420".parse::<axum::http::HeaderValue>().unwrap(),
             "http://127.0.0.1:3456".parse::<axum::http::HeaderValue>().unwrap(),
             "http://127.0.0.1:5173".parse::<axum::http::HeaderValue>().unwrap(),
+            "http://127.0.0.1:5175".parse::<axum::http::HeaderValue>().unwrap(),
             "null".parse::<axum::http::HeaderValue>().unwrap(),
         ];
 
@@ -404,6 +415,10 @@ impl BridgeServer {
             .route("/api/analytics/summary", get(analytics_summary))
             .route("/api/analytics/event-counts", get(analytics_event_counts))
             .route("/api/analytics/recent-events", get(analytics_recent_events))
+            .route("/api/memories", get(memories_list))
+            .route("/api/memories/search", get(memories_search))
+            .route("/api/memories/stats", get(memories_stats))
+            .route("/api/memories/{id}", delete(memories_delete))
             .layer(cors)
             .with_state(state);
 
@@ -480,7 +495,8 @@ async fn chat_handler(
     let model = req.model.clone();
     let messages = req.get_messages();
 
-    println!("[Chat] Received request: conv_id={}, model={}, messages={}", conv_id, model, messages.len());
+    log_to_file!("[Chat] Received request: conv_id={}, model={}, messages={}", conv_id, model, messages.len());
+    std::io::Write::flush(&mut std::io::stdout()).ok();
 
     // Research mode: route to research pipeline
     if req.research_mode == Some(true) {
@@ -532,7 +548,20 @@ async fn chat_handler(
                     if done { break; }
                 }
             }
-            if !report.is_empty() { let db = db; let cid = cid; tokio::task::spawn_blocking(move || { db.with_conn(|conn| { let mid = uuid::Uuid::new_v4().to_string(); let now = chrono::Utc::now().to_rfc3339(); let so = crate::db::message_repo::get_messages_by_conversation(conn, &cid).unwrap_or_default().len() as i64; let _ = crate::db::message_repo::insert_message(conn, &mid, &cid, "assistant", &report, None, &now, false, so); let _ = crate::db::conversation_repo::increment_message_count(conn, &cid); }); }).await.ok(); }
+            if !report.is_empty() {
+                let db = db;
+                let cid = cid;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = db.with_conn(|conn| {
+                        let mid = uuid::Uuid::new_v4().to_string();
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let so = crate::db::message_repo::get_messages_by_conversation(conn, &cid).unwrap_or_default().len() as i64;
+                        let _ = crate::db::message_repo::insert_message(conn, &mid, &cid, "assistant", &report, None, &now, false, so);
+                        let _ = crate::db::conversation_repo::increment_message_count(conn, &cid);
+                        Ok::<(), rusqlite::Error>(())
+                    });
+                }).await;
+            }
         };
         let mut resp = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
         resp.headers_mut().insert(CONTENT_TYPE, "text/event-stream; charset=utf-8".parse().unwrap());
@@ -585,7 +614,7 @@ async fn chat_handler(
             if let Some(pm) = &req.permission_mode {
                 let mode = crate::permissions::PermissionMode::from_str(pm);
                 engine.set_permission_mode(mode).await;
-                println!("[Chat] Permission mode set to: {}", pm);
+                log_to_file!("[Chat] Permission mode set to: {}", pm);
             }
 
             let chat_req = crate::native_engine::engine_core::ChatRequest {
@@ -599,6 +628,7 @@ async fn chat_handler(
                 top_p: None,
                 web_search_enabled: req.web_search_enabled,
             };
+                    log_to_file!("[Chat] Calling send_message...");
             match engine.send_message(chat_req).await {
                 Ok(rx) => Some(rx),
                 Err(e) => {
@@ -612,6 +642,7 @@ async fn chat_handler(
         }
     };
 
+    log_to_file!("[Chat] Creating SSE stream...");
     let stream = async_stream::stream! {
         let mut rx = match rx_opt {
             Some(rx) => rx,
@@ -645,7 +676,7 @@ async fn chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::ToolUseStart { tool_use_id, tool_name, tool_input, text_before } => {
-                    println!("[Chat] Tool use started: {} ({})", tool_name, tool_use_id);
+                    log_to_file!("[Chat] Tool use started: {} ({})", tool_name, tool_use_id);
                     Some(serde_json::json!({
                         "type": "tool_use_start",
                         "tool_use_id": tool_use_id,
@@ -662,7 +693,7 @@ async fn chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::ToolUseDone { tool_use_id, tool_name, tool_input, output, is_error } => {
-                    println!("[Chat] Tool use completed: {} ({}) is_error={}", tool_name, tool_use_id, is_error);
+                    log_to_file!("[Chat] Tool use completed: {} ({}) is_error={}", tool_name, tool_use_id, is_error);
                     Some(serde_json::json!({
                         "type": "tool_use_done",
                         "tool_use_id": tool_use_id,
@@ -725,7 +756,7 @@ async fn chat_handler(
             }
         }
 
-        println!("[Chat] Stream ended for conv_id={}", conv_id);
+        log_to_file!("[Chat] Stream ended for conv_id={}", conv_id);
     };
 
     let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
@@ -783,7 +814,7 @@ async fn tools_handler(
 }
 
 async fn tool_execute_handler(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Json(req): Json<ToolRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let cwd = req.cwd.clone().unwrap_or_else(|| ".".to_string());
@@ -876,7 +907,7 @@ struct CompactRequest {
 async fn compact_handler(
     Path(id): Path<String>,
     State(state): State<AppState>,
-    Json(req): Json<CompactRequest>,
+    Json(_req): Json<CompactRequest>,
 ) -> Json<serde_json::Value> {
     let db = state.6.clone();
     
@@ -944,6 +975,9 @@ async fn context_size_handler(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
+    let log_path = std::path::PathBuf::from("F:/Projects/claude-code-rust/mcp_debug.log");
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+        .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] Called for conversation: {}", id) });
     let db = state.6.clone();
     
     let result = tokio::task::spawn_blocking(move || {
@@ -983,12 +1017,26 @@ async fn context_size_handler(
     }).await;
     
     match result {
-        Ok(Ok(Ok(data))) => Json(data),
-        _ => Json(serde_json::json!({
-            "tokens": 0,
-            "limit": 32768,
-            "error": "Failed to calculate context size"
-        })),
+        Ok(Ok(Ok(data))) => {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] Success: {}", data) });
+            Json(data)
+        },
+        Err(e) => {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] spawn_blocking error: {}", e) });
+            Json(serde_json::json!({"tokens": 0, "limit": 200000, "error": format!("spawn error: {}", e)}))
+        },
+        Ok(Err(e)) => {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] with_conn error: {}", e) });
+            Json(serde_json::json!({"tokens": 0, "limit": 200000, "error": format!("conn error: {}", e)}))
+        },
+        Ok(Ok(Err(e))) => {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] query error: {}", e) });
+            Json(serde_json::json!({"tokens": 0, "limit": 200000, "error": format!("query error: {}", e)}))
+        },
     }
 }
 #[derive(Deserialize)]
@@ -1272,7 +1320,7 @@ static UPLOAD_DIR: once_cell::sync::Lazy<std::sync::Mutex<Option<PathBuf>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 
 fn get_upload_dir() -> PathBuf {
-    let guard = UPLOAD_DIR.lock().unwrap();
+    let guard = UPLOAD_DIR.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = guard.as_ref() {
         return dir.clone();
     }
@@ -1281,7 +1329,7 @@ fn get_upload_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
         .join("claude-desktop")
         .join("uploads");
-    let mut guard = UPLOAD_DIR.lock().unwrap();
+    let mut guard = UPLOAD_DIR.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(default_dir.clone());
     default_dir
 }
@@ -1292,8 +1340,6 @@ async fn upload_handler(mut multipart: Multipart) -> Result<Json<serde_json::Val
         eprintln!("[Upload] Failed to create upload dir: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    let mut field_data: Option<(String, Vec<u8>)> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         eprintln!("[Upload] Multipart error: {}", e);
@@ -1308,8 +1354,6 @@ async fn upload_handler(mut multipart: Multipart) -> Result<Json<serde_json::Val
                 .unwrap_or("application/octet-stream")
                 .to_string();
             let data = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
-
-            field_data = Some((file_name.clone(), data.to_vec()));
 
             let file_size = data.len();
             let file_id = uuid::Uuid::new_v4().to_string();
@@ -1514,6 +1558,7 @@ async fn providers_create(State(state): State<AppState>, Json(req): Json<CreateP
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct UpdateProviderRequest {
     name: Option<String>,
     base_url: Option<String>,
@@ -1680,6 +1725,7 @@ async fn providers_test_websearch(Path(id): Path<String>, State(state): State<Ap
     Json(serde_json::json!({ "ok": false, "reason": "Provider not found" }))
 }
 
+#[allow(dead_code)]
 async fn sync_provider_manager(state: &AppState) {
     let config_manager = state.4.clone();
     let native_engine = state.14.clone();
@@ -2024,7 +2070,7 @@ async fn mcp_tools_list(Path(name): Path<String>, State(state): State<AppState>)
     Ok(Json(serde_json::json!({ "tools": tools_json })))
 }
 
-async fn mcp_resources_list(Path(name): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn mcp_resources_list(Path(_name): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
     let mcp_server_manager = state.1.clone();
     let resources: Vec<crate::mcp::McpResource> = mcp_server_manager.get_all_resources().await;
 
@@ -2493,7 +2539,7 @@ async fn computer_use_screenshot() -> Json<serde_json::Value> {
     }
 }
 
-async fn git_status_handler(State(state): State<AppState>, Query(query): Query<GitRequest>) -> Json<serde_json::Value> {
+async fn git_status_handler(State(_state): State<AppState>, Query(query): Query<GitRequest>) -> Json<serde_json::Value> {
     let git = GitIntegration::with_cwd(query.cwd);
     match git.get_status() {
         Ok(status) => Json(serde_json::json!({ "status": status })),
@@ -2501,7 +2547,7 @@ async fn git_status_handler(State(state): State<AppState>, Query(query): Query<G
     }
 }
 
-async fn git_log_handler(State(state): State<AppState>, Query(query): Query<GitRequest>) -> Json<serde_json::Value> {
+async fn git_log_handler(State(_state): State<AppState>, Query(query): Query<GitRequest>) -> Json<serde_json::Value> {
     let git = GitIntegration::with_cwd(query.cwd);
     match git.get_commits(Some(10), None) {
         Ok(commits) => Json(serde_json::json!({ "commits": commits })),
@@ -2509,7 +2555,7 @@ async fn git_log_handler(State(state): State<AppState>, Query(query): Query<GitR
     }
 }
 
-async fn git_diff_handler(State(state): State<AppState>, Query(query): Query<GitRequest>) -> Json<serde_json::Value> {
+async fn git_diff_handler(State(_state): State<AppState>, Query(query): Query<GitRequest>) -> Json<serde_json::Value> {
     let git = GitIntegration::with_cwd(query.cwd);
     match git.get_file_diff(query.file.as_deref()) {
         Ok(diff) => Json(serde_json::json!({ "diff": diff })),
@@ -2517,7 +2563,7 @@ async fn git_diff_handler(State(state): State<AppState>, Query(query): Query<Git
     }
 }
 
-async fn git_commit_handler(State(state): State<AppState>, Json(req): Json<GitRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn git_commit_handler(State(_state): State<AppState>, Json(req): Json<GitRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let git = GitIntegration::with_cwd(req.cwd);
     let message = req.message.ok_or_else(|| StatusCode::BAD_REQUEST)?;
 
@@ -2527,7 +2573,7 @@ async fn git_commit_handler(State(state): State<AppState>, Json(req): Json<GitRe
     }
 }
 
-async fn git_push_handler(State(state): State<AppState>, Json(req): Json<GitRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn git_push_handler(State(_state): State<AppState>, Json(req): Json<GitRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let git = GitIntegration::with_cwd(req.cwd);
     match git.push(req.remote.as_deref(), req.branch.as_deref(), req.force.unwrap_or(false)) {
         Ok(output) => Ok(Json(serde_json::json!({ "ok": true, "output": output }))),
@@ -2535,7 +2581,7 @@ async fn git_push_handler(State(state): State<AppState>, Json(req): Json<GitRequ
     }
 }
 
-async fn git_pull_handler(State(state): State<AppState>, Json(req): Json<GitRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
+async fn git_pull_handler(State(_state): State<AppState>, Json(req): Json<GitRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let git = GitIntegration::with_cwd(req.cwd);
     match git.pull(req.remote.as_deref(), req.branch.as_deref()) {
         Ok(output) => Ok(Json(serde_json::json!({ "ok": true, "output": output }))),
@@ -3220,3 +3266,109 @@ async fn workflow_config_set(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+// === Memory Handlers ===
+async fn memories_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let memories = crate::db::memory_repo::list_all_memories(conn, 200)
+                .unwrap_or_default()
+                .iter()
+                .map(|m| serde_json::json!({
+                    "id": m.id,
+                    "workspace_path": m.workspace_path,
+                    "memory_type": m.memory_type,
+                    "content": m.summary,
+                    "importance": m.importance,
+                    "created_at": m.created_at,
+                    "tags": m.tags,
+                    
+                }))
+                .collect::<Vec<_>>();
+            Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({"memories": memories}))
+        })
+    }).await;
+    match result {
+        Ok(Ok(Ok(data))) => Json(data),
+        _ => Json(serde_json::json!({"memories": [], "error": "Failed to load memories"})),
+    }
+}
+
+async fn memories_search(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let query = params.get("q").cloned().unwrap_or_default();
+    let workspace = params.get("workspace").cloned().unwrap_or_default();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let memories = if query.is_empty() {
+                crate::db::memory_repo::list_all_memories(conn, 100).unwrap_or_default()
+            } else {
+                crate::db::memory_repo::search_all_memories(conn, &query, 100).unwrap_or_default()
+            };
+            let items: Vec<_> = memories.iter()
+                .filter(|m| workspace.is_empty() || m.workspace_path.contains(&workspace))
+                .map(|m| serde_json::json!({
+                    "id": m.id,
+                    "workspace_path": m.workspace_path,
+                    "memory_type": m.memory_type,
+                    "content": m.summary,
+                    "importance": m.importance,
+                    "created_at": m.created_at,
+                }))
+                .collect();
+            Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({"memories": items}))
+        })
+    }).await;
+    match result {
+        Ok(Ok(Ok(data))) => Json(data),
+        _ => Json(serde_json::json!({"memories": []})),
+    }
+}
+
+async fn memories_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let all = crate::db::memory_repo::list_all_memories(conn, 1000).unwrap_or_default();
+            let total = all.len() as i64;
+            let mut by_type: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            let mut by_importance: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
+            for m in &all {
+                *by_type.entry(m.memory_type.clone()).or_insert(0) += 1;
+                *by_importance.entry(m.importance).or_insert(0) += 1;
+            }
+            let by_type_vec: Vec<_> = by_type.into_iter().collect();
+            let by_imp_vec: Vec<_> = by_importance.into_iter().collect();
+            Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({
+                "total": total,
+                "by_type": by_type_vec,
+                "by_importance": by_imp_vec,
+            }))
+        })
+    }).await;
+    match result {
+        Ok(Ok(Ok(data))) => Json(data),
+        _ => Json(serde_json::json!({"total": 0, "by_type": [], "by_importance": []})),
+    }
+}
+
+async fn memories_delete(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }).await;
+    match result {
+        Ok(Ok(Ok(()))) => Json(serde_json::json!({"ok": true})),
+        _ => Json(serde_json::json!({"ok": false})),
+    }
+}

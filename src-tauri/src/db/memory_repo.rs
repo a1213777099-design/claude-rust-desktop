@@ -212,7 +212,7 @@ pub fn build_smart_summary(messages: &[crate::db::message_repo::MessageRow]) -> 
     let has_decisions = full_text.contains("Decisions:") || full_text.contains("决定") || full_text.contains("改成");
     let has_preferences = full_text.contains("Preferences:") || full_text.contains("喜欢") || full_text.contains("偏好") || full_text.contains("不要");
 
-    let memory_type = if has_decisions && has_preferences {
+    let _memory_type = if has_decisions && has_preferences {
         "decision"
     } else if has_decisions {
         "decision"

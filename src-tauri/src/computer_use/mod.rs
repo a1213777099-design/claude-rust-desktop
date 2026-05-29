@@ -118,11 +118,11 @@ impl ComputerUseManager {
     }
 
     pub fn get_mouse_position(&self) -> ScreenCoordinate {
-        self.current_position.lock().unwrap().clone()
+        self.current_position.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn get_action_history(&self, limit: Option<usize>) -> Vec<ComputerActionResult> {
-        let history = self.action_history.lock().unwrap();
+        let history = self.action_history.lock().unwrap_or_else(|e| e.into_inner());
         let limit = limit.unwrap_or(history.len());
         history.iter().rev().take(limit).cloned().collect()
     }
@@ -162,7 +162,7 @@ impl ComputerUseManager {
             duration_ms: duration.as_millis() as u64,
         };
 
-        self.action_history.lock().unwrap().push(action_result.clone());
+        self.action_history.lock().unwrap_or_else(|e| e.into_inner()).push(action_result.clone());
         Ok(action_result)
     }
 
@@ -197,7 +197,7 @@ impl ComputerUseManager {
                     if let Err(e) = self.real_mouse_move(coord.x, coord.y) {
                         tracing::warn!("Real mouse move failed, using simulated fallback: {}", e);
                     }
-                    let mut pos = self.current_position.lock().unwrap();
+                    let mut pos = self.current_position.lock().unwrap_or_else(|e| e.into_inner());
                     pos.x = coord.x;
                     pos.y = coord.y;
                 }
@@ -207,7 +207,7 @@ impl ComputerUseManager {
                     if let Err(e) = self.real_mouse_move(coord.x, coord.y) {
                         tracing::warn!("Real mouse move for click failed: {}", e);
                     }
-                    let mut pos = self.current_position.lock().unwrap();
+                    let mut pos = self.current_position.lock().unwrap_or_else(|e| e.into_inner());
                     pos.x = coord.x;
                     pos.y = coord.y;
                 }
@@ -221,7 +221,7 @@ impl ComputerUseManager {
                 if let Err(e) = self.real_mouse_down(button) {
                     tracing::warn!("Real mouse down failed: {}", e);
                 }
-                let mut buttons = self.pressed_buttons.lock().unwrap();
+                let mut buttons = self.pressed_buttons.lock().unwrap_or_else(|e| e.into_inner());
                 if !buttons.contains(button) {
                     buttons.push(button.clone());
                 }
@@ -232,7 +232,7 @@ impl ComputerUseManager {
                     tracing::warn!("Real mouse up failed: {}", e);
                 }
                 if let Some(button) = &action.button {
-                    let mut buttons = self.pressed_buttons.lock().unwrap();
+                    let mut buttons = self.pressed_buttons.lock().unwrap_or_else(|e| e.into_inner());
                     buttons.retain(|b| b != button);
                 }
             }
@@ -261,7 +261,7 @@ impl ComputerUseManager {
                     if let Err(e) = self.real_key_down(key) {
                         tracing::warn!("Real key down failed: {}", e);
                     }
-                    let mut keys = self.pressed_keys.lock().unwrap();
+                    let mut keys = self.pressed_keys.lock().unwrap_or_else(|e| e.into_inner());
                     if !keys.contains(key) {
                         keys.push(key.clone());
                     }
@@ -272,7 +272,7 @@ impl ComputerUseManager {
                     if let Err(e) = self.real_key_up(key) {
                         tracing::warn!("Real key up failed: {}", e);
                     }
-                    let mut keys = self.pressed_keys.lock().unwrap();
+                    let mut keys = self.pressed_keys.lock().unwrap_or_else(|e| e.into_inner());
                     keys.retain(|k| k != key);
                 }
             }

@@ -103,10 +103,6 @@ const TIER_DEFS: { key: 'opus' | 'sonnet' | 'haiku'; label: string; description:
 function loadChatModels(): ChatModel[] {
   try {
     const raw: ChatModel[] = JSON.parse(localStorage.getItem('chat_models') || '[]');
-    // Migrate legacy entries without a tier to 'extra' so they are visible and don't ghost-block tier dropdowns
-    let migrated = false;
-    for (const m of raw) { if (!m.tier) { m.tier = 'extra'; migrated = true; } }
-    if (migrated) localStorage.setItem('chat_models', JSON.stringify(raw));
     return raw;
   } catch { return []; }
 }
@@ -221,6 +217,28 @@ const ProviderSettings: React.FC = () => {
   const MODELS_PER_PAGE = 10;
   const [defaultModel, setDefaultModel] = useState(localStorage.getItem('default_model') || '');
   const [chatModels, setChatModels] = useState<ChatModel[]>(loadChatModels());
+  const [contextOverrides, setContextOverrides] = useState<Record<string, number>>(() => {
+    try { return JSON.parse(localStorage.getItem('model_context_overrides') || '{}'); } catch { return {}; }
+  });
+  const saveContextOverride = (tierKey: string, value: number) => {
+    const next = { ...contextOverrides, [tierKey]: value };
+    // Also save by assigned model name so MainContent can look it up
+    const assigned = chatModels.find(cm => cm.tier === tierKey);
+    if (assigned) next[assigned.id] = value;
+    setContextOverrides(next);
+    localStorage.setItem('model_context_overrides', JSON.stringify(next));
+    window.dispatchEvent(new Event('context-overrides-changed'));
+  };
+  const removeContextOverride = (tierKey: string) => {
+    const next = { ...contextOverrides };
+    delete next[tierKey];
+    // Also remove model-level override
+    const assigned = chatModels.find(cm => cm.tier === tierKey);
+    if (assigned) delete next[assigned.id];
+    setContextOverrides(next);
+    localStorage.setItem('model_context_overrides', JSON.stringify(next));
+    window.dispatchEvent(new Event('context-overrides-changed'));
+  };
 
   // Per-provider web-search probe state. Valid values: 'testing' | 'success' | 'failed'.
   // Absence means "never tested" (show as not supported).
@@ -392,8 +410,8 @@ const ProviderSettings: React.FC = () => {
   };
 
   const handleSetTierModel = (tier: 'opus' | 'sonnet' | 'haiku', uid: string) => {
-    // Remove any existing model in this tier
-    let updated = chatModels.filter(cm => cm.tier !== tier);
+    // Remove model from target tier AND remove the selected model from any other tier
+    let updated = chatModels.filter(cm => cm.tier !== tier && (!uid || modelUid(cm) !== uid));
     if (uid) {
       const src = allAvailableModels.find(m => modelUid(m) === uid);
       if (src) {
@@ -410,13 +428,6 @@ const ProviderSettings: React.FC = () => {
     }
   };
 
-  const handleAddExtraModel = (m: ChatModel) => {
-    if (chatModels.some(cm => modelUid(cm) === modelUid(m))) return;
-    const thinkingId = detectThinkingId(m.id);
-    const updated = [...chatModels, { ...m, tier: 'extra' as const, thinkingId }];
-    setChatModels(updated);
-    saveChatModels(updated);
-  };
 
   const handleRemoveChatModel = (uid: string) => {
     const removed = chatModels.find(cm => modelUid(cm) === uid);
@@ -448,7 +459,7 @@ const ProviderSettings: React.FC = () => {
             const assigned = chatModels.find(cm => cm.tier === tier.key);
             const assignedIsDefault = assigned && defaultModel === assigned.id;
             // Models available for this tier (not already assigned to another tier; ignore tierless entries)
-            const usedUids = new Set(chatModels.filter(cm => cm.tier && cm.tier !== tier.key).map(cm => modelUid(cm)));
+            const usedUids = new Set<string>(); // No tier blocking - handleSetTierModel handles moves
             const available = allAvailableModels.filter(m => !usedUids.has(modelUid(m)) && !m.id.endsWith('-thinking'));
             return (
               <div key={tier.key} className={`rounded-[12px] border transition-colors ${assigned ? (assignedIsDefault ? 'bg-[#387ee0]/5 border-[#387ee0]/40' : 'bg-black/[0.02] dark:bg-white/[0.02] border-claude-border') : 'border-dashed border-claude-border/40'}`}>
@@ -478,6 +489,19 @@ const ProviderSettings: React.FC = () => {
                       {assigned && assigned.thinkingId && (
                         <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 flex-shrink-0">Thinking</span>
                       )}
+                      <div className="flex items-center gap-1 ml-auto">
+                        <input type="number" min={1000} step={1000}
+                          value={contextOverrides[tier.key] ?? ''}
+                          placeholder="200000"
+                          onChange={e => {
+                            const v = parseInt(e.target.value);
+                            if (v > 0) saveContextOverride(tier.key, v);
+                            else removeContextOverride(tier.key);
+                          }}
+                          className="w-[90px] text-[11px] text-claude-textSecondary bg-transparent border border-claude-border/30 rounded px-1.5 py-0.5 text-right focus:outline-none focus:border-[#387ee0]/60"
+                        />
+                        <span className="text-[10px] text-claude-textSecondary/50">tokens</span>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -486,64 +510,7 @@ const ProviderSettings: React.FC = () => {
           })}
         </div>
 
-        {/* More models section */}
-        {(() => {
-          const extraModels = chatModels.filter(cm => cm.tier === 'extra');
-          const usedUids = new Set(chatModels.map(cm => modelUid(cm)));
-          const availableForExtra = allAvailableModels.filter(m => !usedUids.has(modelUid(m)) && !m.id.endsWith('-thinking'));
-          return (
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-[13px] font-medium text-claude-textSecondary">More models</span>
-              </div>
-              {extraModels.length > 0 && (
-                <div className="space-y-1.5 mb-3">
-                  {extraModels.map(cm => (
-                    <div key={modelUid(cm)} className={`rounded-[10px] border transition-colors ${defaultModel === cm.id ? 'bg-[#387ee0]/5 border-[#387ee0]/40' : 'bg-black/[0.02] dark:bg-white/[0.02] border-claude-border/60 hover:bg-black/[0.04] dark:hover:bg-white/[0.04]'}`}>
-                      <div className="flex items-center gap-2.5 px-3 py-2">
-                        <button onClick={() => handleSetDefault(cm.id)} title={defaultModel === cm.id ? '当前默认' : '设为默认'}
-                          className={`flex-shrink-0 transition-colors ${defaultModel === cm.id ? 'text-[#387ee0]' : 'text-claude-textSecondary/30 hover:text-[#387ee0]/80'}`}>
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill={defaultModel === cm.id ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" /></svg>
-                        </button>
-                        <div className="flex-1 min-w-0 flex items-center gap-1.5">
-                          <input type="text" value={cm.name}
-                            onChange={e => {
-                              const updated = chatModels.map(c => modelUid(c) === modelUid(cm) ? { ...c, name: e.target.value } : c);
-                              setChatModels(updated);
-                              saveChatModels(updated);
-                            }}
-                            className="text-[13px] text-claude-text font-medium bg-transparent outline-none w-[140px] border-b border-transparent hover:border-claude-border/40 focus:border-[#387ee0]/60 transition-colors"
-                          />
-                          <span className="text-[11px] text-claude-textSecondary/50 truncate">{cm.providerName}</span>
-                        </div>
-                        {cm.thinkingId && (
-                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 flex-shrink-0">Thinking</span>
-                        )}
-                        <button onClick={() => handleRemoveChatModel(modelUid(cm))} className="p-0.5 text-claude-textSecondary/20 hover:text-red-400 transition-colors">
-                          <X size={12} />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {availableForExtra.length > 0 && (
-                <div>
-                  <SearchableModelSelect
-                    value=""
-                    onChange={uid => {
-                      const m = allAvailableModels.find(x => modelUid(x) === uid);
-                      if (m) handleAddExtraModel(m);
-                    }}
-                    options={availableForExtra}
-                    placeholder="+ 添加更多模型..."
-                    dashed={true}
-                  />
-                </div>
-              )}
-            </div>
-          );
-        })()}
+        
       </div>
 
       <hr className="border-claude-border/40 mb-6" />

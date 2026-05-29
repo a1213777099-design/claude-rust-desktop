@@ -6,6 +6,16 @@ import './index.css';
 console.log('[Main] Starting application...');
 console.log('[Main] __TAURI_INTERNALS__:', !!(window as any).__TAURI_INTERNALS__);
 
+// Global error handlers to prevent WebView crash
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('[Global] Unhandled promise rejection:', event.reason);
+  event.preventDefault();
+});
+window.addEventListener('error', (event) => {
+  console.error('[Global] Uncaught error:', event.error || event.message);
+  event.preventDefault();
+});
+
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
   { hasError: boolean; error: Error | null; errorInfo: React.ErrorInfo | null }

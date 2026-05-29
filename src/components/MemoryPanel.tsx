@@ -133,7 +133,7 @@ export default function MemoryPanel() {
                     <span className="text-[11px] text-claude-textSecondary">{new Date(mem.created_at).toLocaleDateString()}</span>
                   </div>
                   <p className="text-[13px] text-claude-text leading-relaxed whitespace-pre-wrap break-words">
-                    {mem.summary.length > 300 ? mem.summary.slice(0, 300) + '...' : mem.summary}
+                    {mem.content.length > 300 ? mem.content.slice(0, 300) + '...' : mem.content}
                   </p>
                   {mem.tags && mem.tags !== 'auto' && (
                     <div className="mt-1.5 flex gap-1 flex-wrap">

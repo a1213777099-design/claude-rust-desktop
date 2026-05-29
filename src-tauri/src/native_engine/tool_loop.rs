@@ -89,7 +89,7 @@ impl ToolLoopExecutor {
             messages,
             system_prompt,
             max_tokens,
-            max_tool_iterations: 50,
+            max_tool_iterations: usize::MAX,
             event_tx,
             anthropic_client: AnthropicClient::new(),
             openai_client: OpenAIClient::new(),
@@ -175,7 +175,7 @@ impl ToolLoopExecutor {
         &mut self,
         tool_name: &str,
         tool_input: &Value,
-        tool_use_id: &str,
+        _tool_use_id: &str,
     ) -> (Value, String, bool) {
         if tool_name == "AskUserQuestion" {
             return self.execute_ask_user_question(tool_input).await;
@@ -481,7 +481,7 @@ impl ToolLoopExecutor {
                             }
                         }
                         "content_block_stop" => {
-                            let index = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                            let _index = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
 
                             if !current_text.is_empty() {
                                 assistant_blocks.push(ContentBlock::Text { text: current_text.clone() });
@@ -497,7 +497,7 @@ impl ToolLoopExecutor {
                                 let name = current_tool_name.clone().unwrap_or_default();
                                 let input = self.finalize_streaming_tool_args(&id);
 
-                                let (.., output_str, is_error) = self.execute_tool_call(&name, &input, &id).await;
+                                let (_tool_use_id, output_str, is_error) = self.execute_tool_call(&name, &input, &id).await;
 
                                 let _ = self.event_tx.send(EngineEvent::ToolUseDone {
                                     tool_use_id: id.clone(),

@@ -100,6 +100,26 @@ const AnalyticsPanel = ({ onClose }: { onClose: () => void }) => {
       const from = start.toISOString().slice(0, 10);
       const to = end.toISOString().slice(0, 10);
 
+      // Read local analytics from localStorage
+      const localStats = [];
+      let localTotal = 0;
+      let localTokensIn = 0, localTokensOut = 0;
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i) || "";
+          if (k.startsWith("analytics_")) {
+            const date = k.replace("analytics_", "");
+            if (date >= from && date <= to) {
+              const s = JSON.parse(localStorage.getItem(k) || "{}");
+              localStats.push({ date, messages_sent: s.messages_sent || 0, conversations_created: s.conversations_created || 0, tokens_input: s.tokens_input || 0, tokens_output: s.tokens_output || 0, tools_executed: 0, errors: 0, voice_inputs: 0, slash_commands: 0, files_uploaded: 0 });
+              localTotal += s.messages_sent || 0;
+              localTokensIn += s.tokens_input || 0;
+              localTokensOut += s.tokens_output || 0;
+            }
+          }
+        }
+      } catch {}
+
       const [sumRes, rangeRes, countsRes, eventsRes] = await Promise.all([
         getAnalyticsSummary(period),
         getAnalyticsRange(from, to),
@@ -107,8 +127,22 @@ const AnalyticsPanel = ({ onClose }: { onClose: () => void }) => {
         getAnalyticsRecentEvents(30),
       ]);
 
-      if (sumRes.success) setSummary(sumRes.summary);
-      if (rangeRes.success) setDailyStats(rangeRes.stats || []);
+      if (sumRes.success) {
+        const s = sumRes.summary;
+        s.total_messages = (s.total_messages || 0) + localTotal;
+        s.total_tokens_input = Math.max(s.total_tokens_input || 0, localTokensIn);
+        s.total_tokens_output = Math.max(s.total_tokens_output || 0, localTokensOut);
+        setSummary(s);
+      } else if (localStats.length > 0) {
+        setSummary({ total_days: period, total_messages: localTotal, total_conversations: 0, total_tokens_input: localTokensIn, total_tokens_output: localTokensOut, total_tools: 0, total_errors: 0, total_voice_inputs: 0, avg_daily_messages: localTotal / period, avg_daily_tokens: 0, streak_days: 0, most_active_day: "", most_used_model: "" });
+      }
+      if (rangeRes.success && rangeRes.stats && rangeRes.stats.length) {
+        const merged = new Map(localStats.map(s => [s.date, s]));
+        for (const s of rangeRes.stats) { merged.set(s.date, s); }
+        setDailyStats(Array.from(merged.values()).sort((a, b) => a.date.localeCompare(b.date)));
+      } else {
+        setDailyStats(localStats);
+      }
       if (countsRes.success) setEventCounts(countsRes.counts || []);
       if (eventsRes.success) setRecentEvents(eventsRes.events || []);
     } catch (_) {}

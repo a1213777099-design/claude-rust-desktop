@@ -1,4 +1,4 @@
-﻿pub mod bridge;
+pub mod bridge;
 pub mod commands;
 pub mod engine;
 pub mod tools;
@@ -35,4 +35,3 @@ pub mod orchestration;
 pub mod computer_use;
 pub mod db;
 pub mod permissions;
-

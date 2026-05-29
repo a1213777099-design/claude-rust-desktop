@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-pub use engine::{SkillExecutionContext, SkillExecutionEngine, SkillExecutionResult};
+pub use engine::{SkillExecutionContext, SkillExecutionEngine};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
@@ -439,7 +439,7 @@ This skill provides utilities for:
         self.create_skill(&name, &description, &content)
     }
 
-    pub async fn execute_skill(&self, skill_id: &str, input: &str, context: Option<SkillExecutionContext>) -> Result<String> {
+    pub async fn execute_skill(&self, skill_id: &str, _input: &str, context: Option<SkillExecutionContext>) -> Result<String> {
         let skills = self.load_skills().await?;
         let skill = skills.into_iter()
             .find(|s| s.id == skill_id && s.enabled)

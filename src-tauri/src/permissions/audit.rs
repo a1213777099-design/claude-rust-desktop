@@ -69,7 +69,7 @@ impl AuditLogger {
     }
 
     pub fn log(&self, entry: AuditEntry) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() >= self.max_entries {
             entries.pop_front();
         }
@@ -77,12 +77,12 @@ impl AuditLogger {
     }
 
     pub fn get_entries(&self) -> Vec<AuditEntry> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.clone().into()
     }
 
     pub fn get_entries_by_conversation(&self, conversation_id: &str) -> Vec<AuditEntry> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries
             .iter()
             .filter(|e| e.conversation_id == conversation_id)
@@ -91,7 +91,7 @@ impl AuditLogger {
     }
 
     pub fn clear(&self) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.clear();
     }
 }

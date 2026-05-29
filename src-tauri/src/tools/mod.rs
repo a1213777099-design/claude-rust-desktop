@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -583,6 +583,7 @@ fn tool_computer_use(input: serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
+#[allow(dead_code)]
 async fn tool_computer_use_async(input: serde_json::Value) -> Result<serde_json::Value> {
     use crate::computer_use::{
         ComputerAction, ComputerActionType, ComputerUseConfig, ComputerUseManager, MouseButton,
@@ -961,24 +962,27 @@ fn tool_web_search_blocking(input: serde_json::Value) -> Result<serde_json::Valu
 
     #[derive(Deserialize)]
     struct DuckDuckGoResponse {
-        RelatedTopics: Vec<RelatedTopic>,
+        #[serde(rename = "RelatedTopics")]
+        related_topics: Vec<RelatedTopic>,
     }
 
     #[derive(Deserialize)]
     struct RelatedTopic {
-        Text: Option<String>,
-        URL: Option<String>,
+        #[serde(rename = "Text")]
+        text: Option<String>,
+        #[serde(rename = "URL")]
+        url: Option<String>,
     }
 
     match response.json::<DuckDuckGoResponse>() {
         Ok(data) => {
-            let results: Vec<serde_json::Value> = data.RelatedTopics
+            let results: Vec<serde_json::Value> = data.related_topics
                 .iter()
-                .filter(|t| t.Text.is_some())
+                .filter(|t| t.text.is_some())
                 .take(10)
                 .map(|t| serde_json::json!({
-                    "title": t.Text.as_deref().unwrap_or(""),
-                    "url": t.URL.as_deref().unwrap_or("")
+                    "title": t.text.as_deref().unwrap_or(""),
+                    "url": t.url.as_deref().unwrap_or("")
                 }))
                 .collect();
 
@@ -1277,24 +1281,27 @@ async fn tool_web_search_async(input: serde_json::Value) -> Result<serde_json::V
 
     #[derive(Deserialize)]
     struct DuckDuckGoResponse {
-        RelatedTopics: Vec<RelatedTopic>,
+        #[serde(rename = "RelatedTopics")]
+        related_topics: Vec<RelatedTopic>,
     }
 
     #[derive(Deserialize)]
     struct RelatedTopic {
-        Text: Option<String>,
-        URL: Option<String>,
+        #[serde(rename = "Text")]
+        text: Option<String>,
+        #[serde(rename = "URL")]
+        url: Option<String>,
     }
 
     match response.json::<DuckDuckGoResponse>().await {
         Ok(data) => {
-            let results: Vec<serde_json::Value> = data.RelatedTopics
+            let results: Vec<serde_json::Value> = data.related_topics
                 .iter()
-                .filter(|t| t.Text.is_some())
+                .filter(|t| t.text.is_some())
                 .take(10)
                 .map(|t| serde_json::json!({
-                    "title": t.Text.as_deref().unwrap_or(""),
-                    "url": t.URL.as_deref().unwrap_or("")
+                    "title": t.text.as_deref().unwrap_or(""),
+                    "url": t.url.as_deref().unwrap_or("")
                 }))
                 .collect();
 

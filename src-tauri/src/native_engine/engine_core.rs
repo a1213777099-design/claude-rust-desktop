@@ -3,7 +3,7 @@ use crate::native_engine::provider_manager::ProviderManager;
 use crate::native_engine::tool_loop::{EngineEvent, ToolLoopExecutor};
 use crate::mcp::McpToolRegistry;
 use crate::permissions::{PermissionContext, PermissionManager, PermissionResult};
-use crate::skills::{SkillExecutionContext, SkillExecutionEngine, SkillsManager};
+use crate::skills::{SkillExecutionContext, SkillsManager};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -332,7 +332,7 @@ impl QueryEngine {
         let conv_id_clone = conv_id.clone();
         let active_turns_clone = self.active_turns.clone();
         let conversation_states_clone = self.conversation_states.clone();
-        let tool_call_history_clone = self.tool_call_history.clone();
+        let _tool_call_history_clone = self.tool_call_history.clone();
         let db = self.db_manager.clone();
 
         let executor_handle = tokio::spawn(async move {

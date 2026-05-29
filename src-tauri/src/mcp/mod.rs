@@ -7,10 +7,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 
+fn mcp_log(msg: &str) {
+    let log_path = std::path::PathBuf::from("F:/Projects/claude-code-rust/mcp_debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        use std::io::Write;
+        let _ = writeln!(f, "[{}] {}", chrono::Utc::now().format("%H:%M:%S%.3f"), msg);
+    }
+}
+
+
 pub mod tool_executor;
 pub mod composio;
-pub use tool_executor::{McpToolDefinition, McpToolRegistry};
-pub use composio::{ComposioManager, ComposioConfig, ComposioSession, ComposioConnectorStatus, McpManagedConnector};
+pub use tool_executor::McpToolRegistry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -100,11 +108,19 @@ impl McpServerManager {
     }
 
     pub async fn initialize(&self) -> Result<()> {
+        mcp_log(&format!("Initializing. Config path: {:?}", self.config_path));
+        mcp_log(&format!("Config file exists: {}", self.config_path.exists()));
         if self.config_path.exists() {
-            self.load_config().await?;
+            match self.load_config().await {
+                Ok(()) => mcp_log("Config loaded successfully"),
+                Err(e) => mcp_log(&format!("Config load error: {}", e)),
+            }
         } else {
+            mcp_log("Config file not found, creating default");
             self.create_default_config().await?;
         }
+        let count = self.servers.read().await.len();
+        mcp_log(&format!("After init: {} servers", count));
         Ok(())
     }
 
@@ -366,6 +382,10 @@ impl McpServerManager {
 
     pub async fn list_servers(&self) -> Vec<McpServerStatus> {
         let servers = self.servers.read().await;
+        mcp_log(&format!("list_servers: {} servers loaded", servers.len()));
+        for (id, state) in servers.iter() {
+            println!("[MCP]   - {}: name={}, enabled={}, running={}", id, state.config.name, state.config.enabled, state.status.running);
+        }
         servers.values().map(|s| s.status.clone()).collect()
     }
 
@@ -868,7 +888,7 @@ impl McpConnector {
         let json = serde_json::to_string(request)?;
         stdin.write_all(format!("{}\n", json).as_bytes()).await?;
 
-        drop(stdin);
+        let _ = stdin;
 
         let mut stdout = self.stdout.lock().await;
         let stdout = stdout.as_mut().ok_or_else(|| anyhow!("MCP stdout not available"))?;

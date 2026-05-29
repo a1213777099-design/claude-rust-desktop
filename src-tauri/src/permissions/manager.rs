@@ -1,8 +1,7 @@
 use super::audit::{AuditAction, AuditEntry, AuditLoggerRef};
-use super::rules::{DANGEROUS_TOOLS, PermissionAction, PermissionLevel, PermissionRule, PermissionRuleset, PermissionScope};
+use super::rules::{DANGEROUS_TOOLS, PermissionAction, PermissionRule, PermissionRuleset};
 use super::{PermissionChecker, PermissionContext, PermissionResult, ToolPermission};
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,43 +62,43 @@ impl PermissionManager {
     }
 
     pub fn set_mode(&self, mode: PermissionMode) {
-        let mut m = self.mode.lock().unwrap();
+        let mut m = self.mode.lock().unwrap_or_else(|e| e.into_inner());
         *m = mode;
         eprintln!("[Permission] Mode changed to: {}", mode.as_str());
     }
 
     pub fn get_mode(&self) -> PermissionMode {
-        *self.mode.lock().unwrap()
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn load_default_rules(&mut self) {
         let default_rules = super::rules::get_default_rules();
-        let mut ruleset = self.ruleset.lock().unwrap();
+        let mut ruleset = self.ruleset.lock().unwrap_or_else(|e| e.into_inner());
         *ruleset = default_rules;
     }
 
     pub fn add_rule(&self, rule: PermissionRule) {
-        let mut ruleset = self.ruleset.lock().unwrap();
+        let mut ruleset = self.ruleset.lock().unwrap_or_else(|e| e.into_inner());
         ruleset.add_rule(rule);
     }
 
     pub fn remove_rule(&self, rule_id: &str) {
-        let mut ruleset = self.ruleset.lock().unwrap();
+        let mut ruleset = self.ruleset.lock().unwrap_or_else(|e| e.into_inner());
         ruleset.rules.retain(|r| r.id != rule_id);
     }
 
     pub fn get_rules(&self) -> Vec<PermissionRule> {
-        let ruleset = self.ruleset.lock().unwrap();
+        let ruleset = self.ruleset.lock().unwrap_or_else(|e| e.into_inner());
         ruleset.rules.clone()
     }
 
     pub fn set_tool_permission(&self, tool_name: &str, permission: ToolPermission) {
-        let mut permissions = self.tool_permissions.lock().unwrap();
+        let mut permissions = self.tool_permissions.lock().unwrap_or_else(|e| e.into_inner());
         permissions.insert(tool_name.to_string(), permission);
     }
 
     pub fn get_tool_permission(&self, tool_name: &str) -> Option<ToolPermission> {
-        let permissions = self.tool_permissions.lock().unwrap();
+        let permissions = self.tool_permissions.lock().unwrap_or_else(|e| e.into_inner());
         permissions.get(tool_name).cloned()
     }
 
@@ -186,7 +185,7 @@ impl PermissionManager {
                 .with_user_id(context.user_id.as_deref()),
         );
 
-        let ruleset = self.ruleset.lock().unwrap();
+        let ruleset = self.ruleset.lock().unwrap_or_else(|e| e.into_inner());
         let rules = ruleset.get_rules_for_tool(&context.tool_name);
         
         for rule in rules {
@@ -251,7 +250,7 @@ impl PermissionManager {
 
     fn handle_dangerous_tool(&self, context: &PermissionContext) -> PermissionResult {
         let confirm_key = format!("{}-{}", context.conversation_id, context.tool_name);
-        let confirmations = self.confirmations.lock().unwrap();
+        let confirmations = self.confirmations.lock().unwrap_or_else(|e| e.into_inner());
         
         if confirmations.get(&confirm_key) == Some(&true) {
             PermissionResult::Granted
@@ -270,7 +269,7 @@ impl PermissionManager {
 
     pub fn confirm_permission(&self, conversation_id: &str, tool_name: &str) {
         let confirm_key = format!("{}-{}", conversation_id, tool_name);
-        let mut confirmations = self.confirmations.lock().unwrap();
+        let mut confirmations = self.confirmations.lock().unwrap_or_else(|e| e.into_inner());
         confirmations.insert(confirm_key, true);
 
         self.audit_logger.log(
@@ -281,12 +280,12 @@ impl PermissionManager {
 
     pub fn clear_confirmation(&self, conversation_id: &str, tool_name: &str) {
         let confirm_key = format!("{}-{}", conversation_id, tool_name);
-        let mut confirmations = self.confirmations.lock().unwrap();
+        let mut confirmations = self.confirmations.lock().unwrap_or_else(|e| e.into_inner());
         confirmations.remove(&confirm_key);
     }
 
     pub fn clear_all_confirmations(&self) {
-        let mut confirmations = self.confirmations.lock().unwrap();
+        let mut confirmations = self.confirmations.lock().unwrap_or_else(|e| e.into_inner());
         confirmations.clear();
     }
 

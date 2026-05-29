@@ -42,7 +42,6 @@ use bridge::BridgeServer;
 use native_engine::engine_core::NativeEngine;
 use native_engine::provider_manager::ProviderManager;
 use mcp::McpServerManager;
-use permissions::{AuditLogger, PermissionManager};
 use tauri::Manager;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,6 +49,19 @@ use tokio::sync::Notify;
 use tokio::sync::Mutex;
 
 fn main() {
+    std::env::set_var("RUST_BACKTRACE", "1");
+    // Log panics to file
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("[PANIC] {}: {:?}", chrono::Utc::now().to_rfc3339(), info);
+        eprintln!("{}", msg);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("panic.log") {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", msg);
+        }
+        default_hook(info);
+    }));
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -60,12 +72,12 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(Mutex::new(None::<NativeEngine>)))
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<ProviderManager>>>)))
-        .manage(Arc::new(claude_desktop_tauri_lib::db::DbManager::new(PathBuf::from(":memory:")).unwrap()))
+        .manage(Arc::new(claude_desktop_tauri_lib::db::DbManager::new(PathBuf::from(":memory:")).expect("Failed to init DB")))
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<McpServerManager>>>)))
         .setup(|app| {
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
             let bridge_ready = Arc::new(Notify::new());
-            let bridge_ready_clone = bridge_ready.clone();
+            let _bridge_ready_clone = bridge_ready.clone();
 
             let mcp_config_path = data_dir.join("mcp-servers.json");
             let mcp_manager = Arc::new(Mutex::new(McpServerManager::new(mcp_config_path)));

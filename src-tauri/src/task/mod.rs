@@ -38,7 +38,7 @@ pub struct TaskEvent {
 
 pub struct TaskExecutor {
     provider_manager: Arc<Mutex<ProviderManager>>,
-    db_manager: Arc<DbManager>,
+    _db_manager: Arc<DbManager>,
     anthropic_client: AnthropicClient,
     openai_client: OpenAIClient,
     tasks: Arc<Mutex<HashMap<String, TaskState>>>,
@@ -69,7 +69,7 @@ impl TaskExecutor {
     ) -> Self {
         Self {
             provider_manager,
-            db_manager,
+            _db_manager: db_manager,
             anthropic_client: AnthropicClient::new(),
             openai_client: OpenAIClient::new(),
             tasks: Arc::new(Mutex::new(HashMap::new())),

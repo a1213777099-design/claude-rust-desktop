@@ -2,7 +2,6 @@ use crate::native_engine::anthropic_client::{AnthropicClient, AnthropicContent, 
 use crate::native_engine::openai_client::{OpenAIClient, OpenAIContent, OpenAIMessage};
 use crate::native_engine::provider_manager::{ApiFormat, ResolvedProvider};
 use anyhow::{anyhow, Result};
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, BinaryHeap};
 use std::sync::Arc;
@@ -19,7 +18,6 @@ pub use config::*;
 pub use openspace::*;
 pub use superpowers::*;
 pub use gstack::*;
-pub use test_scenario::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WorkflowPhase {
@@ -269,10 +267,6 @@ impl MultiAgentOrchestrator {
         self.log("INFO", task_id, message);
     }
 
-    fn log_warn(&self, task_id: Option<&str>, message: &str) {
-        self.log("WARN", task_id, message);
-    }
-
     fn log_error(&self, task_id: Option<&str>, message: &str) {
         self.log("ERROR", task_id, message);
     }
@@ -339,7 +333,7 @@ impl MultiAgentOrchestrator {
         provider: &ResolvedProvider,
     ) -> Result<serde_json::Value> {
         let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_agents));
-        let mut task_results: HashMap<String, serde_json::Value> = HashMap::new();
+        let task_results: HashMap<String, serde_json::Value> = HashMap::new();
         
         let completed_tasks = self.completed_tasks.clone();
         let running_tasks = self.running_tasks.clone();

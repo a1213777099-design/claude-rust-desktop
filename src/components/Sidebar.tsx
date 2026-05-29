@@ -134,7 +134,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const [showHelpModal, setShowHelpModal] = useState(false);
   const [userMenuPos, setUserMenuPos] = useState<{ bottom: number; left: number } | null>(null);
   const [planLabel, setPlanLabel] = useState('Free plan');
-  const [usageData, setUsageData] = useState<{ token_used: number; token_quota: number } | null>(null);
+  const [usageData, setUsageData] = useState<{ token_used: number; token_quota: number; quota?: { window?: { used: number; limit: number; resetAt?: string }; week?: { used: number; limit: number; resetAt?: string } } } | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [isRecentsCollapsed, setIsRecentsCollapsed] = useState(false);
@@ -294,9 +294,16 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const fetchPlan = async () => {
     try {
       const data = await getUserUsage();
+      const windowUsed = data?.quota?.window?.used || 0;
+      const windowLimit = data?.quota?.window?.limit || 0;
+      const weekUsed = data?.quota?.week?.used || 0;
+      const weekLimit = data?.quota?.week?.limit || 0;
+      const tokenUsed = Number(data?.token_used) || windowUsed || weekUsed || 0;
+      const tokenQuota = Number(data?.token_quota) || windowLimit || weekLimit || 0;
       setUsageData({
-        token_used: Number(data?.token_used) || 0,
-        token_quota: Number(data?.token_quota) || 0,
+        token_used: tokenUsed,
+        token_quota: tokenQuota,
+        quota: data?.quota,
       });
       if (data.plan && data.plan.name) {
         const nameMap: Record<string, string> = {
@@ -846,17 +853,35 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                 </div>
                 {localStorage.getItem('user_mode') === 'selfhosted' ? (
                   <div className="text-[13px] text-claude-textSecondary mt-1 leading-tight">{t('sidebar.selfHosted')}</div>
-                ) : usageData && usageData.token_quota > 0 ? (
+                ) : usageData && (usageData.token_quota > 0 || usageData.quota) ? (
                   <div className="mt-1.5 mr-3">
-                    <div className="h-1 w-full rounded-full bg-claude-hover overflow-hidden">
-                      <div
-                        className="h-full bg-neutral-700 dark:bg-neutral-300 transition-[width] duration-300"
-                        style={{ width: `${Math.min(100, (usageData.token_used / usageData.token_quota) * 100)}%` }}
-                      />
-                    </div>
-                    <div className="text-[10px] text-claude-textSecondary mt-1 leading-none tabular-nums">
-                      ${usageData.token_used.toFixed(2)} / ${usageData.token_quota.toFixed(2)}
-                    </div>
+                    {usageData.quota?.window && usageData.quota.window.limit > 0 ? (
+                      <>
+                        <div className="h-1 w-full rounded-full bg-claude-hover overflow-hidden">
+                          <div
+                            className="h-full bg-neutral-700 dark:bg-neutral-300 transition-[width] duration-300"
+                            style={{ width: `${Math.min(100, (usageData.quota.window.used / usageData.quota.window.limit) * 100)}%` }}
+                          />
+                        </div>
+                        <div className="text-[10px] text-claude-textSecondary mt-1 leading-none tabular-nums">
+                          ${usageData.quota.window.used.toFixed(2)} / ${usageData.quota.window.limit.toFixed(2)}
+                        </div>
+                      </>
+                    ) : usageData.token_quota > 0 ? (
+                      <>
+                        <div className="h-1 w-full rounded-full bg-claude-hover overflow-hidden">
+                          <div
+                            className="h-full bg-neutral-700 dark:bg-neutral-300 transition-[width] duration-300"
+                            style={{ width: `${Math.min(100, (usageData.token_used / usageData.token_quota) * 100)}%` }}
+                          />
+                        </div>
+                        <div className="text-[10px] text-claude-textSecondary mt-1 leading-none tabular-nums">
+                          ${usageData.token_used.toFixed(2)} / ${usageData.token_quota.toFixed(2)}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="text-[13px] text-claude-textSecondary leading-tight">{planLabel}</div>
+                    )}
                   </div>
                 ) : (
                   <div className="text-[13px] text-claude-textSecondary mt-1 leading-tight">{planLabel}</div>

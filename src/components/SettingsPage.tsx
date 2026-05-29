@@ -234,15 +234,13 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
         >
           {t('settings.general')}
         </button>
-        {localStorage.getItem('user_mode') === 'selfhosted' && (
-          <button
-            onClick={() => setTab('models')}
-            className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
-              }`}
-          >
-            {t('settings.models')}
-          </button>
-        )}
+        <button
+          onClick={() => setTab('models')}
+          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors ${tab === 'models' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+            }`}
+        >
+          {t('settings.models')}
+        </button>
         {localStorage.getItem('user_mode') !== 'selfhosted' && (
           <button
             onClick={() => setTab('account')}

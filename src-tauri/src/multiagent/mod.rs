@@ -130,6 +130,7 @@ pub struct MultiAgentOrchestrator {
     agents: Arc<Mutex<HashMap<String, AgentConfig>>>,
     state: Arc<Mutex<AgentState>>,
     event_tx: broadcast::Sender<OrchestratorEvent>,
+    #[allow(dead_code)]
     http_client: reqwest::Client,
 }
 

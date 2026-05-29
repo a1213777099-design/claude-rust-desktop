@@ -54,7 +54,7 @@ impl ProviderManager {
     }
 
     pub fn from_providers(providers: Vec<Provider>, config_path: PathBuf) -> Self {
-        let mut manager = Self {
+        let manager = Self {
             providers,
             config_path,
         };
@@ -196,14 +196,16 @@ impl ProviderManager {
 
 pub fn get_default_context_size(model_id: &str) -> u32 {
     match model_id {
-        id if id.contains("gpt-4o") || id.contains("claude-3.5") || id.contains("claude-sonnet-4") => 200_000,
+        id if id.contains("opus") || id.contains("claude-opus") => 200_000,
+        id if id.contains("haiku") || id.contains("claude-haiku") => 200_000,
+        id if id.contains("gpt-4o") || id.contains("claude-3.5") || id.contains("claude-sonnet") || id.contains("sonnet") => 200_000,
         id if id.contains("gpt-4-turbo") || id.contains("claude-3") => 128_000,
         id if id.contains("gpt-4") => 8_192,
         id if id.contains("gpt-3.5") => 16_384,
         id if id.contains("claude-2") => 100_000,
-        id if id.contains("deepseek") => 64_000,
+        id if id.contains("deepseek") => 128_000,
         id if id.contains("qwen") || id.contains("qwq") => 128_000,
         id if id.contains("gemini") => 1_000_000,
-        _ => 32_768,
+        _ => 200_000,
     }
 }

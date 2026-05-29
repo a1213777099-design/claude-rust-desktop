@@ -370,7 +370,8 @@ Research this sub-question now. Use web_search to find high-quality sources, the
         Ok((text, sources))
     }
 
-        async fn run_sub_researcher_openai(
+    #[allow(dead_code)]
+    async fn run_sub_researcher_openai(
         &self,
         request: &ResearchRequest,
         sub_question: String,
@@ -397,13 +398,21 @@ Research this sub-question now. Use web_search to find high-quality sources, the
             match client.get(&search_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     #[derive(serde::Deserialize)]
-                    struct DDGResponse { RelatedTopics: Vec<DDGTopic> }
+                    struct DDGResponse {
+                        #[serde(rename = "RelatedTopics")]
+                        related_topics: Vec<DDGTopic>,
+                    }
                     #[derive(serde::Deserialize)]
-                    struct DDGTopic { Text: Option<String>, URL: Option<String> }
+                    struct DDGTopic {
+                        #[serde(rename = "Text")]
+                        text: Option<String>,
+                        #[serde(rename = "URL")]
+                        url: Option<String>,
+                    }
 
                     if let Ok(data) = resp.json::<DDGResponse>().await {
-                        for topic in data.RelatedTopics.iter().take(5) {
-                            if let (Some(text), Some(url)) = (&topic.Text, &topic.URL) {
+                        for topic in data.related_topics.iter().take(5) {
+                            if let (Some(text), Some(url)) = (&topic.text, &topic.url) {
                                 if !url.is_empty() && !seen_urls.contains(url) {
                                     seen_urls.insert(url.clone());
                                     sources.push(ResearchSource {

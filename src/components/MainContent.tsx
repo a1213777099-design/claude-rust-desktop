@@ -1105,6 +1105,43 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     contextInfo, setContextInfo,
     tokenUsage, setTokenUsage,
   } = useProjectStore();
+  // Apply model context window overrides from settings
+  const applyContextOverride = (info: { tokens: number; limit: number }) => {
+    try {
+      const overrides = JSON.parse(localStorage.getItem('model_context_overrides') || '{}');
+      const modelKey = currentModelString || '';
+      let override = overrides[modelKey];
+      if (!override) {
+        for (const [k, v] of Object.entries(overrides)) {
+          if (modelKey.includes(k) || k.includes(modelKey)) { override = v; break; }
+        }
+      }
+      if (override && typeof override === "number" && override > 0) return { ...info, limit: override };
+    } catch {}
+    return info;
+  };
+
+  // Re-apply context overrides when settings change
+  useEffect(() => {
+    const handler = () => {
+      try {
+        const overrides = JSON.parse(localStorage.getItem('model_context_overrides') || '{}');
+        const modelKey = currentModelString || '';
+        let override = overrides[modelKey];
+        if (!override) {
+          for (const [k, v] of Object.entries(overrides)) {
+            if (modelKey.includes(k) || k.includes(modelKey)) { override = v; break; }
+          }
+        }
+        if (override && typeof override === "number" && override > 0) {
+          const base = contextInfo || { tokens: 0, limit: 200000 };
+          setContextInfo({ ...base, limit: override });
+        }
+      } catch {}
+    };
+    window.addEventListener('context-overrides-changed', handler);
+    return () => window.removeEventListener('context-overrides-changed', handler);
+  }, [contextInfo?.tokens, contextInfo?.limit]);
   const {
     activeTasks, setActiveTasks,
     toolPermissionDialog, setToolPermissionDialog,
@@ -1437,6 +1474,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const pendingFilesRef = useRef(pendingFiles);
   pendingFilesRef.current = pendingFiles;
   const textareaHeightRef = useRef(textareaHeightVal.current);
+  const tokenUsageRef = useRef<any>(null);
   textareaHeightRef.current = textareaHeightVal.current;
 
   // textarea 高度计算改为在 onChange 中直接操作 DOM（见 adjustTextareaHeight）
@@ -1853,17 +1891,20 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 if (event === 'tool_permission' && data) {
                   setToolPermissionDialog({ request_id: data.request_id, tool_use_id: data.tool_use_id, tool_name: data.tool_name, input: data.input });
                 }
+                if (event === 'usage' && data?.usage) {
+                  const u = data.usage; const inp = u.input_tokens || u.prompt_tokens || 0; const out = u.output_tokens || u.completion_tokens || 0;
+                  setTokenUsage((prev: any) => ({ input_tokens: (prev?.input_tokens||0)+inp, output_tokens: (prev?.output_tokens||0)+out }));
+                  tokenUsageRef.current = { input_tokens: (tokenUsageRef.current?.input_tokens||0)+inp, output_tokens: (tokenUsageRef.current?.output_tokens||0)+out };
+                }
                 if (event === 'message_start' && data?.usage) {
-                  setTokenUsage((prev: any) => {
-                    const u = data.usage;
-                    return { input_tokens: (prev?.input_tokens || 0) + (u.input_tokens || 0), output_tokens: (prev?.output_tokens || 0) + (u.output_tokens || 0) };
-                  });
+                  const u = data.usage; const inp = u.input_tokens || u.prompt_tokens || 0; const out = u.output_tokens || u.completion_tokens || 0;
+                  setTokenUsage((prev: any) => ({ input_tokens: (prev?.input_tokens||0)+inp, output_tokens: (prev?.output_tokens||0)+out }));
+                  tokenUsageRef.current = { input_tokens: (tokenUsageRef.current?.input_tokens||0)+inp, output_tokens: (tokenUsageRef.current?.output_tokens||0)+out };
                 }
                 if (event === 'message_delta' && data?.usage) {
-                  setTokenUsage((prev: any) => {
-                    const u = data.usage;
-                    return { input_tokens: prev?.input_tokens || 0, output_tokens: (prev?.output_tokens || 0) + (u.output_tokens || 0) };
-                  });
+                  const u = data.usage; const out = u.output_tokens || u.completion_tokens || 0;
+                  setTokenUsage((prev: any) => ({ input_tokens: prev?.input_tokens||0, output_tokens: (prev?.output_tokens||0)+out }));
+                  tokenUsageRef.current = { input_tokens: tokenUsageRef.current?.input_tokens||0, output_tokens: (tokenUsageRef.current?.output_tokens||0)+out };
                 }
                 if (event === 'task_event' && data) {
                   setActiveTasks(prev => {
@@ -1913,7 +1954,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           }
         }).catch(() => {});
       }
-      getContextSize(activeId).then(setContextInfo).catch(() => { });
+      getContextSize(activeId).then(info => setContextInfo(applyContextOverride(info))).catch(() => { });
       isAtBottomRef.current = true;
 
       // Handle initialMessage from Project page navigation
@@ -2175,7 +2216,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 isAtBottomRef.current = true;
                 scheduleScrollToBottomAfterRender();
                 if (final_.title) setConversationTitle(final_.title);
-                getContextSize(conversationId).then(setContextInfo).catch(() => { });
+                getContextSize(conversationId).then(info => setContextInfo(applyContextOverride(info))).catch(() => { });
                 return;
               }
               // 跨进程轮询：内容在另一个进程，从数据库拉最新消息
@@ -2577,6 +2618,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   };
 
   const handleSend = async (overrideText?: string) => {
+    try {
+    tokenUsageRef.current = null;
     const effectiveText = (typeof overrideText === 'string') ? overrideText : inputText;
     if (handleSlashCommand(effectiveText)) return;
     // Skill slug is already in the text (inserted when selected from menu)
@@ -2759,6 +2802,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     setLoading(true);
     addStreaming(conversationId!);
     activeRequestCountRef.current += 1;
+    try { const today = new Date().toISOString().slice(0,10); const k = "analytics_"+today; const s = JSON.parse(localStorage.getItem(k)||"{}"); s.messages_sent=(s.messages_sent||0)+1; s.last_model=currentModelString; localStorage.setItem(k,JSON.stringify(s)); } catch {}
     await sendMessage(
       conversationId!,
       userMessageText,
@@ -2785,6 +2829,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         abortControllerRef.current = null;
         isCreatingRef.current = false; // Reset flag
         clearStreamSession(conversationId!, streamRequestId);
+        // Refresh context token indicator after message completes
+        if (conversationId) getContextSize(conversationId).then(info => setContextInfo(applyContextOverride(info))).catch(() => {});
         setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
@@ -2911,11 +2957,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           // Reload messages to reflect compacted state
           if (activeId) {
             loadConversation(activeId);
-            getContextSize(activeId).then(setContextInfo).catch(() => {});
+            getContextSize(activeId).then(info => setContextInfo(applyContextOverride(info))).catch(() => {});
           }
         }
         if (event === 'context_size' && data) {
-          setContextInfo({ tokens: data.tokens, limit: data.limit });
+          setContextInfo(applyContextOverride({ tokens: data.tokens, limit: data.limit }));
         }
         if (event === 'tool_text_offset' && data && data.offset != null) {
           setMessages(prev => {
@@ -2949,17 +2995,21 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
         }
         // Token usage tracking
+        if (event === 'usage' && data?.usage) {
+          const u = data.usage; const inp = u.input_tokens || u.prompt_tokens || 0; const out = u.output_tokens || u.completion_tokens || 0;
+          setTokenUsage((prev: any) => ({ input_tokens: (prev?.input_tokens||0)+inp, output_tokens: (prev?.output_tokens||0)+out }));
+          tokenUsageRef.current = { input_tokens: (tokenUsageRef.current?.input_tokens||0)+inp, output_tokens: (tokenUsageRef.current?.output_tokens||0)+out };
+          console.log('[Analytics] Usage:', u, '-> input:', inp, 'output:', out);
+        }
         if (event === 'message_start' && data?.usage) {
-          setTokenUsage((prev: any) => {
-            const u = data.usage;
-            return { input_tokens: (prev?.input_tokens || 0) + (u.input_tokens || 0), output_tokens: (prev?.output_tokens || 0) + (u.output_tokens || 0) };
-          });
+          const u = data.usage; const inp = u.input_tokens || u.prompt_tokens || 0; const out = u.output_tokens || u.completion_tokens || 0;
+          setTokenUsage((prev: any) => ({ input_tokens: (prev?.input_tokens||0)+inp, output_tokens: (prev?.output_tokens||0)+out }));
+          tokenUsageRef.current = { input_tokens: (tokenUsageRef.current?.input_tokens||0)+inp, output_tokens: (tokenUsageRef.current?.output_tokens||0)+out };
         }
         if (event === 'message_delta' && data?.usage) {
-          setTokenUsage((prev: any) => {
-            const u = data.usage;
-            return { input_tokens: prev?.input_tokens || 0, output_tokens: (prev?.output_tokens || 0) + (u.output_tokens || 0) };
-          });
+          const u = data.usage; const out = u.output_tokens || u.completion_tokens || 0;
+          setTokenUsage((prev: any) => ({ input_tokens: prev?.input_tokens||0, output_tokens: (prev?.output_tokens||0)+out }));
+          tokenUsageRef.current = { input_tokens: tokenUsageRef.current?.input_tokens||0, output_tokens: (tokenUsageRef.current?.output_tokens||0)+out };
         }
         // Task/Agent progress
         if (event === 'task_event' && data) {
@@ -3165,6 +3215,22 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       currentModelString,
       [...messages, tempUserMsg]
     );
+    // Save token usage to localStorage
+    try { const tu = tokenUsageRef.current;
+      if (tu && (tu.input_tokens > 0 || tu.output_tokens > 0)) {
+        const today = new Date().toISOString().slice(0,10); const key = "analytics_"+today;
+        const stats = JSON.parse(localStorage.getItem(key)||"{}");
+        stats.tokens_input = (stats.tokens_input||0) + tu.input_tokens;
+        stats.tokens_output = (stats.tokens_output||0) + tu.output_tokens;
+        localStorage.setItem(key, JSON.stringify(stats));
+        console.log("[Analytics] Token usage saved:", tu);
+      }
+    } catch (e) { console.error("[Analytics] Token save failed:", e); }
+    } catch (sendError: any) {
+      console.error('[handleSend] Error:', sendError);
+      setLoading(false); isCreatingRef.current = false;
+      try { setMessages(prev => { const n = [...prev]; const l = n[n.length-1]; if (l && l.role==="assistant") l.content = "Error: "+(sendError?.message||String(sendError)); return n; }); } catch {}
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -3319,6 +3385,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
+        // Refresh context token indicator after message completes
+        if (conversationId) getContextSize(conversationId).then(info => setContextInfo(applyContextOverride(info))).catch(() => {});
         setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
@@ -3382,7 +3450,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
         }
         if (event === 'context_size' && data) {
-          setContextInfo({ tokens: data.tokens, limit: data.limit });
+          setContextInfo(applyContextOverride({ tokens: data.tokens, limit: data.limit }));
         }
         if (event === 'tool_text_offset' && data && data.offset != null) {
           setMessages(prev => {
@@ -3536,6 +3604,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (viewingIdRef.current === conversationId) setLoading(false);
         abortControllerRef.current = null;
         clearStreamSession(conversationId, streamRequestId);
+        // Refresh context token indicator after message completes
+        if (conversationId) getContextSize(conversationId).then(info => setContextInfo(applyContextOverride(info))).catch(() => {});
         setMessagesFor(conversationId, prev => {
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
@@ -3599,7 +3669,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           });
         }
         if (event === 'context_size' && data) {
-          setContextInfo({ tokens: data.tokens, limit: data.limit });
+          setContextInfo(applyContextOverride({ tokens: data.tokens, limit: data.limit }));
         }
         if (event === 'tool_text_offset' && data && data.offset != null) {
           setMessages(prev => {

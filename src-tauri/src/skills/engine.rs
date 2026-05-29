@@ -280,7 +280,7 @@ impl SkillExecutionEngine {
     fn generate_summary(
         frontmatter: &FrontmatterData,
         results: &[ToolExecutionResult],
-        context: &SkillExecutionContext,
+        _context: &SkillExecutionContext,
     ) -> String {
         let mut summary = String::new();
         
@@ -288,7 +288,7 @@ impl SkillExecutionEngine {
             summary.push_str(&format!("## {} 执行结果\n\n", name));
         }
         
-        for (i, result) in results.iter().enumerate() {
+        for (_i, result) in results.iter().enumerate() {
             if result.tool_name == "text" {
                 if let Some(text) = result.output.as_str() {
                     summary.push_str(text);

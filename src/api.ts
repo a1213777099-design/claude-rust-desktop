@@ -55,7 +55,7 @@ async function ensureNativeEngine() {
   }
 }
 
-// 获取存储的 token
+// ????? token
 function getToken() {
   return localStorage.getItem('auth_token');
 }
@@ -64,7 +64,7 @@ function getToken() {
 // opted to use a cross-mode model in this conversation (via the cross-mode warning
 // modal in MainContent), the per-conv override takes precedence over the global
 // user_mode. This is what makes "keep using clawparrot opus while in selfhosted
-// mode" work — only that one conv switches its endpoint, the rest stay in the
+// mode" work ? only that one conv switches its endpoint, the rest stay in the
 // global mode.
 function getUserModeForConversation(conversationId?: string): string {
   if (conversationId) {
@@ -80,7 +80,7 @@ function getUserModeForConversation(conversationId?: string): string {
 }
 
 // Resolve env_token / env_base_url to send to bridge. clawparrot mode must ignore
-// CUSTOM_API_KEY/CUSTOM_BASE_URL — those exist only because an old version of the
+// CUSTOM_API_KEY/CUSTOM_BASE_URL ? those exist only because an old version of the
 // app let clawparrot users paste their own relay API key; the UI was removed but
 // the localStorage values stick around, and if we fall back to them the user
 // silently keeps hitting their old personal relay instead of the clawparrot
@@ -123,7 +123,7 @@ async function request(path: string, options: RequestInit = {}) {
   return res;
 }
 
-// 系统状态（检测 git-bash 等运行时依赖）
+// ??????? git-bash ???????
 export async function getSystemStatus(): Promise<{
   platform: string;
   gitBash: { required: boolean; found: boolean; path: string | null };
@@ -158,7 +158,7 @@ export async function login(email: string, password: string) {
   return res.json();
 }
 
-// Gateway login for Electron app — authenticates via local API proxy, returns API key for Claude Code SDK
+// Gateway login for Electron app ? authenticates via local API proxy, returns API key for Claude Code SDK
 export async function gatewayLogin(email: string, password: string) {
   const res = await fetch(`${GATEWAY_BASE}/api/auth/login`, {
     method: 'POST',
@@ -323,7 +323,7 @@ export async function getUserUsage() {
             usage.quota.week.used = (usage.quota.week.used || 0) + (gwUsage.week_used || 0);
           }
         } else if (!usage) {
-          // No Chengdu auth_token — use gateway usage as primary source.
+// No Chengdu auth_token ? use gateway usage as primary source.
           // SG gateway's /gateway/usage calls Chengdu internal /user/:id/summary,
           // so it has the real plan+quota data even without a session cookie.
           usage = gwUsage;
@@ -334,7 +334,7 @@ export async function getUserUsage() {
 
   if (usage) return usage;
 
-  // selfhosted mode (no gateway, no Chengdu) — unlimited placeholder
+  // selfhosted mode (no gateway, no Chengdu) �?unlimited placeholder
   return {
     plan: { id: 999, name: 'Self-hosted', status: 'active', price: 0 },
     token_quota: 0,
@@ -400,7 +400,7 @@ export async function deleteAccount(password: string) {
   return res.json();
 }
 
-// 套餐与支付
+// 套餐与支�?
 export async function getPlans() {
   if (isTauriApp && localStorage.getItem('auth_token')) {
     try { return await chengduRequest('/payment/plans'); } catch (_) {}
@@ -434,7 +434,7 @@ export async function getPaymentStatus(orderId: string) {
   return res.json();
 }
 
-// 兑换码
+// 兑换�?
 export async function redeemCode(code: string) {
   if (isTauriApp && localStorage.getItem('auth_token')) {
     const token = localStorage.getItem('auth_token');
@@ -452,7 +452,7 @@ export async function redeemCode(code: string) {
   return res.json();
 }
 
-// ═══ Projects ═══
+// ══�?Projects ══�?
 
 export interface Project {
   id: string;
@@ -739,7 +739,7 @@ export async function exportConversation(id: string): Promise<void> {
 }
 
 
-// 查询对话的活跃生成状态
+// 查询对话的活跃生成状�?
 export async function getGenerationStatus(conversationId: string) {
   const res = await request(`/conversations/${conversationId}/generation-status`);
   return res.json();
@@ -751,13 +751,13 @@ export async function stopGeneration(conversationId: string) {
   return res.json();
 }
 
-// 获取对话上下文大小
+// 获取对话上下文大�?
 export async function getContextSize(conversationId: string): Promise<{ tokens: number; limit: number }> {
   const res = await request(`/conversations/${conversationId}/context-size`);
   return res.json();
 }
 
-// 手动压缩对话 — delegates to engine's /compact command
+// 手动压缩对话 �?delegates to engine's /compact command
 export async function compactConversation(
   id: string,
   instruction?: string
@@ -783,7 +783,7 @@ export async function branchConversation(
   return res.json();
 }
 
-// 回答 AskUserQuestion — write control_response to engine stdin
+// 回答 AskUserQuestion �?write control_response to engine stdin
 export async function answerUserQuestion(
   conversationId: string,
   requestId: string,
@@ -863,23 +863,27 @@ export interface WebSearchTestResult {
 
 export async function testProviderWebSearch(id: string): Promise<WebSearchTestResult> {
   const res = await fetch(`${API_BASE}/providers/${id}/test-websearch`, { method: 'POST' });
-  if (!res.ok) return { ok: false, reason: 'HTTP ' + res.status };
   return res.json();
 }
 
 export async function getProviders(): Promise<Provider[]> {
+  console.log('[API] getProviders called, API_BASE:', API_BASE);
   const res = await fetch(`${API_BASE}/providers`);
+  if (!res.ok) return [];
   const data = await res.json();
   return Array.isArray(data) ? data : (Array.isArray(data?.providers) ? data.providers : []);
 }
 
 export async function createProvider(p: Partial<Provider>): Promise<Provider> {
+  console.log('[API] createProvider called, API_BASE:', API_BASE);
   const res = await fetch(`${API_BASE}/providers`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+  if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || `HTTP ${res.status}`); }
   return res.json();
 }
 
 export async function updateProvider(id: string, p: Partial<Provider>): Promise<Provider> {
   const res = await fetch(`${API_BASE}/providers/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+  if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || `HTTP ${res.status}`); }
   return res.json();
 }
 
@@ -889,7 +893,8 @@ export async function deleteProvider(id: string): Promise<void> {
 
 export async function getProviderModels(): Promise<Array<{ id: string; name: string; providerId: string; providerName: string }>> {
   const res = await fetch(`${API_BASE}/providers/models`);
-  return res.json();
+  const data = await res.json();
+  return Array.isArray(data) ? data : (Array.isArray(data?.models) ? data.models : []);
 }
 
 // Check if a conversation has an active engine stream
@@ -898,7 +903,7 @@ export async function getStreamStatus(conversationId: string): Promise<{ active:
   return res.json();
 }
 
-// Reconnect to an active stream — receives buffered + live SSE events
+// Reconnect to an active stream �?receives buffered + live SSE events
 export function reconnectStream(
   conversationId: string,
   onDelta: (delta: string, full: string) => void,
@@ -971,6 +976,9 @@ export function reconnectStream(
             if (parsed.type === 'compact_boundary' && onSystem) {
               onSystem('compact_boundary', '', parsed);
             }
+            if (parsed.type === 'usage' && onSystem) {
+              onSystem('usage', '', parsed);
+            }
             // Research mode events on reconnect path
             if (parsed.type && parsed.type.startsWith('research_') && onSystem) {
               onSystem(parsed.type, '', parsed);
@@ -1010,7 +1018,7 @@ export async function deleteMessagesFrom(
   return res.json();
 }
 
-// 删除对话末尾 N 条消息（编辑时 msg.id 不可用的回退方案）
+// 删除对话末尾 N 条消息（编辑�?msg.id 不可用的回退方案�?
 export async function deleteMessagesTail(
   conversationId: string,
   count: number,
@@ -1091,7 +1099,7 @@ export async function uploadFile(
       console.error('[API] Upload network error:', err);
       reject(new Error(`网络错误，无法连接到 ${uploadUrl}`));
     });
-    xhr.addEventListener('abort', () => reject(new Error('上传已取消')));
+      xhr.addEventListener('abort', () => reject(new Error('上传已取消')));
 
     xhr.open('POST', uploadUrl);
     if (token) {
@@ -1220,7 +1228,7 @@ export async function materializeGithub(
   return res.json();
 }
 
-// 检查模型是否需要使用前端代理（当 Provider 使用 OpenAI 格式时）
+// 检查模型是否需要使用前端代理（�?Provider 使用 OpenAI 格式时）
 async function checkUseProxyForModel(model: string): Promise<boolean> {
   try {
     const providers = await getProviders();
@@ -1238,7 +1246,7 @@ async function checkUseProxyForModel(model: string): Promise<boolean> {
   return false;
 }
 
-// 通过前端代理发送消息（支持 OpenAI 格式的 Provider）
+// 通过前端代理发送消息（支持 OpenAI 格式�?Provider�?
 async function sendMessageViaProxy(
   conversationId: string,
   messages: any[],
@@ -1253,7 +1261,7 @@ async function sendMessageViaProxy(
   const { apiProxy, resolveProviderForModel } = await import('./utils/apiProxy');
   const providers = await getProviders();
   
-  // 转换为代理格式
+  // 转换为代理格�?
   const proxyProviders = providers.map((p: any) => ({
     id: p.id,
     name: p.name,
@@ -1335,7 +1343,7 @@ async function sendMessageViaProxy(
   };
 }
 
-// 解析代理返回的 SSE 流
+// 解析代理返回�?SSE �?
 async function parseProxyStream(stream: ReadableStream, handlers: {
   onDelta: (delta: string, full: string) => void;
   onThinking?: (delta: string, full: string) => void;
@@ -1442,7 +1450,7 @@ async function parseProxyStream(stream: ReadableStream, handlers: {
   }
 }
 
-// 流式对话（核心 - Tauri 版本，直接使用 bridge-server HTTP API）
+// 流式对话（核�?- Tauri 版本，直接使�?bridge-server HTTP API�?
 export async function sendMessageNative(
   conversationId: string,
   messages: any[],
@@ -1656,7 +1664,7 @@ export async function sendMessageNative(
   };
 }
 
-// 流式对话（核心 - HTTP 版本）
+// 流式对话（核�?- HTTP 版本�?
 export async function sendMessage(
   conversationId: string,
   message: string,
@@ -1759,6 +1767,7 @@ export async function sendMessage(
     } = null;
 
     const flushPending = () => {
+      try {
       flushScheduled = false;
       if (pendingThinkingDelta && onThinking) {
         const delta = pendingThinkingDelta;
@@ -1770,6 +1779,7 @@ export async function sendMessage(
         pendingTextDelta = '';
         onDelta(delta, fullText);
       }
+      } catch (e) { console.error('[flushPending] Error:', e); }
     };
 
     const scheduleFlush = () => {
@@ -1895,7 +1905,7 @@ export async function sendMessage(
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // 保留不完整的最后一行
+      buffer = lines.pop() || ''; // 保留不完整的最后一�?
 
       for (const line of lines) {
         if (!line.startsWith('data:')) continue;
@@ -1912,7 +1922,7 @@ export async function sendMessage(
         try {
           const parsed = JSON.parse(data);
 
-          // 处理 system 事件（如 compaction 通知）
+          // 处理 system 事件（如 compaction 通知�?
           if (parsed.type === 'system') {
             if (onSystem) {
               onSystem(parsed.event, parsed.message, parsed);
@@ -1920,7 +1930,7 @@ export async function sendMessage(
             continue;
           }
 
-          // 处理 status 事件（如搜索状态通知）
+          // 处理 status 事件（如搜索状态通知�?
           if (parsed.type === 'status') {
             if (onSystem) {
               onSystem('status', parsed.message, parsed);
@@ -1990,7 +2000,7 @@ export async function sendMessage(
                 console.log(`[API] Stream progress: ${deltaCount} deltas received, ${fullText.length} chars`);
               }
               const textChunk = parsed.delta.text;
-              // 处理中转 API 将 <thinking> 标签嵌入 text 的情况
+              // 处理中转 API �?<thinking> 标签嵌入 text 的情�?
               if (textChunk.includes('<thinking>') || textChunk.includes('</thinking>')) {
                 const thinkRegex = /<thinking>([\s\S]*?)<\/thinking>/g;
                 let match;
@@ -2019,10 +2029,10 @@ export async function sendMessage(
             }
           }
 
-          // 处理 content_block_start 来识别 thinking block
+          // 处理 content_block_start 来识�?thinking block
           if (parsed.type === 'content_block_start' && parsed.content_block) {
             if (parsed.content_block.type === 'thinking' && onThinking) {
-              // 新的 thinking block 开始
+              // 新的 thinking block 开�?
               thinkingText = '';
             }
           }
@@ -2075,6 +2085,12 @@ export async function sendMessage(
             continue;
           }
 
+          // Handle standalone usage events
+          if (parsed.type === 'usage' && onSystem) {
+            onSystem('usage', '', parsed);
+            continue;
+          }
+
           // Handle tool use events
           if (parsed.type === 'tool_use_start' && onToolUse) {
             onToolUse({ type: 'start', tool_use_id: parsed.tool_use_id, tool_name: parsed.tool_name, tool_input: parsed.tool_input, textBefore: parsed.textBefore || '' });
@@ -2086,10 +2102,10 @@ export async function sendMessage(
             onToolUse({ type: 'done', tool_use_id: parsed.tool_use_id, content: parsed.content || parsed.output, is_error: parsed.is_error });
           }
           if (parsed.type === 'tool_arg_delta') {
-            // Tool argument streaming delta — can be ignored or logged
+            // Tool argument streaming delta �?can be ignored or logged
           }
 
-          // Research mode events — forward as system events for MainContent to handle
+          // Research mode events �?forward as system events for MainContent to handle
           if (parsed.type && parsed.type.startsWith('research_') && onSystem) {
             onSystem(parsed.type, '', parsed);
             // research_report_delta also feeds into the streaming text so the
@@ -2127,7 +2143,7 @@ export async function sendMessage(
             return;
           }
         } catch (e) {
-          // 忽略非JSON行
+          // 忽略非JSON�?
         }
       }
     }
@@ -2248,13 +2264,14 @@ export async function disconnectIde(id: string) {
 
 export async function trackEvent(eventType: string, properties?: Record<string, any>, sessionId?: string) {
   try {
+    console.log('[Analytics] trackEvent:', eventType, properties);
     const res = await request('/analytics/track', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ event_type: eventType, properties, session_id: sessionId }),
     });
     return res.json();
-  } catch (_) { return { success: false }; }
+  } catch (err) { console.warn('[Analytics] trackEvent failed:', err); return { success: false }; }
 }
 
 export async function getAnalyticsDaily(date: string) {

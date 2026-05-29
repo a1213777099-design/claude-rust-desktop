@@ -455,7 +455,7 @@ pub async fn native_engine_init(app: AppHandle) -> Result<NativeEngineState, Str
     {
         let db_mgr = db_manager.clone();
         let claude_dir_clone = claude_dir.clone();
-        tokio::task::spawn_blocking(move || {
+        let _ = tokio::task::spawn_blocking(move || {
             db_mgr.with_conn(|conn| {
                 if let Err(e) = crate::db::migration::check_and_migrate(&claude_dir_clone, conn) {
                     eprintln!("[NativeEngine] Migration warning: {}", e);

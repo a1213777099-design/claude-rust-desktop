@@ -5,10 +5,8 @@ use std::collections::HashMap;
 use tokio::sync::broadcast;
 
 pub use sse_parser::{
-    analyze_pending_tool_calls, consume_sse_payloads, decode_loose_json_string,
-    extract_loose_json_boolean_field, extract_loose_json_number_field,
-    extract_loose_json_string_field, merge_tool_args, recover_malformed_tool_input,
-    try_parse_tool_input, PendingToolCall, SsePayloads, ToolCallAnalysis,
+    consume_sse_payloads, merge_tool_args,
+    try_parse_tool_input,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

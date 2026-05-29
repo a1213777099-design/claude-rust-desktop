@@ -128,7 +128,7 @@ impl OpenAIClient {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
-                .expect("Failed to create HTTP client"),
+                .unwrap_or_else(|e| { eprintln!("[HTTP] Client build failed: {}, using default", e); Client::new() }),
         }
     }
 

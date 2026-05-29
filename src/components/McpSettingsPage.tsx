@@ -224,7 +224,7 @@ const McpSettingsPage = () => {
             setEditingServer(null);
             setShowAddForm(true);
           }}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-claude-btn-hover text-white rounded-lg text-[14px] hover:opacity-90 transition-opacity"
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-claude-btn-hover text-claude-text rounded-lg text-[14px] hover:opacity-90 transition-opacity"
         >
           <Plus size={16} />
           Add Server
@@ -306,7 +306,7 @@ const McpSettingsPage = () => {
           <div className="flex gap-2">
             <button
               onClick={handleSubmit}
-              className="px-4 py-2 bg-claude-btn-hover text-white rounded-lg text-[14px] hover:opacity-90 transition-opacity"
+              className="px-4 py-2 bg-claude-btn-hover text-claude-text rounded-lg text-[14px] hover:opacity-90 transition-opacity"
             >
               {editingServer ? 'Update' : 'Add'}
             </button>
@@ -333,96 +333,38 @@ const McpSettingsPage = () => {
             <p className="text-[12px] mt-1">Add a server to extend Claude with external tools</p>
           </div>
         ) : (
-          servers.map((server) => (
-            <div
-              key={server.id}
-              className={`border rounded-xl p-4 transition-colors ${
-                server.enabled ? 'border-[#e5e5e5]' : 'border-[#e5e5e5] opacity-60'
-              }`}
-            >
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className={`w-2.5 h-2.5 rounded-full ${
-                    server.running ? 'bg-green-500' : server.enabled ? 'bg-gray-400' : 'bg-gray-300'
-                  }`} />
-                  <div>
-                    <h4 className="text-[15px] font-medium text-claude-text">{server.name}</h4>
-                    <p className="text-[12px] text-[#999] font-mono mt-0.5">
-                      {server.command} {(server.args || []).join(' ')}
-                    </p>
+          servers.map((server) => {
+            const cmdName = server.command.split(/[\\/]/).pop() || server.command;
+            const argStr = (server.args || []).join(' ');
+            return (
+              <div key={server.id} className={`border rounded-xl px-4 py-3 transition-colors ${server.enabled ? 'border-[#e5e5e5]' : 'border-[#e5e5e5] opacity-60'}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className={`flex-shrink-0 w-2 h-2 rounded-full ${server.running ? 'bg-green-500' : server.enabled ? 'bg-gray-400' : 'bg-gray-300'}`} />
+                    <h4 className="text-[14px] font-medium text-claude-text truncate">{server.name}</h4>
+                    <span className="flex-shrink-0 text-[11px] text-[#999]">{server.tools_count} tools</span>
+                  </div>
+                  <div className="flex items-center gap-0.5 flex-shrink-0">
+                    {server.running ? (
+                      <button onClick={() => handleStop(server.id)} className="p-1.5 hover:bg-red-50 rounded-md transition-colors text-red-500" title="Stop"><Square size={14} /></button>
+                    ) : (
+                      <button onClick={() => handleStart(server.id)} disabled={!server.enabled} className="p-1.5 hover:bg-green-50 rounded-md transition-colors text-green-600 disabled:opacity-30" title="Start"><Play size={14} /></button>
+                    )}
+                    {server.running && <button onClick={() => handleRestart(server.id)} className="p-1.5 hover:bg-blue-50 rounded-md transition-colors text-blue-500" title="Restart"><RotateCw size={14} /></button>}
+                    <button onClick={() => handleEdit(server)} className="p-1.5 hover:bg-gray-100 rounded-md transition-colors text-[#666]" title="Edit"><Edit2 size={13} /></button>
+                    <button onClick={() => handleDelete(server.id)} className="p-1.5 hover:bg-red-50 rounded-md transition-colors text-red-500" title="Delete"><Trash2 size={13} /></button>
+                    <label className="flex items-center gap-1 ml-1.5 cursor-pointer">
+                      <input type="checkbox" checked={server.enabled} onChange={(e) => handleToggle(server.id, e.target.checked)} className="w-3.5 h-3.5 rounded border-[#d0d0d0] text-[#D97757] focus:ring-[#D97757]/30" />
+                    </label>
                   </div>
                 </div>
-
-                <div className="flex items-center gap-1.5">
-                  <span className="text-[12px] text-[#999] mr-2">
-                    {server.tools_count} tools
-                    {server.resources_count > 0 && `, ${server.resources_count} resources`}
-                  </span>
-
-                  {server.running ? (
-                    <button
-                      onClick={() => handleStop(server.id)}
-                      className="p-1.5 hover:bg-red-50 rounded-lg transition-colors text-red-500"
-                      title="Stop"
-                    >
-                      <Square size={16} />
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => handleStart(server.id)}
-                      disabled={!server.enabled}
-                      className="p-1.5 hover:bg-green-50 rounded-lg transition-colors text-green-600 disabled:opacity-30"
-                      title="Start"
-                    >
-                      <Play size={16} />
-                    </button>
-                  )}
-
-                  {server.running && (
-                    <button
-                      onClick={() => handleRestart(server.id)}
-                      className="p-1.5 hover:bg-blue-50 rounded-lg transition-colors text-blue-500"
-                      title="Restart"
-                    >
-                      <RotateCw size={16} />
-                    </button>
-                  )}
-
-                  <button
-                    onClick={() => handleEdit(server)}
-                    className="p-1.5 hover:bg-gray-100 rounded-lg transition-colors text-[#666]"
-                    title="Edit"
-                  >
-                    <Edit2 size={14} />
-                  </button>
-
-                  <button
-                    onClick={() => handleDelete(server.id)}
-                    className="p-1.5 hover:bg-red-50 rounded-lg transition-colors text-red-500"
-                    title="Delete"
-                  >
-                    <Trash2 size={14} />
-                  </button>
-
-                  <label className="flex items-center gap-1.5 ml-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={server.enabled}
-                      onChange={(e) => handleToggle(server.id, e.target.checked)}
-                      className="w-4 h-4 rounded border-[#d0d0d0] text-[#D97757] focus:ring-[#D97757]/30"
-                    />
-                    <span className="text-[12px] text-[#666]">Enabled</span>
-                  </label>
+                <div className="mt-1.5 ml-[18px]">
+                  <p className="text-[11px] text-[#aaa] font-mono truncate" title={`${server.command} ${argStr}`}>{cmdName} {argStr}</p>
                 </div>
+                {server.error && <div className="mt-2 px-3 py-1.5 bg-red-50 text-red-600 rounded-lg text-[12px]">Error: {server.error}</div>}
               </div>
-
-              {server.error && (
-                <div className="mt-2 px-3 py-1.5 bg-red-50 text-red-600 rounded-lg text-[12px]">
-                  Error: {server.error}
-                </div>
-              )}
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 

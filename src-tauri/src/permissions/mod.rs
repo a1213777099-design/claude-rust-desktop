@@ -3,8 +3,8 @@ pub mod rules;
 pub mod audit;
 
 pub use manager::{PermissionManager, PermissionMode};
-pub use rules::{PermissionRule, PermissionAction, PermissionScope, PermissionLevel};
-pub use audit::{AuditEntry, AuditLogger};
+pub use rules::{PermissionScope, PermissionLevel};
+pub use audit::AuditLogger;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
