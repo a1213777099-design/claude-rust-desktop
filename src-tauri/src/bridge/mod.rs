@@ -323,8 +323,11 @@ impl BridgeServer {
             .route("/api/conversations/{id}/warm", post(conversation_warm_handler))
             .route("/api/conversations/{id}/context-size", get(context_size_handler))
             .route("/api/conversations/{id}/compact", post(compact_handler))
-            .route("/api/projects", get(projects_list))
-            .route("/api/projects", post(projects_create))
+            .route("/api/projects", get(projects_list).post(projects_create))
+            .route("/api/projects/{id}", get(projects_get).patch(projects_update).delete(projects_delete))
+            .route("/api/projects/{id}/conversations", get(project_conversations_list).post(project_conversation_create))
+            .route("/api/projects/{id}/files", post(project_file_upload))
+            .route("/api/projects/{id}/files/{file_id}", delete(project_file_delete))
             .route("/api/upload", post(upload_handler))
             .route("/api/uploads/{id}/raw", get(upload_get_handler))
             .route("/api/uploads/{id}", delete(upload_delete_handler))
@@ -1308,14 +1311,134 @@ async fn conversation_permission_handler(
     }
 }
 
-async fn projects_list() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "projects": [] }))
+async fn projects_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let projects = crate::db::project_repo::list_projects(conn).unwrap_or_default();
+            serde_json::json!(projects)
+        })
+    }).await;
+    match result {
+        Ok(Ok(data)) => Json(serde_json::json!({ "projects": data })),
+        _ => Json(serde_json::json!({ "projects": [] })),
+    }
 }
 
-async fn projects_create() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "id": uuid::Uuid::new_v4().to_string() }))
+async fn projects_create(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled").to_string();
+    let description = body.get("description").and_then(|v| v.as_str()).map(String::from);
+    let workspace_path = body.get("workspace_path").and_then(|v| v.as_str()).map(String::from);
+    let now = chrono::Utc::now().to_rfc3339();
+    let db = state.6.clone();
+    let id_clone = id.clone();
+    let name_clone = name.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            crate::db::project_repo::insert_project(conn, &id_clone, &name_clone, description.as_deref(), None, workspace_path.as_deref(), false, &now, &now)
+        })
+    }).await;
+    Json(serde_json::json!({ "id": id, "name": name }))
 }
 
+async fn projects_update(Path(id): Path<String>, State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            if let Ok(Some(mut project)) = crate::db::project_repo::get_project(conn, &id) {
+                if let Some(name) = body.get("name").and_then(|v| v.as_str()) { project.name = name.to_string(); }
+                if let Some(desc) = body.get("description") { project.description = desc.as_str().map(String::from); }
+                if let Some(instr) = body.get("instructions") { project.instructions = instr.as_str().map(String::from); }
+                let _ = crate::db::project_repo::update_project(conn, &id, Some(&project.name), project.description.as_deref(), project.instructions.as_deref(), project.workspace_path.as_deref(), Some(project.is_archived));
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    }).await;
+    Json(serde_json::json!({ "ok": result.is_ok() }))
+}
+
+async fn projects_delete(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::project_repo::delete_project(conn, &id))
+    }).await;
+    Json(serde_json::json!({ "ok": true }))
+}
+
+async fn projects_get(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            crate::db::project_repo::get_project(conn, &id)
+                .map_err(|e| anyhow::anyhow!(e))
+        })
+    }).await;
+    match result {
+        Ok(Ok(Ok(Some(project)))) => Json(serde_json::json!({
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "instructions": project.instructions,
+            "workspace_path": project.workspace_path,
+            "is_archived": project.is_archived,
+            "created_at": project.created_at,
+            "updated_at": project.updated_at,
+        })),
+        _ => Json(serde_json::json!({"error": "not found"})),
+    }
+}
+
+async fn project_conversations_list(Path(project_id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let pid = project_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            crate::db::conversation_repo::list_conversations_by_project(conn, &pid)
+        })
+    }).await;
+    match result {
+        Ok(Ok(Ok(convs))) => {
+            let items: Vec<_> = convs.iter().map(|c| serde_json::json!({
+                "id": c.id,
+                "title": c.title,
+                "model": c.model,
+                "project_id": c.project_id,
+                "created_at": c.created_at,
+                "updated_at": c.updated_at,
+            })).collect();
+            Json(serde_json::json!({"conversations": items}))
+        }
+        _ => Json(serde_json::json!({"conversations": []})),
+    }
+}
+async fn project_conversation_create(Path(project_id): Path<String>, State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    let conv_id = uuid::Uuid::new_v4().to_string();
+    let title = body.get("title").and_then(|v| v.as_str()).map(String::from);
+    let model = body.get("model").and_then(|v| v.as_str()).map(String::from);
+    let now = chrono::Utc::now().to_rfc3339();
+    let db = state.6.clone();
+    let conv_id_clone = conv_id.clone();
+    let project_id_clone = project_id.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            crate::db::conversation_repo::insert_conversation(conn, &conv_id_clone, title.as_deref(), model.as_deref(), None, None, Some(&project_id_clone), false, false, false, &now, &now, 0)
+        })
+    }).await;
+    Json(serde_json::json!({ "id": conv_id, "project_id": project_id }))
+}
+
+async fn project_file_delete(Path((project_id, file_id)): Path<(String, String)>, State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.6.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::project_repo::delete_project_file(conn, &file_id))
+    }).await;
+    Json(serde_json::json!({"ok": true}))
+}
+
+async fn project_file_upload(Path(project_id): Path<String>, State(state): State<AppState>, body: axum::extract::Multipart) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"error": "file upload not yet implemented"}))
+}
 static UPLOAD_DIR: once_cell::sync::Lazy<std::sync::Mutex<Option<PathBuf>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
 

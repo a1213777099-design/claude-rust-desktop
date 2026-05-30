@@ -93,6 +93,17 @@ pub fn list_conversations(conn: &Connection) -> Result<Vec<ConversationRow>> {
     Ok(result)
 }
 
+pub fn list_conversations_by_project(conn: &Connection, project_id: &str) -> Result<Vec<ConversationRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, title, model, provider, workspace_path, project_id, research_mode, pinned, archived, created_at, updated_at, message_count FROM conversations WHERE project_id = ?1 ORDER BY updated_at DESC"
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| row_to_conversation(row))?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
 pub fn update_conversation_title(conn: &Connection, id: &str, title: &str) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3"
