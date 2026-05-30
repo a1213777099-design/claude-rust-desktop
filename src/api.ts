@@ -1504,6 +1504,7 @@ export async function sendMessageNative(
         permission_mode: permissionMode,
         web_search_enabled: webSearchEnabled,
         research_mode: researchModeFlag || undefined,
+        reasoning_effort: (() => { try { return localStorage.getItem("reasoning_effort") || undefined; } catch { return undefined; } })(),
       }),
     });
 
@@ -1727,6 +1728,7 @@ export async function sendMessage(
         permission_mode: permissionMode,
         web_search_enabled: webSearchEnabled,
         research_mode: researchModeFlag || undefined,
+        reasoning_effort: (() => { try { return localStorage.getItem("reasoning_effort") || undefined; } catch { return undefined; } })(),
         user_profile: (() => {
           try {
             const p = JSON.parse(localStorage.getItem('user_profile') || localStorage.getItem('user') || '{}');

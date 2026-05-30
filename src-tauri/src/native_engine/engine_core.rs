@@ -25,6 +25,7 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub web_search_enabled: Option<bool>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug)]
@@ -323,7 +324,8 @@ impl QueryEngine {
         .with_conv_id(conv_id.clone())
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_manager(self.permission_manager.clone())
-        .with_web_search_enabled(request.web_search_enabled.unwrap_or(false));
+        .with_web_search_enabled(request.web_search_enabled.unwrap_or(false))
+                .with_reasoning_effort(request.reasoning_effort);
 
         if let Some(ref registry) = self.mcp_registry {
             executor = executor.with_mcp_registry(registry.clone());
@@ -390,8 +392,8 @@ impl QueryEngine {
                                     let msgs = crate::db::message_repo::get_messages_by_conversation(conn, &cv).unwrap_or_default();
                                     let (sum, mem_tags, mem_importance) = crate::db::memory_repo::build_smart_summary(&msgs);
                                     if !sum.is_empty() {
-                                        let mem_type = if sum.contains("Decisions:") || sum.contains("决定") { "decision" }
-                                            else if sum.contains("Preferences:") || sum.contains("喜欢") { "preference" }
+                                        let mem_type = if sum.contains("Decisions:") || sum.contains("鍐冲畾") { "decision" }
+                                            else if sum.contains("Preferences:") || sum.contains("鍠滄") { "preference" }
                                             else if sum.contains("Key facts:") { "fact" }
                                             else { "context" };
                                         crate::db::memory_repo::insert_memory(conn, &Uuid::new_v4().to_string(), &ws, &cv, &sum, &mem_tags, mem_type, mem_importance, &Utc::now().to_rfc3339())?;

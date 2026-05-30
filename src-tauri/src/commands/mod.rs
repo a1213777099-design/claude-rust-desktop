@@ -218,6 +218,7 @@ pub async fn chat_send(
         temperature: None,
         top_p: None,
             web_search_enabled: None,
+                reasoning_effort: None,
         };
 
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;
@@ -261,6 +262,7 @@ pub async fn chat_stream(
         temperature: None,
         top_p: None,
             web_search_enabled: None,
+                reasoning_effort: None,
         };
 
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;
@@ -541,6 +543,7 @@ pub async fn native_chat(
         temperature: None,
         top_p: None,
             web_search_enabled: None,
+                reasoning_effort: None,
         };
     
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;

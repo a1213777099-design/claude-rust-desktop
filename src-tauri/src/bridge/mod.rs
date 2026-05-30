@@ -111,6 +111,7 @@ pub struct ChatRequest {
     pub custom_system_prompt: Option<String>,
     pub permission_mode: Option<String>,
     pub web_search_enabled: Option<bool>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl ChatRequest {
@@ -630,6 +631,7 @@ async fn chat_handler(
                 temperature: None,
                 top_p: None,
                 web_search_enabled: req.web_search_enabled,
+                reasoning_effort: req.reasoning_effort.clone(),
             };
                     log_to_file!("[Chat] Calling send_message...");
             match engine.send_message(chat_req).await {

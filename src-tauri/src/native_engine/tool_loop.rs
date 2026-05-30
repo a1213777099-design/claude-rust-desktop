@@ -67,6 +67,7 @@ pub struct ToolLoopExecutor {
     answer_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     permission_manager: Option<Arc<PermissionManager>>,
     web_search_enabled: bool,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,7 @@ impl ToolLoopExecutor {
             answer_waiters: Arc::new(Mutex::new(HashMap::new())),
             permission_manager: None,
             web_search_enabled: false,
+            reasoning_effort: None,
         }
     }
 
@@ -129,6 +131,11 @@ impl ToolLoopExecutor {
 
     pub fn with_web_search_enabled(mut self, enabled: bool) -> Self {
         self.web_search_enabled = enabled;
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
