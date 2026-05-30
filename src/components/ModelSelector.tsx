@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ChevronDown, Check, ChevronRight } from 'lucide-react';
+import { ChevronDown, Check } from 'lucide-react';
 
 export interface SelectableModel {
   id: string;
@@ -9,7 +9,6 @@ export interface SelectableModel {
   tier?: 'opus' | 'sonnet' | 'haiku' | 'extra';
 }
 
-// Chat model thinking mapping from localStorage
 function getChatModelMap(): Map<string, { thinkingId?: string }> {
   try {
     const models = JSON.parse(localStorage.getItem('chat_models') || '[]');
@@ -24,7 +23,6 @@ function getChatModelMap(): Map<string, { thinkingId?: string }> {
 
 function stripThinking(modelStr: string) {
   const map = getChatModelMap();
-  // Check if this is a known thinking variant — find the base model
   for (const [baseId, cfg] of map) {
     if (cfg.thinkingId === modelStr) return baseId;
   }
@@ -41,7 +39,6 @@ function withThinking(base: string, thinking: boolean) {
 
 function isThinking(modelStr: string) {
   const map = getChatModelMap();
-  // Check if it's a known thinking variant
   for (const [, cfg] of map) {
     if (cfg.thinkingId === modelStr) return true;
   }
@@ -49,16 +46,9 @@ function isThinking(modelStr: string) {
 }
 
 function hasThinkingVariant(_modelId: string): boolean {
-  // All models can toggle extended thinking.
-  // Models that don't support it will simply ignore the parameter — no harm done.
   return true;
 }
 
-// Turn raw model ids / names into friendly labels.
-// - claude-opus-4-6 → "Opus 4.6", claude-haiku-4-5-20251001 → "Haiku 4.5"
-// - GLM-5 → "GLM 5", Deepseek-V3.2 → "Deepseek V3.2" (hyphens become spaces)
-// - Strips provider/org prefix (e.g. "Pro/zai-org/GLM-5" → "GLM 5")
-// - But keeps full name if the suffix after slash is very short (e.g. "openrouter/free" stays "openrouter/free")
 function prettifyModelName(name?: string, id?: string): string {
   for (const candidate of [id, name]) {
     if (!candidate) continue;
@@ -73,7 +63,6 @@ function prettifyModelName(name?: string, id?: string): string {
   const lastSlash = raw.lastIndexOf('/');
   if (lastSlash >= 0) {
     const suffix = raw.slice(lastSlash + 1);
-    // If suffix is very short (like "free"), show full name to avoid confusion
     if (suffix.length <= 5 && !suffix.includes('-')) {
       return raw.replace(/-/g, ' ');
     }
@@ -82,12 +71,21 @@ function prettifyModelName(name?: string, id?: string): string {
   return raw.replace(/-/g, ' ');
 }
 
+const EFFORT_LEVELS = [
+  { id: 'low', label: 'Low' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'high', label: 'High' },
+  { id: 'xhigh', label: 'Max' },
+];
+
 interface ModelSelectorProps {
   currentModelString: string;
   models: SelectableModel[];
   onModelChange: (newModelString: string) => void;
   isNewChat?: boolean;
   dropdownPosition?: 'top' | 'bottom';
+  effort?: string;
+  onEffortChange?: (effort: string) => void;
 }
 
 const ModelSelector: React.FC<ModelSelectorProps> = ({
@@ -95,10 +93,11 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
   models,
   onModelChange,
   dropdownPosition,
+  effort = 'medium',
+  onEffortChange,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [dropUp, setDropUp] = useState(false);
-  const [showMore, setShowMore] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const currentBase = stripThinking(currentModelString);
@@ -106,19 +105,13 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
   const currentModel = models.find(m => m && m.id === currentBase);
   const currentLabel = prettifyModelName(currentModel?.name, currentModel?.id || currentBase);
 
-  // Split models into main tiers and extra
   const mainModels = models.filter(m => m && m.tier !== 'extra');
-  const extraModels = models.filter(m => m && m.tier === 'extra');
-  const hasExtra = extraModels.length > 0;
-
-  // Current model supports thinking?
   const currentHasThinking = hasThinkingVariant(currentBase);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
         setIsOpen(false);
-        setShowMore(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
@@ -129,25 +122,24 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
     if (!isOpen && containerRef.current) {
       const rect = containerRef.current.getBoundingClientRect();
       const spaceBelow = window.innerHeight - rect.bottom;
-      setDropUp(dropdownPosition === 'top' ? true : (dropdownPosition === 'bottom' ? false : spaceBelow < 280));
+      setDropUp(dropdownPosition === 'top' ? true : (dropdownPosition === 'bottom' ? false : spaceBelow < 380));
     }
     setIsOpen(!isOpen);
-    setShowMore(false);
   };
 
   const handleSelectModel = (baseId: string, enabled: number) => {
     if (!enabled) return;
-    // If switching to a model without thinking variant, auto-disable thinking
     const targetHasThinking = hasThinkingVariant(baseId);
     onModelChange(withThinking(baseId, targetHasThinking ? thinking : false));
     setIsOpen(false);
-    setShowMore(false);
   };
 
   const handleToggleThinking = () => {
     if (!currentHasThinking) return;
     onModelChange(withThinking(currentBase, !thinking));
   };
+
+  const currentEffortLabel = EFFORT_LEVELS.find(e => e.id === effort)?.label || 'Medium';
 
   const renderModelItem = (m: SelectableModel) => {
     const active = currentBase === m.id;
@@ -179,7 +171,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
         <ChevronDown size={14} className="text-claude-textSecondary" />
       </button>
 
-      {isOpen && !showMore && (
+      {isOpen && (
         <div className={`absolute ${dropUp ? 'bottom-full mb-2' : 'top-full mt-2'} right-0 w-[260px] bg-claude-input rounded-xl shadow-xl border border-claude-border z-50 overflow-hidden py-1 text-left`}>
           {/* Main tier models */}
           {mainModels.map(renderModelItem)}
@@ -203,32 +195,29 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
             </button>
           </div>
 
-          {/* More models button */}
-          {hasExtra && (<>
-            <div className="h-[1px] bg-claude-border my-1 mx-4" />
-            <button
-              onClick={() => setShowMore(true)}
-              className="w-full px-4 py-2.5 flex items-center justify-between text-left hover:bg-claude-hover cursor-pointer"
-            >
-              <div className="text-[14.5px] font-[500] text-claude-text">More models</div>
-              <ChevronRight size={16} className="text-claude-textSecondary" />
-            </button>
-          </>)}
-        </div>
-      )}
-
-      {/* More models sub-panel */}
-      {isOpen && showMore && (
-        <div className={`absolute ${dropUp ? 'bottom-full mb-2' : 'top-full mt-2'} right-0 w-[260px] bg-claude-input rounded-xl shadow-xl border border-claude-border z-50 overflow-hidden py-1 text-left`}>
-          <button
-            onClick={() => setShowMore(false)}
-            className="w-full px-4 py-2 flex items-center gap-2 text-left hover:bg-claude-hover cursor-pointer text-claude-textSecondary"
-          >
-            <ChevronRight size={14} className="rotate-180" />
-            <span className="text-[13px] font-medium">Back</span>
-          </button>
+          {/* Effort level */}
           <div className="h-[1px] bg-claude-border my-1 mx-4" />
-          {extraModels.map(renderModelItem)}
+          <div className="px-4 py-2">
+            <div className="text-[14.5px] font-[500] text-claude-text mb-2">Reasoning Effort</div>
+            <div className="flex gap-1">
+              {EFFORT_LEVELS.map(level => (
+                <button
+                  key={level.id}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEffortChange?.(level.id);
+                  }}
+                  className={`flex-1 px-1.5 py-1 text-[12px] font-medium rounded-md transition-colors ${
+                    effort === level.id
+                      ? 'bg-[#3A6FE0] text-white'
+                      : 'bg-claude-border/40 text-claude-textSecondary hover:bg-claude-border'
+                  }`}
+                >
+                  {level.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -236,4 +225,3 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
 };
 
 export default ModelSelector;
-

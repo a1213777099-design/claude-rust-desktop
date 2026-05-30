@@ -1055,6 +1055,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const location = useLocation();
   const [localId, setLocalId] = useState<string | null>(null);
   const [showEntranceAnimation, setShowEntranceAnimation] = useState(false);
+  const [reasoningEffort, setReasoningEffort] = useState<string>(() => localStorage.getItem('reasoning_effort') || 'medium');
 
   // Use localId if we just created a chat, effectively overriding the lack of URL param until next true navigation
   const activeId = id || localId || null;
@@ -2284,6 +2285,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         console.error("Failed to update conversation model", err);
       }
     }
+  };
+
+  const handleEffortChange = (effort: string) => {
+    setReasoningEffort(effort);
+    localStorage.setItem("reasoning_effort", effort);
   };
 
   const handleAttachToProject = async (project: Project) => {
@@ -4271,6 +4277,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                     models={selectorModels}
                     onModelChange={handleModelChange}
                     isNewChat={true}
+                    effort={reasoningEffort}
+                    onEffortChange={handleEffortChange}
                   />
                     {(() => {
                       const tokens = contextInfo?.tokens ?? 0;
@@ -4684,6 +4692,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       onModelChange={handleModelChange}
                       isNewChat={false}
                       dropdownPosition="top"
+                      effort={reasoningEffort}
+                      onEffortChange={handleEffortChange}
                     />
                     {(() => {
                       const tokens = contextInfo?.tokens ?? 0;
