@@ -4031,10 +4031,10 @@ async fn tdai_search(
     let client = state.tdai_client.clone();
     let q = p.query.clone();
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::memory::tencentdb_client::TdaiSearchResponse> {
-        db.with_conn(|conn| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async move { client.search(&workspace, &q, top_k, conn).await })
-        }).and_then(|inner| inner)
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async move {
+            client.search(&workspace, &q, top_k, &*db).await
+        })
     }).await;
     match res {
         Ok(Ok(v)) => Json(v),

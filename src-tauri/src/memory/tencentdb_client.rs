@@ -16,6 +16,7 @@
 //! Auth: x-tdai-user-key header
 //! Isolation: every request carries teamId / agentId / userId (v3 strict isolation)
 
+use crate::db::DbManager;
 use crate::db::memory_repo::{search_memories_hybrid, MemoryRow};
 use crate::memory::tiered::{
     ensure_schema as ensure_tiered_schema, format_memories_for_prompt, insert_tiered_memory,
@@ -205,12 +206,18 @@ impl TdaiClient {
     }
 
     /// Hybrid search. Tries TencentDB first, falls back to local tiered store.
+    ///
+    /// The DB handle (`db`) is used ONLY for the synchronous local fallback.
+    /// The remote (network) call runs without holding the DB lock, so we never
+    /// block other database access while awaiting a network request. A prior
+    /// version held a `MutexGuard` across `block_on(search_remote(...).await)`,
+    /// which serialized all DB traffic behind a single network round-trip.
     pub async fn search(
         &self,
         workspace_path: &str,
         query: &str,
         top_k: i64,
-        conn: &Connection,
+        db: &DbManager,
     ) -> Result<TdaiSearchResponse> {
         let cfg = self.cfg.read().await.clone();
         if cfg.enabled && !cfg.base_url.is_empty() && !cfg.user_key.is_empty() {
@@ -222,9 +229,10 @@ impl TdaiClient {
                 }
             }
         }
-        // local fallback
+        // local fallback — acquire the DB lock ONLY for this synchronous call
         let team_id = if cfg.team_id.is_empty() { "default".into() } else { cfg.team_id };
-        let local = search_tiered_hybrid(conn, workspace_path, &team_id, query, None, top_k)?;
+        let local = db
+            .with_conn(|conn| search_tiered_hybrid(conn, workspace_path, &team_id, query, None, top_k))??;
         let hits = local
             .into_iter()
             .enumerate()

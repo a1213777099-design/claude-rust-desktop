@@ -387,14 +387,19 @@ impl QueryEngine {
             if combined_query.len() > 10 {
                 let workspace_path_for_search = workspace_path.clone();
                 let query_for_search = combined_query.clone();
-                let tdai_resp = tokio::task::spawn_blocking(move || {
+                let tdai_resp = {
                     let rt = tokio::runtime::Handle::current();
-                    db.with_conn(|conn| {
+                    tokio::task::spawn_blocking(move || {
                         rt.block_on(async move {
-                            tdai.search(&workspace_path_for_search, &query_for_search, 15, conn).await.ok()
+                            tdai
+                                .search(&workspace_path_for_search, &query_for_search, 15, &*db)
+                                .await
+                                .ok()
                         })
-                    }).ok().flatten()
-                }).await.unwrap_or(None);
+                    })
+                    .await
+                    .unwrap_or(None)
+                };
                 let memories: Vec<MemorySummary> = if let Some(resp) = tdai_resp {
                     resp.hits.into_iter().take(5).map(|h| MemorySummary {
                         content: h.content,

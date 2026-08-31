@@ -1,45 +1,55 @@
 ﻿const DEFAULT_BRIDGE_PORT = 30080;
-let detectedBridgePort: number | null = null;
-
-async function detectBridgePort(): Promise<number> {
-  if (detectedBridgePort) return detectedBridgePort;
-  console.log('[API] Starting Bridge port detection...');
-  for (let port = DEFAULT_BRIDGE_PORT; port < DEFAULT_BRIDGE_PORT + 10; port++) {
-    console.log(`[API] Trying port ${port}...`);
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/system-status`, { signal: AbortSignal.timeout(1500) });
-      if (res.ok) {
-        detectedBridgePort = port;
-        console.log(`[API] Bridge found on port ${port}`);
-        console.log(`[API] Bridge detection complete. Using port ${port}`);
-        return port;
-      }
-    } catch {
-      console.log(`[API] Port ${port} not available`);
-    }
-  }
-  console.log(`[API] Bridge detection complete. Using default port ${DEFAULT_BRIDGE_PORT}`);
-  return DEFAULT_BRIDGE_PORT;
-}
-
-function getApiBase(): string {
-  if (detectedBridgePort && detectedBridgePort !== DEFAULT_BRIDGE_PORT) {
-    return `http://127.0.0.1:${detectedBridgePort}/api`;
-  }
-  return `http://127.0.0.1:${DEFAULT_BRIDGE_PORT}/api`;
-}
-
-let API_BASE = `http://127.0.0.1:${DEFAULT_BRIDGE_PORT}/api`;
-const GATEWAY_BASE = 'http://127.0.0.1:30090';
-const CHENGDU_API = 'http://127.0.0.1:30090/api';
 const isTauriApp = typeof window !== 'undefined' && !!(window as any).__TAURI_INTERNALS__;
 
-if (isTauriApp) {
-  detectBridgePort().then(port => {
-    API_BASE = `http://127.0.0.1:${port}/api`;
-    detectedBridgePort = port;
-  });
+// Memoized bridge port detection. The first call kicks off the scan; every
+// subsequent call (including concurrent requests) awaits the SAME promise, so
+// there is no race between detection finishing and requests firing.
+let _bridgePortPromise: Promise<number> | null = null;
+
+function detectBridgePort(): Promise<number> {
+  if (_bridgePortPromise) return _bridgePortPromise;
+  _bridgePortPromise = (async () => {
+    if (!isTauriApp) return DEFAULT_BRIDGE_PORT;
+    console.log('[API] Starting Bridge port detection...');
+    for (let port = DEFAULT_BRIDGE_PORT; port < DEFAULT_BRIDGE_PORT + 10; port++) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/system-status`, { signal: AbortSignal.timeout(1500) });
+        if (res.ok) {
+          console.log(`[API] Bridge found on port ${port}`);
+          return port;
+        }
+      } catch {
+        // port not available, try next
+      }
+    }
+    console.log(`[API] Bridge not found, using default port ${DEFAULT_BRIDGE_PORT}`);
+    return DEFAULT_BRIDGE_PORT;
+  })();
+  return _bridgePortPromise;
 }
+
+// Resolves the correct API base URL. Awaiting this guarantees the port scan has
+// completed, eliminating the startup race where requests hit the default port
+// before detection finished.
+let _resolvedApiBase: string | null = null;
+
+async function apiBase(): Promise<string> {
+  const port = await detectBridgePort();
+  const base = `http://127.0.0.1:${port}/api`;
+  _resolvedApiBase = base;
+  return base;
+}
+
+// Synchronous variant for callers that need a URL in a non-async context
+// (e.g. image src attributes). Returns the default port until the first port
+// scan resolves — by the time such UI renders, detection has already completed
+// via the initial request().
+function apiBaseSync(): string {
+  return _resolvedApiBase ?? `http://127.0.0.1:${DEFAULT_BRIDGE_PORT}/api`;
+}
+
+const GATEWAY_BASE = 'http://127.0.0.1:30090';
+const CHENGDU_API = 'http://127.0.0.1:30090/api';
 
 let nativeEngineInitialized = false;
 
@@ -109,7 +119,7 @@ async function request(path: string, options: RequestInit = {}) {
   if (token) {
     (headers as any)['Authorization'] = `Bearer ${token}`;
   }
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const res = await fetch(`${await apiBase()}${path}`, { ...options, headers });
   if (res.status === 401) {
     localStorage.removeItem('auth_token');
     localStorage.removeItem('user');
@@ -128,7 +138,7 @@ export async function getSystemStatus(): Promise<{
   platform: string;
   gitBash: { required: boolean; found: boolean; path: string | null };
 }> {
-  const res = await fetch(`${API_BASE}/system-status`);
+  const res = await fetch(`${await apiBase()}/system-status`);
   if (!res.ok) throw new Error('Failed to get system status');
   return res.json();
 }
@@ -521,7 +531,7 @@ export async function uploadProjectFile(projectId: string, file: File): Promise<
   const formData = new FormData();
   formData.append('file', file);
   const token = getToken();
-  const res = await fetch(`${API_BASE}/projects/${projectId}/files`, {
+  const res = await fetch(`${await apiBase()}/projects/${projectId}/files`, {
     method: 'POST',
     headers: token ? { 'Authorization': `Bearer ${token}` } : {},
     body: formData,
@@ -717,7 +727,7 @@ export async function exportConversation(id: string): Promise<void> {
   }
 
   // Web Fallback Logic
-  const res = await fetch(`${API_BASE}/conversations/${id}/export`, {
+  const res = await fetch(`${await apiBase()}/conversations/${id}/export`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (res.status === 401) {
@@ -871,37 +881,37 @@ export interface WebSearchTestResult {
 }
 
 export async function testProviderWebSearch(id: string): Promise<WebSearchTestResult> {
-  const res = await fetch(`${API_BASE}/providers/${id}/test-websearch`, { method: 'POST' });
+  const res = await fetch(`${await apiBase()}/providers/${id}/test-websearch`, { method: 'POST' });
   return res.json();
 }
 
 export async function getProviders(): Promise<Provider[]> {
-  console.log('[API] getProviders called, API_BASE:', API_BASE);
-  const res = await fetch(`${API_BASE}/providers`);
+  console.log('[API] getProviders called, base:', await apiBase());
+  const res = await fetch(`${await apiBase()}/providers`);
   if (!res.ok) return [];
   const data = await res.json();
   return Array.isArray(data) ? data : (Array.isArray(data?.providers) ? data.providers : []);
 }
 
 export async function createProvider(p: Partial<Provider>): Promise<Provider> {
-  console.log('[API] createProvider called, API_BASE:', API_BASE);
-  const res = await fetch(`${API_BASE}/providers`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+  console.log('[API] createProvider called, base:', await apiBase());
+  const res = await fetch(`${await apiBase()}/providers`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
   if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || `HTTP ${res.status}`); }
   return res.json();
 }
 
 export async function updateProvider(id: string, p: Partial<Provider>): Promise<Provider> {
-  const res = await fetch(`${API_BASE}/providers/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
+  const res = await fetch(`${await apiBase()}/providers/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) });
   if (!res.ok) { const err = await res.json().catch(() => ({})); throw new Error(err.error || `HTTP ${res.status}`); }
   return res.json();
 }
 
 export async function deleteProvider(id: string): Promise<void> {
-  await fetch(`${API_BASE}/providers/${id}`, { method: 'DELETE' });
+  await fetch(`${await apiBase()}/providers/${id}`, { method: 'DELETE' });
 }
 
 export async function getProviderModels(): Promise<Array<{ id: string; name: string; providerId: string; providerName: string }>> {
-  const res = await fetch(`${API_BASE}/providers/models`);
+  const res = await fetch(`${await apiBase()}/providers/models`);
   const data = await res.json();
   return Array.isArray(data) ? data : (Array.isArray(data?.models) ? data.models : []);
 }
@@ -926,7 +936,8 @@ export function reconnectStream(
   let fullText = '';
   let thinkingText = '';
 
-  fetch(`${API_BASE}/conversations/${conversationId}/reconnect`, { signal })
+  apiBase().then((base) => {
+    fetch(`${base}/conversations/${conversationId}/reconnect`, { signal })
     .then(async (res) => {
       if (!res.ok || !res.body) { onError('Reconnect failed'); return; }
       const reader = res.body.getReader();
@@ -1012,6 +1023,7 @@ export function reconnectStream(
     .catch((err) => {
       if (err.name !== 'AbortError') onError(err.message || 'Reconnect failed');
     });
+  });
 }
 
 // 删除指定消息及其后续消息
@@ -1128,7 +1140,7 @@ export async function deleteAttachment(fileId: string): Promise<void> {
 }
 
 export function getAttachmentUrl(fileId: string): string {
-  return `${API_BASE}/uploads/${fileId}/raw`;
+  return `${apiBaseSync()}/uploads/${fileId}/raw`;
 }
 
 // Skills 相关
@@ -1267,28 +1279,28 @@ export async function mcpResourceMonitor(
 
 // GitHub Connector
 export async function getGithubStatus() {
-  const res = await fetch(`${API_BASE}/github/status`);
+  const res = await fetch(`${await apiBase()}/github/status`);
   return res.json();
 }
 
 export async function getGithubAuthUrl() {
-  const res = await fetch(`${API_BASE}/github/auth-url`);
+  const res = await fetch(`${await apiBase()}/github/auth-url`);
   return res.json();
 }
 
 export async function disconnectGithub() {
-  const res = await fetch(`${API_BASE}/github/disconnect`, { method: 'POST' });
+  const res = await fetch(`${await apiBase()}/github/disconnect`, { method: 'POST' });
   return res.json();
 }
 
 export async function getGithubRepos(page = 1) {
-  const res = await fetch(`${API_BASE}/github/repos?page=${page}`);
+  const res = await fetch(`${await apiBase()}/github/repos?page=${page}`);
   return res.json();
 }
 
 export async function getGithubTree(owner: string, repo: string, ref = '') {
   const qs = ref ? `?ref=${encodeURIComponent(ref)}` : '';
-  const res = await fetch(`${API_BASE}/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tree${qs}`);
+  const res = await fetch(`${await apiBase()}/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tree${qs}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Failed to fetch tree' }));
     throw new Error(err.error || 'Failed to fetch tree');
@@ -1301,7 +1313,7 @@ export async function getGithubContents(owner: string, repo: string, path = '', 
   if (path) params.set('path', path);
   if (ref) params.set('ref', ref);
   const qs = params.toString();
-  const url = `${API_BASE}/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents${qs ? '?' + qs : ''}`;
+  const url = `${await apiBase()}/github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents${qs ? '?' + qs : ''}`;
   const res = await fetch(url);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Failed to fetch contents' }));
@@ -1316,7 +1328,7 @@ export async function materializeGithub(
   ref: string,
   selections: Array<{ path: string; isFolder: boolean }>
 ): Promise<{ ok: boolean; repoFullName: string; ref: string; rootDir: string; fileCount: number; skipped: number }> {
-  const res = await fetch(`${API_BASE}/github/materialize`, {
+  const res = await fetch(`${await apiBase()}/github/materialize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ conversationId, repoFullName, ref, selections }),
@@ -1568,8 +1580,8 @@ export async function sendMessageNative(
   let deltaCount = 0;
 
   console.log(`[API] Sending message (native): model=${model}, messages=${messages.length}, stream=true`);
-  console.log(`[API] Request URL: ${API_BASE}/chat`);
-  console.log(`[API] Establishing SSE connection to ${API_BASE}/chat`);
+  console.log(`[API] Request URL: ${await apiBase()}/chat`);
+  console.log(`[API] Establishing SSE connection to ${await apiBase()}/chat`);
 
   // Read permissionMode from localStorage (persisted by useChatStore.setPermissionMode)
   let permissionMode: string | undefined;
@@ -1589,7 +1601,7 @@ export async function sendMessageNative(
     } catch {}
     try { researchModeFlag = localStorage.getItem("research_mode") === "true"; } catch {}
     console.log("[API] researchMode:", researchModeFlag, "webSearchEnabled:", webSearchEnabled);
-    const res = await fetch(`${API_BASE}/chat`, {
+    const res = await fetch(`${await apiBase()}/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1788,8 +1800,8 @@ export async function sendMessage(
   let fullText = '';
   let deltaCount = 0;
   console.log(`[API] Sending message: model=${model}, messages=${messages?.length || 0}, stream=true`);
-  console.log(`[API] Request URL: ${API_BASE}/chat`);
-  console.log(`[API] Establishing SSE connection to ${API_BASE}/chat`);
+  console.log(`[API] Request URL: ${await apiBase()}/chat`);
+  console.log(`[API] Establishing SSE connection to ${await apiBase()}/chat`);
   try {
     if (isTauriApp) {
       await detectBridgePort();
@@ -1811,7 +1823,7 @@ export async function sendMessage(
     } catch {}
     try { researchModeFlag = localStorage.getItem("research_mode") === "true"; } catch {}
     console.log("[API] researchMode:", researchModeFlag, "webSearchEnabled:", webSearchEnabled);
-    const res = await fetch(`${API_BASE}/chat`, {
+    const res = await fetch(`${await apiBase()}/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -2407,7 +2419,7 @@ export async function multiagentResearch(
   onEvent: (event: any) => void
 ): Promise<void> {
   await detectBridgePort();
-  const res = await fetch(`${API_BASE}/multiagent/research`, {
+  const res = await fetch(`${await apiBase()}/multiagent/research`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query, model_id: model, user_id: 'default' })
@@ -2456,7 +2468,7 @@ export async function createTerminal(cwd?: string, shell?: string): Promise<{ te
   const body: Record<string, string> = {};
   if (cwd) body.cwd = cwd;
   if (shell) body.shell = shell;
-  const res = await fetch(`${API_BASE}/terminals`, {
+  const res = await fetch(`${await apiBase()}/terminals`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -2469,7 +2481,7 @@ export async function createTerminal(cwd?: string, shell?: string): Promise<{ te
 }
 
 export async function writeTerminal(terminalId: string, data: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/terminals/${encodeURIComponent(terminalId)}/write`, {
+  const res = await fetch(`${await apiBase()}/terminals/${encodeURIComponent(terminalId)}/write`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ data }),
@@ -2478,7 +2490,7 @@ export async function writeTerminal(terminalId: string, data: string): Promise<v
 }
 
 export async function resizeTerminal(terminalId: string, cols: number, rows: number): Promise<void> {
-  const res = await fetch(`${API_BASE}/terminals/${encodeURIComponent(terminalId)}/resize`, {
+  const res = await fetch(`${await apiBase()}/terminals/${encodeURIComponent(terminalId)}/resize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ cols, rows }),
@@ -2487,14 +2499,14 @@ export async function resizeTerminal(terminalId: string, cols: number, rows: num
 }
 
 export async function closeTerminal(terminalId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/terminals/${encodeURIComponent(terminalId)}`, {
+  const res = await fetch(`${await apiBase()}/terminals/${encodeURIComponent(terminalId)}`, {
     method: 'DELETE',
   });
   if (!res.ok) throw new Error('Failed to close terminal');
 }
 
 export async function listTerminals(): Promise<TerminalSession[]> {
-  const res = await fetch(`${API_BASE}/terminals`);
+  const res = await fetch(`${await apiBase()}/terminals`);
   if (!res.ok) throw new Error('Failed to list terminals');
   return res.json();
 }
@@ -2508,7 +2520,8 @@ export function streamTerminalOutput(
 ): () => void {
   let closed = false;
 
-  fetch(`${API_BASE}/terminals/${encodeURIComponent(terminalId)}/stream`, { signal })
+  apiBase().then((base) => {
+    fetch(`${base}/terminals/${encodeURIComponent(terminalId)}/stream`, { signal })
     .then(async (res) => {
       if (!res.ok || !res.body) {
         onError('Failed to open terminal stream');
@@ -2554,6 +2567,7 @@ export function streamTerminalOutput(
     .catch((err) => {
       if (err.name !== 'AbortError') onError(err.message || 'Terminal stream error');
     });
+  });
 
   return () => {
     closed = true;
@@ -2577,7 +2591,7 @@ export async function* workflowEventStream(
   resumeRoles?: Array<{ name: string; cause_by: string; output: string }>
 ): AsyncGenerator<WorkflowEvent, void, unknown> {
   const currentModel = model || localStorage.getItem('chat_model') || 'deepseek-v4-flash-free';
-  const res = await fetch(`${API_BASE}/workflow/v2/stream`, {
+  const res = await fetch(`${await apiBase()}/workflow/v2/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ goal, provider_id: providerId, model: currentModel, workspace, resume_roles: resumeRoles }),
@@ -2752,12 +2766,12 @@ export interface TdaiSearchResponse {
 }
 
 export async function getTdaiConfig(): Promise<TencentDBConfig> {
-  const res = await fetch(`${API_BASE}/tdai/config`);
+  const res = await fetch(`${await apiBase()}/tdai/config`);
   return res.json();
 }
 
 export async function setTdaiConfig(cfg: Partial<TencentDBConfig>): Promise<{ ok: boolean; config: TencentDBConfig }> {
-  const res = await fetch(`${API_BASE}/tdai/config`, {
+  const res = await fetch(`${await apiBase()}/tdai/config`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cfg),
@@ -2766,12 +2780,12 @@ export async function setTdaiConfig(cfg: Partial<TencentDBConfig>): Promise<{ ok
 }
 
 export async function verifyTdaiAuth(): Promise<{ valid: boolean; user_id?: string; team_id?: string; agent_id?: string; error?: string }> {
-  const res = await fetch(`${API_BASE}/tdai/auth/verify`, { method: 'POST' });
+  const res = await fetch(`${await apiBase()}/tdai/auth/verify`, { method: 'POST' });
   return res.json();
 }
 
 export async function getTdaiHealth(): Promise<TdaiHealthInfo> {
-  const res = await fetch(`${API_BASE}/tdai/health`);
+  const res = await fetch(`${await apiBase()}/tdai/health`);
   return res.json();
 }
 
@@ -2780,7 +2794,7 @@ export async function searchTdaiMemories(
   workspacePath?: string,
   topK = 5
 ): Promise<TdaiSearchResponse> {
-  const res = await fetch(`${API_BASE}/tdai/search`, {
+  const res = await fetch(`${await apiBase()}/tdai/search`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ workspace_path: workspacePath, query, top_k: topK }),
@@ -2794,7 +2808,7 @@ export async function addTdaiMemory(
   importance = 3,
   tags = ''
 ): Promise<{ ok: boolean; id?: string; error?: string }> {
-  const res = await fetch(`${API_BASE}/tdai/memory`, {
+  const res = await fetch(`${await apiBase()}/tdai/memory`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ workspace_path: workspacePath, content, importance, tags }),
@@ -2803,12 +2817,12 @@ export async function addTdaiMemory(
 }
 
 export async function promoteTdaiMemory(id: string): Promise<{ ok: boolean; tier?: number; error?: string }> {
-  const res = await fetch(`${API_BASE}/tdai/memory/${encodeURIComponent(id)}/promote`, { method: 'POST' });
+  const res = await fetch(`${await apiBase()}/tdai/memory/${encodeURIComponent(id)}/promote`, { method: 'POST' });
   return res.json();
 }
 
 export async function getTdaiStats(workspacePath?: string): Promise<{ ok: boolean; stats: Record<string, number> }> {
   const qs = workspacePath ? `?workspace_path=${encodeURIComponent(workspacePath)}` : '';
-  const res = await fetch(`${API_BASE}/tdai/stats${qs}`);
+  const res = await fetch(`${await apiBase()}/tdai/stats${qs}`);
   return res.json();
 }

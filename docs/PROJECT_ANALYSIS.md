@@ -153,7 +153,7 @@ Rust 内部起了一个 **axum 服务跑在 localhost:30080**（`bridge/mod.rs`�
 | 运行时稳定性 | ⚠️ 15 次历史 panic，集中在 metagpt tool_loop |
 | 架构合理性 | ⚠️ 本地应用走 HTTP 回环；存在 IPC→HTTP→自身的绕路 |
 | 模块化 | ⚠️ bridge 4114 行、MainContent 5369 行、api.ts 2814 行，三处巨型文件 |
-| 死代码 | 🔴 crate 级 allow 全局掩盖，真实存量未知 |
+| 死代码 | 🔴 crate 级 `allow` 全局掩盖；实测摘掉后暴露 **325 条警告**（297 死代码 + 28 可清理），详见第九节 |
 | 注释质量 | ✅ 无成片注释掉的死代码；TODO/FIXME 仅 2 处 |
 | 国际化 | ✅ 494/492 key，覆盖良好 |
 | 仓库卫生 | 🔴 89 个垃圾文件、126 个未跟踪文件、3 个月未提交 |
@@ -166,9 +166,39 @@ Rust 内部起了一个 **axum 服务跑在 localhost:30080**（`bridge/mod.rs`�
 
 1. **先把改动固化** — 当前工作区有 71 个已修改文件（+6919 / −4559）和 126 个未跟踪文件，最后一次提交停在 **2026-05-30**。三个月的心血没有任何版本保护，这是最高优先级。
 2. **补 `.gitignore` 并清理根目录** — 排除 `.fastembed_cache/`、`outputs/`、`_*.cjs`、`fix_*.cjs`、`*.log`。可先移到备份目录，确认无碍再删。（`.codegraph/` 保留，它是 CodeGraph 索引且已自我忽略。）
-3. **摘掉 crate 级 `allow`** — 让编译器重新说话，一次性看清死代码全貌（预计会暴露较多，建议单独一个 commit）。
-4. **修 SQLite 并发与 `api.ts` 端口竞态** — 这两个直接影响用户可感知的稳定性。
+3. **crate 级 `allow` 评估（已完成）** — 临时摘掉后 `cargo check` 暴露 **325 条警告**：297 条（91%）为死代码（未接通的功能脚手架，集中在 `orchestration`/`prompt`/`native_engine`/`memory`），仅 **28 条**为真正可清理项（未用导入 13、未用变量 11、多余 `mut` 1、manifest key 1）。**结论：不整体摘掉**——会一夜冒出 297 条多半有意的脚手架警告；改为「保留 crate allow + 分级清理」，28 条可清理项留作后续。详见第九节。
+4. **修 SQLite 并发与 `api.ts` 端口竞态（已完成）** — 详见第九节。
 5. **拆 `MainContent.tsx`** — 5369 行是后续所有 UI 改动的速度瓶颈。
 6. **重估 HTTP 回环架构** — 短期不必推翻（能跑），但新功能应优先走 Tauri IPC，并停止在 `commands/` 内部再发 HTTP 请求。
 
 **如果只是想了解项目**：上述第二节和第六节就是全貌 —— 一个功能铺得很开、能跑起来、但工程纪律被多轮 AI 辅助调试冲淡的中型代码库。
+
+---
+
+## 九、已实施的修复（2026-08-31）
+
+以下改动均已通过编译验证（`cargo check` 零错误、`tsc --noEmit` 零错误、`vite build` 通过）。
+
+| 任务 | 文件 | 性质 | 验证 |
+|---|---|---|---|
+| 补 `.gitignore` | `.gitignore` | 隔离调试产物 + 863MB 编译目录 | 未跟踪 128→36 |
+| 固化三个月改动 | commit `436095f` + `4eb34ce` | 176 文件 +19418/−4559 | `git log` |
+| 评估 crate 级 `allow` | 只读 | 325 警告（297 死代码 + 28 可清理） | 临时摘掉后 `cargo check` |
+| 修 `api.ts` 端口竞态 | `src/api.ts` | 消除启动期请求打错端口 | `tsc` 零错误 + `vite build` 通过 |
+| 修 SQLite 并发隐患 | `tencentdb_client.rs` / `engine_core.rs` / `bridge/mod.rs` | 不再持 DB 锁跨网络 await | `cargo check` 零错误 |
+
+### 修复 1：`api.ts` 端口探测竞态（Task 4）
+- **问题**：`API_BASE` 在模块加载时写死默认端口 30080，由 `detectBridgePort()` 异步回填；但 `request()` 与 `getSystemStatus()` 直接读该模块级变量，从不等待探测完成。启动初期探测未跑完（最多 10 端口 ×1.5s）时，请求打到默认端口，bridge 若在别的端口即失败。
+- **修法**：探测改为 **memoized promise**（`detectBridgePort` 首次调用启动扫描，后续调用共享同一 promise）；新增 `apiBase()` async，所有 `fetch(\`${API_BASE}...\`)`（41 处）统一改为 `await apiBase()`。即发即弃的流式调用（`reconnectStream` / `streamTerminalOutput`）用 `apiBase().then(base => ...)` 包裹；`getAttachmentUrl`（被 JSX 同步使用）改用 `apiBaseSync()`（探测完成后缓存字符串）。
+- **效果**：探测与请求不再竞态，且端口只扫描一次。
+
+### 修复 2：SQLite 并发隐患（Task 5）
+- **问题**：`db/mod.rs` 已用 `parking_lot::Mutex`（无 poisoning，本无 poison 风险），但 `TdaiClient::search(.., conn)` 的两个调用方（`engine_core.rs:394`、`bridge/mod.rs:4036`）在 `db.with_conn(|conn| { rt.block_on(async { tdai.search(.., conn).await }) })` 中**持着 DB 锁去 `block_on` 网络异步调用**——锁被跨网络 await 持有，串行化所有 DB 访问，且在多线程运行时内 `block_on` 嵌套可能自死锁。
+- **修法**：`search` 参数由 `&Connection` 改为 `&DbManager`，内部**仅在同步的本地兜底分支**用 `with_conn` 拿锁；远程（网络）调用全程不持锁。两个调用方改为传 `&*db`，不再自行 `with_conn`。
+- **效果**：DB 锁只在同步本地兜底时短暂持有，网络往返期间其他 DB 请求不再被阻塞。
+
+### 评估结论：crate 级 `allow` 不整体摘除
+临时摘掉 crate 级 `#![allow(dead_code, ...)]` 后 `cargo check` 暴露 **325 条警告**：
+- 297 条（91%）为「never used / never constructed / never read」死代码 —— 多为 `.trae` 规格里"多智能体编排 / Computer Use / Git 工具未接通"遗留的功能脚手架，多半是有意保留。
+- 28 条为真正可清理项：未用导入 13、未用变量 11、多余 `mut` 1、manifest key 1（`src-tauri/Cargo.toml` 的 `target.cfg(...).rustflags`）。
+- **决定**：保留 crate 级 allow（避免一次性淹没 297 条脚手架警告），改为分级清理；28 条可清理项留作后续单独 commit。
