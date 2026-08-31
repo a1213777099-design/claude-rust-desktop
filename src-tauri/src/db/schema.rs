@@ -89,4 +89,40 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_workspace_path ON memories(workspace_path);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+
+-- Swarm sessions: persistent MetaGPT workflow sessions
+CREATE TABLE IF NOT EXISTS swarm_sessions (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  workspace TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  agent_status TEXT,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS swarm_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES swarm_sessions(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  agent_name TEXT,
+  agent_icon TEXT,
+  agent_color TEXT,
+  type TEXT,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_swarm_messages_session ON swarm_messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_swarm_sessions_updated_at ON swarm_sessions(updated_at);
+-- Knowledge base for MetaGPT workflows
+CREATE TABLE IF NOT EXISTS knowledge (
+  id TEXT PRIMARY KEY,
+  workspace TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL,
+  tags TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_workspace ON knowledge(workspace);
+
 "#;

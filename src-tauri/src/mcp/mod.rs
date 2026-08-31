@@ -8,11 +8,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 
 fn mcp_log(msg: &str) {
-    let log_path = std::path::PathBuf::from("F:/Projects/claude-code-rust/mcp_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        use std::io::Write;
-        let _ = writeln!(f, "[{}] {}", chrono::Utc::now().format("%H:%M:%S%.3f"), msg);
-    }
+    tracing::debug!(target: "mcp", "{}", msg);
 }
 
 
@@ -347,26 +343,30 @@ impl McpServerManager {
     }
 
     pub async fn update_server(&self, id: &str, config: McpServerConfig) -> Result<()> {
-        let mut servers = self.servers.write().await;
-        if let Some(state) = servers.get_mut(id) {
-            let was_running = state.status.running;
-            state.config = config;
-            state.status.name = state.config.name.clone();
-            state.status.command = state.config.command.clone();
-            state.status.args = state.config.args.clone();
-            state.status.env = if state.config.env.is_empty() { None } else { Some(state.config.env.clone()) };
-            state.status.enabled = state.config.enabled;
+        // 写锁必须先释放再 save_config：save_config 内部要拿读锁，
+        // tokio RwLock 不可重入，持锁嵌套会永久死锁（设置页编辑按钮挂死的根因）
+        {
+            let mut servers = self.servers.write().await;
+            if let Some(state) = servers.get_mut(id) {
+                let was_running = state.status.running;
+                state.config = config;
+                state.status.name = state.config.name.clone();
+                state.status.command = state.config.command.clone();
+                state.status.args = state.config.args.clone();
+                state.status.env = if state.config.env.is_empty() { None } else { Some(state.config.env.clone()) };
+                state.status.enabled = state.config.enabled;
 
-            if was_running {
-                if let Some(connector) = state.connector.take() {
-                    let mut conn = connector.lock().await;
-                    let _ = conn.stop().await;
+                if was_running {
+                    if let Some(connector) = state.connector.take() {
+                        let mut conn = connector.lock().await;
+                        let _ = conn.stop().await;
+                    }
+                    state.status.running = false;
+                    state.status.pid = None;
                 }
-                state.status.running = false;
-                state.status.pid = None;
+            } else {
+                return Err(anyhow!("Server not found: {}", id));
             }
-        } else {
-            return Err(anyhow!("Server not found: {}", id));
         }
 
         self.save_config().await?;
@@ -384,7 +384,7 @@ impl McpServerManager {
         let servers = self.servers.read().await;
         mcp_log(&format!("list_servers: {} servers loaded", servers.len()));
         for (id, state) in servers.iter() {
-            println!("[MCP]   - {}: name={}, enabled={}, running={}", id, state.config.name, state.config.enabled, state.status.running);
+            tracing::info!(target: "mcp", "  - {}: name={}, enabled={}, running={}", id, state.config.name, state.config.enabled, state.status.running);
         }
         servers.values().map(|s| s.status.clone()).collect()
     }
@@ -508,6 +508,21 @@ impl McpServerManager {
         all_resources
     }
 
+    pub async fn get_server_resources(&self, server_id: &str) -> Vec<McpResource> {
+        let servers = self.servers.read().await;
+        if let Some(state) = servers.get(server_id) {
+            if state.status.running {
+                if let Some(connector) = &state.connector {
+                    let conn = connector.lock().await;
+                    if let Ok(resources) = conn.list_resources().await {
+                        return resources;
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
     pub async fn read_resource(&self, server_id: &str, uri: &str, options: Option<serde_json::Value>) -> Result<McpResourceContent> {
         let connector = {
             let servers = self.servers.read().await;
@@ -575,32 +590,27 @@ impl McpServerManager {
     }
 
     pub async fn toggle_server(&self, id: &str) -> Result<()> {
-        let enabled = {
+        let new_enabled = {
             let servers = self.servers.read().await;
-            if let Some(state) = servers.get(id) {
-                state.config.enabled
-            } else {
-                return Err(anyhow!("Server not found: {}", id));
+            match servers.get(id) {
+                Some(state) => !state.config.enabled,
+                None => return Err(anyhow!("Server not found: {}", id)),
             }
         };
-
-        let mut servers = self.servers.write().await;
-        if let Some(state) = servers.get_mut(id) {
-            state.config.enabled = !enabled;
-            state.status.enabled = !enabled;
-        }
-
-        self.save_config().await?;
-        Ok(())
+        self.set_server_enabled(id, new_enabled).await
     }
 
     pub async fn set_server_enabled(&self, id: &str, enabled: bool) -> Result<()> {
-        let mut servers = self.servers.write().await;
-        if let Some(state) = servers.get_mut(id) {
-            state.config.enabled = enabled;
-            state.status.enabled = enabled;
-        } else {
-            return Err(anyhow!("Server not found: {}", id));
+        // 同 update_server：先释放写锁再持久化，避免 save_config 读锁死锁
+        {
+            let mut servers = self.servers.write().await;
+            match servers.get_mut(id) {
+                Some(state) => {
+                    state.config.enabled = enabled;
+                    state.status.enabled = enabled;
+                }
+                None => return Err(anyhow!("Server not found: {}", id)),
+            }
         }
 
         self.save_config().await?;
@@ -664,14 +674,27 @@ impl McpConnector {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        let mut cmd = Command::new(&self.config.command);
+        // On Windows, resolve command to .cmd/.exe if needed (e.g. npx -> npx.cmd)
+        let command = if cfg!(target_os = "windows") && !self.config.command.contains('.') && !self.config.command.contains('\\') && !self.config.command.contains('/') {
+            which::which(&self.config.command)
+                .or_else(|_| which::which(format!("{}.cmd", &self.config.command)))
+                .or_else(|_| which::which(format!("{}.exe", &self.config.command)))
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| self.config.command.clone())
+        } else {
+            self.config.command.clone()
+        };
+
+        tracing::info!(target: "mcp", "Starting MCP server: {} {:?}", command, self.config.args);
+
+        let mut cmd = Command::new(&command);
         cmd.args(&self.config.args)
             .envs(&self.config.env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn()?;
+        let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to start '{}': {}", command, e))?;
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to take stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to take stdout"))?;
@@ -859,7 +882,7 @@ impl McpConnector {
                 Err(e) => {
                     if attempt < max_retries {
                         let delay_ms = self.calculate_backoff(attempt);
-                        eprintln!("[MCP] Retry attempt {}/{} for {}: {} (retrying in {}ms)", 
+                        tracing::warn!(target: "mcp", "Retry attempt {}/{} for {}: {} (retrying in {}ms)",
                             attempt + 1,
                             max_retries,
                             request.method,
@@ -914,16 +937,16 @@ impl McpConnector {
     }
 
     async fn attempt_reconnect(&self) -> Result<()> {
-        eprintln!("[MCP] Attempting to reconnect to server: {}", self.config.name);
-        
+        tracing::info!(target: "mcp", "Attempting to reconnect to server: {}", self.config.name);
+
         // 检查进程是否存在
         if self.process.is_none() {
             return Err(anyhow!("No process to reconnect"));
         }
-        
+
         // 进程仍在运行，尝试重新初始化
-        eprintln!("[MCP] Process is still running, attempting to reinitialize...");
-        
+        tracing::info!(target: "mcp", "Process is still running, attempting to reinitialize...");
+
         Ok(())
     }
 

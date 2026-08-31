@@ -195,12 +195,12 @@ impl IdeBridge {
                                 let cid = conn_id.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = Self::handle_connection(stream, conns, senders, cid.clone(), rx).await {
-                                        eprintln!("[IDE Bridge] Connection {} error: {}", cid, e);
+                                        tracing::error!(target: "ide_bridge", "Connection {} error: {}", cid, e);
                                     }
                                 });
                             }
                             Err(e) => {
-                                eprintln!("[IDE Bridge] Accept error: {}", e);
+                                tracing::error!(target: "ide_bridge", "Accept error: {}", e);
                             }
                         }
                     }

@@ -220,7 +220,7 @@ impl EnginePool {
                                     &stdin_tx,
                                 ).await;
                             } else {
-                                eprintln!("[Engine] Failed to parse SSE payload: {} bytes", payload.len());
+                                tracing::error!(target: "engine", "Failed to parse SSE payload: {} bytes", payload.len());
                             }
                         }
                         continue;
@@ -513,7 +513,7 @@ impl EnginePool {
             let mut payload = serde_json::to_string(&response)?;
             payload.push('\n');
             stdin_tx.send(payload).await.map_err(|_| anyhow::anyhow!("stdin channel closed"))?;
-            eprintln!("[AskUser] Answered request_id={} for conv={}", request_id, conv_id);
+            tracing::info!(target: "askuser", "Answered request_id={} for conv={}", request_id, conv_id);
             return Ok(());
         }
         anyhow::bail!("No active engine process for conversation {}", conv_id)
@@ -551,7 +551,7 @@ impl EnginePool {
             let mut payload = serde_json::to_string(&response)?;
             payload.push('\n');
             stdin_tx.send(payload).await.map_err(|_| anyhow::anyhow!("stdin channel closed"))?;
-            eprintln!("[Permission] Responded request_id={} behavior={} for conv={}", request_id, behavior, conv_id);
+            tracing::info!(target: "permission", "Responded request_id={} behavior={} for conv={}", request_id, behavior, conv_id);
             return Ok(());
         }
         anyhow::bail!("No active engine process for conversation {}", conv_id)

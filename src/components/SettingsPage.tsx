@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Brain } from 'lucide-react';
+import { ChevronRight, Smartphone, MonitorIcon, LogOut, MoreHorizontal, Check, X, Server, Globe, Database } from 'lucide-react';
 import { getUserProfile, updateUserProfile, getUserUsage, getGatewayUsage, getSessions, deleteSession, logoutOtherSessions, changePassword, deleteAccount, logout, getProviderModels } from '../api';
 import ProviderSettings from './ProviderSettings';
 import McpSettingsPage from './McpSettingsPage';
-import MemoryPanel from './MemoryPanel';
+import TencentDBPanel from './TencentDBPanel';
 import { useI18n } from '../hooks/useI18n';
 
 interface SettingsPageProps {
@@ -16,7 +16,7 @@ const WORK_OPTIONS = [
   '法律', '医疗健康', '其他',
 ];
 
-type Tab = 'general' | 'account' | 'usage' | 'models' | 'mcp' | 'memory';
+type Tab = 'general' | 'account' | 'usage' | 'models' | 'mcp' | 'tencentdb';
 
 const SettingsPage = ({ onClose }: SettingsPageProps) => {
   const { t } = useI18n();
@@ -268,12 +268,12 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
           {t('settings.mcpServers')}
         </button>
         <button
-          onClick={() => setTab('memory')}
-          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'memory' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
+          onClick={() => setTab('tencentdb')}
+          className={`text-left px-3 py-2 rounded-lg text-[15px] font-medium transition-colors flex items-center gap-2 ${tab === 'tencentdb' ? 'bg-claude-btn-hover text-claude-text' : 'text-claude-textSecondary hover:bg-claude-hover'
             }`}
         >
-          <Brain size={16} />
-          Memory
+          <Database size={16} />
+          TencentDB
         </button>
       </div>
 
@@ -285,7 +285,7 @@ const SettingsPage = ({ onClose }: SettingsPageProps) => {
           {tab === 'account' && renderAccount()}
           {tab === 'usage' && renderUsage()}
           {tab === 'mcp' && <McpSettingsPage />}
-          {tab === 'memory' && <MemoryPanel />}
+          {tab === 'tencentdb' && <TencentDBPanel />}
         </div>
       </div>
     </div>

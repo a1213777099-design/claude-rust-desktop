@@ -126,3 +126,58 @@ pub fn count_messages(conn: &Connection, conversation_id: &str) -> Result<i64> {
     let count: i64 = stmt.query_row(params![conversation_id], |row| row.get(0))?;
     Ok(count)
 }
+
+// ─── Tool call persistence ──────────────────────────────────────────────────
+// 聊天引擎每轮的工具调用记录：持久化后前端重载会话时仍能渲染工具卡片
+
+#[derive(Debug, Clone)]
+pub struct ToolCallRow {
+    pub id: String,
+    pub message_id: String,
+    pub name: String,
+    pub input: String,
+    pub output: String,
+    pub is_error: bool,
+    pub sort_order: i64,
+}
+
+pub fn insert_tool_call(
+    conn: &Connection,
+    id: &str,
+    message_id: &str,
+    name: &str,
+    input: &str,
+    output: &str,
+    is_error: bool,
+    sort_order: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO tool_calls (id, message_id, name, input, output, is_error, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, message_id, name, input, output, is_error as i64, sort_order],
+    )?;
+    Ok(())
+}
+
+pub fn list_tool_calls_for_conversation(conn: &Connection, conversation_id: &str) -> Result<Vec<ToolCallRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT tc.id, tc.message_id, tc.name, COALESCE(tc.input, ''), COALESCE(tc.output, ''), tc.is_error, tc.sort_order \
+         FROM tool_calls tc JOIN messages m ON m.id = tc.message_id \
+         WHERE m.conversation_id = ?1 ORDER BY tc.sort_order ASC",
+    )?;
+    let rows = stmt.query_map(params![conversation_id], |row| {
+        Ok(ToolCallRow {
+            id: row.get(0)?,
+            message_id: row.get(1)?,
+            name: row.get(2)?,
+            input: row.get(3)?,
+            output: row.get(4)?,
+            is_error: row.get::<_, i64>(5)? != 0,
+            sort_order: row.get(6)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}

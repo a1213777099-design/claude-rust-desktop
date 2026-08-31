@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Server, Plus, Trash2, Power, PowerOff, Settings, Check, X, Loader2, Terminal } from 'lucide-react';
+import { Server, Plus, Trash2, Power, PowerOff, Settings, Check, X, Loader2, Terminal, FileText } from 'lucide-react';
+import { mcpResourcesList, McpResourceSummary } from '../api';
+import ResourceViewerPanel from './ResourceViewerPanel';
 
 interface McpServer {
   name: string;
@@ -37,6 +39,14 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
   const [argInput, setArgInput] = useState('');
   const [envKeyInput, setEnvKeyInput] = useState('');
   const [envValueInput, setEnvValueInput] = useState('');
+  const [resServer, setResServer] = useState<string | null>(null);
+  const [resources, setResources] = useState<McpResourceSummary[]>([]);
+  const [loadingResources, setLoadingResources] = useState(false);
+  const [viewingResource, setViewingResource] = useState<{
+    serverName: string; uri: string; name: string; mimeType?: string;
+  } | null>(null);
+  // 两段式删除确认：第一次点击进入待确认态，3 秒内再点确认
+  const [confirmDeleteName, setConfirmDeleteName] = useState<string | null>(null);
 
   useEffect(() => {
     loadServers();
@@ -45,7 +55,6 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
   const loadServers = async () => {
     setLoading(true);
     try {
-      const configPath = await getConfigPath();
       const response = await fetch(`http://127.0.0.1:30080/api/mcp/servers`, {
         headers: { 'Authorization': `Bearer ${localStorage.getItem('auth_token')}` },
       });
@@ -60,9 +69,21 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
     }
   };
 
-  const getConfigPath = async (): Promise<string> => {
-    const appData = await (window as any).__TAURI_INTERNALS__?.invoke('plugin:dialog|open') || '';
-    return appData;
+  const toggleResources = async (name: string) => {
+    if (resServer === name) {
+      setResServer(null);
+      return;
+    }
+    setResServer(name);
+    setLoadingResources(true);
+    setResources([]);
+    try {
+      setResources(await mcpResourcesList(name));
+    } catch (e) {
+      console.error('Failed to load MCP resources:', e);
+    } finally {
+      setLoadingResources(false);
+    }
   };
 
   const handleAddServer = async () => {
@@ -97,11 +118,21 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
   };
 
   const handleRemoveServer = async (name: string) => {
+    if (confirmDeleteName !== name) {
+      setConfirmDeleteName(name);
+      setTimeout(() => setConfirmDeleteName(prev => (prev === name ? null : prev)), 3000);
+      return;
+    }
+    setConfirmDeleteName(null);
     try {
-      await fetch(`http://127.0.0.1:30080/api/mcp/servers/${encodeURIComponent(name)}`, {
+      const res = await fetch(`http://127.0.0.1:30080/api/mcp/servers/${encodeURIComponent(name)}`, {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${localStorage.getItem('auth_token')}` },
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        console.error('Failed to remove MCP server:', (data as { error?: string })?.error || res.status);
+      }
       loadServers();
     } catch (e) {
       console.error('Failed to remove MCP server:', e);
@@ -110,7 +141,7 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
 
   const handleToggleServer = async (name: string, enabled: boolean) => {
     try {
-      await fetch(`http://127.0.0.1:30080/api/mcp/servers/${encodeURIComponent(name)}/toggle`, {
+      const res = await fetch(`http://127.0.0.1:30080/api/mcp/servers/${encodeURIComponent(name)}/toggle`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -118,6 +149,10 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
         },
         body: JSON.stringify({ enabled: !enabled }),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        console.error('Failed to toggle MCP server:', (data as { error?: string })?.error || res.status);
+      }
       loadServers();
     } catch (e) {
       console.error('Failed to toggle MCP server:', e);
@@ -218,23 +253,64 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
                       </button>
                       <button
                         onClick={() => handleRemoveServer(server.name)}
-                        className="p-1.5 hover:bg-red-500/10 rounded-md transition-colors"
-                        title="Remove"
+                        className={`p-1.5 rounded-md transition-colors ${confirmDeleteName === server.name ? 'bg-red-500 text-white' : 'hover:bg-red-500/10'}`}
+                        title={confirmDeleteName === server.name ? '再点一次确认删除' : 'Remove'}
                       >
-                        <Trash2 size={14} className="text-red-500" />
+                        {confirmDeleteName === server.name
+                          ? <span className="text-[10px] leading-none font-medium">确认?</span>
+                          : <Trash2 size={14} className="text-red-500" />}
                       </button>
                     </div>
                   </div>
                   <div className="text-[12px] text-claude-textSecondary font-mono bg-claude-hover/50 rounded px-2 py-1">
-                    {server.command} {server.args.join(' ')}
+                    {server.command} {(server.args || []).join(' ')}
                   </div>
-                  {Object.keys(server.env).length > 0 && (
+                  {Object.keys(server.env || {}).length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-1">
                       {Object.entries(server.env).map(([key, value]) => (
                         <span key={key} className="text-[10px] px-1.5 py-0.5 bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded">
                           {key}={value}
                         </span>
                       ))}
+                    </div>
+                  )}
+                  {server.enabled && (
+                    <div className="mt-3">
+                      <button
+                        onClick={() => toggleResources(server.name)}
+                        className="flex items-center gap-1.5 text-[12px] text-claude-textSecondary hover:text-claude-text transition-colors"
+                      >
+                        <FileText size={13} />
+                        {resServer === server.name ? 'Hide Resources' : 'Resources'}
+                      </button>
+                      {resServer === server.name && (
+                        <div className="mt-2 border border-claude-border rounded-lg overflow-hidden">
+                          {loadingResources ? (
+                            <div className="flex items-center justify-center py-3">
+                              <Loader2 size={14} className="animate-spin text-claude-textSecondary" />
+                            </div>
+                          ) : resources.length === 0 ? (
+                            <div className="px-3 py-2.5 text-[12px] text-claude-textSecondary">No resources exposed</div>
+                          ) : (
+                            resources.map((r) => (
+                              <button
+                                key={r.uri}
+                                onClick={() => setViewingResource({
+                                  serverName: server.name, uri: r.uri, name: r.name, mimeType: r.mime_type,
+                                })}
+                                className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-claude-hover transition-colors border-b border-claude-border last:border-b-0"
+                              >
+                                <FileText size={13} className="text-blue-400 flex-shrink-0" />
+                                <span className="text-[12px] text-claude-text flex-shrink-0">{r.name}</span>
+                                <span className="text-[11px] text-claude-textSecondary font-mono truncate flex-1">{r.uri}</span>
+                                {r.mime_type && (
+                                  <span className="text-[10px] text-claude-textSecondary bg-claude-hover px-1.5 py-0.5 rounded flex-shrink-0">{r.mime_type}</span>
+                                )}
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -361,6 +437,19 @@ export default function McpManagementPanel({ onClose }: { onClose: () => void })
           </button>
         </div>
       </div>
+
+      {/* 资源查看器（独立全屏层，阻止点击冒泡关闭本面板） */}
+      {viewingResource && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <ResourceViewerPanel
+            serverName={viewingResource.serverName}
+            resourceUri={viewingResource.uri}
+            resourceName={viewingResource.name}
+            mimeType={viewingResource.mimeType}
+            onClose={() => setViewingResource(null)}
+          />
+        </div>
+      )}
     </div>
   );
 }

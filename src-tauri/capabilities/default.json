@@ -11,8 +11,6 @@
     "http:default",
     "clipboard-manager:default",
     "notification:default",
-    "process:default",
-    "haptics:default",
-    "barcode-scanner:default"
+    "process:default"
   ]
 }

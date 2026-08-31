@@ -26,6 +26,7 @@ pub struct ChatRequest {
     pub top_p: Option<f32>,
     pub web_search_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
+    pub extended_thinking: bool,
 }
 
 #[derive(Debug)]
@@ -76,6 +77,29 @@ pub struct QueryEngine {
     tool_call_history: Arc<Mutex<HashMap<String, Vec<ToolCallRecord>>>>,
     permission_manager: Arc<PermissionManager>,
     skills_manager: Option<Arc<Mutex<SkillsManager>>>,
+    tdai_client: Arc<crate::memory::tencentdb_client::TdaiClient>,
+}
+
+/// Lightweight in-memory representation of a memory hit, used for prompt injection.
+#[derive(Debug, Clone)]
+struct MemorySummary {
+    content: String,
+    importance: i32,
+    tier_label: String,
+    created_at: String,
+}
+
+/// 规范化工作区路径：git-bash 风格 "/f/Projects/x" → "F:\Projects\x"。
+/// Windows 上 std::path 无法把 /f/... 解析为 F 盘，不转换会导致工具 cwd 无效。
+fn normalize_workspace_path(p: &str) -> String {
+    let t = p.trim();
+    let b = t.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[2] == b'/' && b[1].is_ascii_alphabetic() {
+        let drive = (b[1] as char).to_ascii_uppercase();
+        let rest = t[2..].replace('/', "\\");
+        return format!("{}:{}", drive, rest);
+    }
+    t.to_string()
 }
 
 impl QueryEngine {
@@ -84,6 +108,7 @@ impl QueryEngine {
         db_manager: Arc<DbManager>,
         workspaces_dir: PathBuf,
         permission_manager: Arc<PermissionManager>,
+        tdai_client: Arc<crate::memory::tencentdb_client::TdaiClient>,
     ) -> Self {
         Self {
             provider_manager,
@@ -96,6 +121,7 @@ impl QueryEngine {
             tool_call_history: Arc::new(Mutex::new(HashMap::new())),
             permission_manager,
             skills_manager: None,
+            tdai_client,
         }
     }
 
@@ -280,7 +306,38 @@ impl QueryEngine {
     pub async fn send_message(&self, request: ChatRequest) -> Result<mpsc::Receiver<EngineEvent>> {
         let conv_id = request.conversation_id.clone();
         let model = request.model.clone();
-        let workspace_path = request.workspace_path.clone().unwrap_or_else(|| ".".to_string());
+        // 工作区解析：显式传入 > 会话记录 > 会话所属项目 > "." 兜底。
+        // 之前未解析时工具 cwd 永远是进程启动目录，项目会话从未真正绑定工作区。
+        let workspace_path = match request.workspace_path.clone().filter(|s| !s.trim().is_empty()) {
+            Some(ws) => normalize_workspace_path(&ws),
+            None => {
+                let db = self.db_manager.clone();
+                let cv = conv_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    db.with_conn(|conn| {
+                        crate::db::conversation_repo::get_conversation(conn, &cv)
+                            .ok()
+                            .flatten()
+                            .and_then(|c| {
+                                c.workspace_path.filter(|s| !s.trim().is_empty()).or_else(|| {
+                                    c.project_id.and_then(|pid| {
+                                        crate::db::project_repo::get_project(conn, &pid)
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|p| p.workspace_path.filter(|s| !s.trim().is_empty()))
+                                    })
+                                })
+                            })
+                    })
+                    .ok()
+                    .flatten()
+                })
+                .await
+                .unwrap_or(None)
+                .map(|ws| normalize_workspace_path(&ws))
+                .unwrap_or_else(|| ".".to_string())
+            }
+        };
 
         let provider = {
             let pm = self.provider_manager.lock().await;
@@ -313,10 +370,69 @@ impl QueryEngine {
                 if content.is_empty() { None } else { Some((Uuid::new_v4().to_string(), content)) }
             })
             .collect();
+        // Retrieve relevant memories for cross-session context (improved).
+        // Primary path: TencentDB Agent Memory client (remote → local tiered fallback).
+        let enhanced_system_prompt = {
+            let db = self.db_manager.clone();
+            let tdai = self.tdai_client.clone();
+            // Use last 3 user messages for better context matching
+            let user_queries: Vec<String> = request.messages.iter()
+                .rev()
+                .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+                .take(3)
+                .filter_map(|m| m.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect();
+            let combined_query = user_queries.join(" ");
+
+            if combined_query.len() > 10 {
+                let workspace_path_for_search = workspace_path.clone();
+                let query_for_search = combined_query.clone();
+                let tdai_resp = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Handle::current();
+                    db.with_conn(|conn| {
+                        rt.block_on(async move {
+                            tdai.search(&workspace_path_for_search, &query_for_search, 15, conn).await.ok()
+                        })
+                    }).ok().flatten()
+                }).await.unwrap_or(None);
+                let memories: Vec<MemorySummary> = if let Some(resp) = tdai_resp {
+                    resp.hits.into_iter().take(5).map(|h| MemorySummary {
+                        content: h.content,
+                        importance: h.importance,
+                        tier_label: match h.tier { 0 => "raw", 1 => "fact", 2 => "scene", _ => "persona" }.to_string(),
+                        created_at: h.created_at,
+                    }).collect()
+                } else {
+                    // Hard fallback: pure local if TdaiClient itself failed to start
+                    Vec::new()
+                };
+
+                if !memories.is_empty() {
+                    let memory_section = memories.iter()
+                        .map(|m| {
+                            let created = chrono::DateTime::parse_from_rfc3339(&m.created_at)
+                                .ok()
+                                .map(|dt| format!("{} days ago", chrono::Utc::now().signed_duration_since(dt).num_days()))
+                                .unwrap_or_else(|| "recent".to_string());
+                            format!("- [{} | importance:{}/5 | {}] {}", m.tier_label, m.importance, created, m.content)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let base_prompt = request.system_prompt.clone().unwrap_or_default();
+                    Some(format!("{}\n\n[Relevant Memories — TencentDB]\n{}", base_prompt, memory_section))
+                } else {
+                    request.system_prompt.clone()
+                }
+            } else {
+                request.system_prompt.clone()
+            }
+        };
+
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,
-            request.system_prompt,
+            enhanced_system_prompt,
             request.max_tokens.unwrap_or(8192),
             event_tx.clone(),
             workspace_path,
@@ -325,8 +441,8 @@ impl QueryEngine {
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_manager(self.permission_manager.clone())
         .with_web_search_enabled(request.web_search_enabled.unwrap_or(false))
-                .with_reasoning_effort(request.reasoning_effort);
-
+                .with_reasoning_effort(request.reasoning_effort)
+                .with_extended_thinking(request.extended_thinking);
         if let Some(ref registry) = self.mcp_registry {
             executor = executor.with_mcp_registry(registry.clone());
         }
@@ -336,6 +452,7 @@ impl QueryEngine {
         let conversation_states_clone = self.conversation_states.clone();
         let _tool_call_history_clone = self.tool_call_history.clone();
         let db = self.db_manager.clone();
+        let tdai_client_clone = self.tdai_client.clone();
 
         let executor_handle = tokio::spawn(async move {
             match executor.execute().await {
@@ -367,6 +484,7 @@ impl QueryEngine {
                         // Then save assistant message
                         let conv_id = conv_id_clone.clone();
                         let db2 = db.clone();
+                        let tool_call_records = executor.completed_tool_calls.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             db.with_conn(|conn| {
                                 let msg_id = Uuid::new_v4().to_string();
@@ -378,12 +496,19 @@ impl QueryEngine {
                                     conn, &msg_id, &conv_id, "assistant", &full_text, None, &now, false, sort_order,
                                 )?;
                                 crate::db::conversation_repo::increment_message_count(conn, &conv_id)?;
+                                // 工具调用记录随助手消息持久化，前端重载会话后仍渲染工具卡片
+                                for (i, (tc_id, tc_name, tc_input, tc_output, tc_err)) in tool_call_records.iter().enumerate() {
+                                    let _ = crate::db::message_repo::insert_tool_call(
+                                        conn, tc_id, &msg_id, tc_name, tc_input, tc_output, *tc_err, i as i64,
+                                    );
+                                }
                                 Ok::<(), anyhow::Error>(())
                             })
                         }).await;
 
                         // Write memory
                         let db_m = db2.clone();
+                        let tdai_m = tdai_client_clone.clone();
                         let cv = conv_id_clone.clone();
                         tokio::spawn(async move {
                             let r = tokio::task::spawn_blocking(move || {
@@ -391,23 +516,35 @@ impl QueryEngine {
                                     let ws = crate::db::conversation_repo::get_conversation(conn, &cv).ok().flatten().and_then(|c| c.workspace_path).unwrap_or_default();
                                     let msgs = crate::db::message_repo::get_messages_by_conversation(conn, &cv).unwrap_or_default();
                                     let (sum, mem_tags, mem_importance) = crate::db::memory_repo::build_smart_summary(&msgs);
-                                    if !sum.is_empty() {
-                                        let mem_type = if sum.contains("Decisions:") || sum.contains("鍐冲畾") { "decision" }
-                                            else if sum.contains("Preferences:") || sum.contains("鍠滄") { "preference" }
-                                            else if sum.contains("Key facts:") { "fact" }
-                                            else { "context" };
-                                        crate::db::memory_repo::insert_memory(conn, &Uuid::new_v4().to_string(), &ws, &cv, &sum, &mem_tags, mem_type, mem_importance, &Utc::now().to_rfc3339())?;
+                                    let summary = if sum.is_empty() {
+                                        // Fallback: use last user message as context memory
+                                        msgs.iter().rev()
+                                            .find(|m| m.role == "user")
+                                            .map(|m| format!("Context: {}", m.content.chars().take(200).collect::<String>()))
+                                            .unwrap_or_else(|| "conversation".to_string())
+                                    } else { sum };
+                                    let mem_type = if summary.contains("Decisions:") || summary.contains("决定") { "decision" }
+                                        else if summary.contains("Preferences:") || summary.contains("偏好") { "preference" }
+                                        else if summary.contains("Key facts:") { "fact" }
+                                        else { "context" };
+                                    tracing::info!(target: "memory", "Creating memory for conversation {}: type={}, importance={}", cv, mem_type, mem_importance);
+                                    // Primary store only: TencentDB tiered memory (legacy table retired from main path)
+                                    let tdai = tdai_m.clone();
+                                    let rt = tokio::runtime::Handle::current();
+                                    let tier = if mem_type == "decision" || mem_type == "preference" { 2 } else { 1 };
+                                    if let Err(e) = rt.block_on(tdai.add_memory_with_tier(&ws, &summary, mem_importance, &mem_tags, tier, conn)) {
+                                        tracing::warn!(target: "memory", "tiered write failed: {}", e);
                                     }
                                     Ok(())
                                 });
-                                if let Err(e) = res { eprintln!("[Memory] error: {}", e); }
+                                if let Err(e) = res { tracing::error!(target: "memory", "error: {}", e); }
                             }).await;
-                            if let Err(e) = r { eprintln!("[Memory] task join error: {}", e); }
+                            if let Err(e) = r { tracing::error!(target: "memory", "task join error: {}", e); }
                         });
                     }
                 }
                 Err(e) => {
-                    eprintln!("[QueryEngine] Error in turn for {}: {}", conv_id_clone, e);
+                    tracing::error!(target: "queryengine", "Error in turn for {}: {}", conv_id_clone, e);
                     let mut states = conversation_states_clone.lock().await;
                     if let Some(state) = states.get_mut(&conv_id_clone) {
                         state.status = ConversationStatus::Error;

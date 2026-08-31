@@ -1,3 +1,6 @@
+pub mod state;
+pub mod memory_handlers_v2;
+
 use crate::clipboard::ClipboardManager;
 use crate::config::{AppConfig, ConfigManager};
 use crate::db::DbManager;
@@ -7,12 +10,7 @@ use crate::logger::Logger;
 
 macro_rules! log_to_file {
     ($($arg:tt)*) => {
-        let msg = format!($($arg)*);
-        let log_path = std::env::current_dir().unwrap_or_default().join("chat_debug.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-            use std::io::Write;
-            let _ = writeln!(f, "[{}] {}", chrono::Utc::now().format("%H:%M:%S%.3f"), msg);
-        }
+        tracing::debug!(target: "chat", $($arg)*);
     };
 }
 
@@ -23,7 +21,6 @@ use crate::permissions::{AuditLogger, PermissionManager, PermissionMode};
 use crate::process::ProcessManager;
 use crate::research::{ResearchEvent, ResearchOrchestrator, ResearchRequest};
 use crate::multiagent::{MultiAgentOrchestrator as PipelineOrchestrator, OrchestratorConfig};
-use crate::orchestration::{MultiAgentOrchestrator, OrchestratorConfigFile};
 use crate::skills::{Skill, SkillsManager, SkillExecutionContext};
 use crate::streaming::{StreamManager};
 use crate::task::{TaskExecutor, TaskRequest, TaskResult};
@@ -50,11 +47,7 @@ use axum::http::header::{HeaderName, ORIGIN, CONTENT_TYPE, AUTHORIZATION, ACCEPT
 use axum::http::Method;
 
 use crate::tools::{execute_tool, get_tool_definitions, ToolDefinition};
-
-struct ResearchTask {
-    handle: tokio::task::JoinHandle<()>,
-    event_tx: broadcast::Sender<ResearchEvent>,
-}
+pub use state::{AppState, ResearchTask};
 
 #[derive(Clone)]
 pub struct BridgeServer {
@@ -74,28 +67,9 @@ pub struct BridgeServer {
     notification_manager: Arc<Mutex<NotificationManager>>,
     logger: Arc<Mutex<Logger>>,
     active_research: Arc<Mutex<HashMap<String, ResearchTask>>>,
-    orchestrator: Arc<Mutex<Option<crate::orchestration::MultiAgentOrchestrator>>>,
+    tdai_client: Arc<crate::memory::tencentdb_client::TdaiClient>,
 }
 
-pub type AppState = (
-    Arc<Mutex<EnginePool>>,
-    Arc<McpServerManager>,
-    Arc<Mutex<StreamManager>>,
-    Arc<Mutex<HashMap<String, bool>>>,
-    Arc<Mutex<Option<ConfigManager>>>,
-    Arc<Mutex<SkillsManager>>,
-    Arc<DbManager>,
-    Arc<Mutex<Option<TaskExecutor>>>,
-    Arc<Mutex<ProcessManager>>,
-    Arc<Mutex<PtyManager>>,
-    Arc<Mutex<FileWatcher>>,
-    Arc<Mutex<ClipboardManager>>,
-    Arc<Mutex<NotificationManager>>,
-    Arc<Mutex<Logger>>,
-    Arc<Mutex<Option<NativeEngine>>>,
-    Arc<Mutex<HashMap<String, ResearchTask>>>,
-    Arc<Mutex<Option<crate::orchestration::MultiAgentOrchestrator>>>,
-);
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChatRequest {
@@ -112,6 +86,7 @@ pub struct ChatRequest {
     pub permission_mode: Option<String>,
     pub web_search_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
+    pub extended_thinking: Option<bool>,
 }
 
 impl ChatRequest {
@@ -169,30 +144,30 @@ impl BridgeServer {
 
         let skill_manager = SkillsManager::new();
         if let Err(e) = skill_manager.install_bundled_skills() {
-            eprintln!("[Bridge] Failed to install bundled skills: {}", e);
+            tracing::error!(target: "bridge", "Failed to install bundled skills: {}", e);
         }
 
         let db_path = data_dir.join("claude_desktop.db");
         let db_manager = DbManager::new(db_path.clone()).expect("Failed to initialize database");
         db_manager.init().expect("Failed to initialize database schema");
-        println!("[Bridge] Database initialized at {:?}", db_path);
-        println!("[Bridge] Running migration check...");
+        tracing::info!(target: "bridge", "[Bridge] Database initialized at {:?}", db_path);
+        tracing::info!(target: "bridge", "[Bridge] Running migration check...");
         {
             let data_dir_ref = &data_dir;
             db_manager.with_conn(|conn| {
                 if let Err(e) = crate::db::migration::check_and_migrate(data_dir_ref, conn) {
-                    eprintln!("[Bridge] Migration warning: {}", e);
+                    tracing::warn!(target: "bridge", "Migration warning: {}", e);
                 }
             }).ok();
         }
-        println!("[Bridge] Migration check completed");
+        tracing::info!(target: "bridge", "[Bridge] Migration check completed");
         let db_manager = Arc::new(db_manager);
         let logger = Logger::new(log_dir);
         let file_watcher = FileWatcher::new();
 
         let config_dir = data_dir.clone();
         let config_manager = ConfigManager::new(config_dir.clone());
-        println!("[Bridge] ConfigManager initialized at {:?}", data_dir.display());
+        tracing::info!(target: "bridge", "[Bridge] ConfigManager initialized at {:?}", data_dir.display());
         let config_manager = Arc::new(Mutex::new(Some(config_manager)));
 
         let provider_manager = Arc::new(Mutex::new(ProviderManager::new(
@@ -206,26 +181,30 @@ impl BridgeServer {
         let audit_logger = Arc::new(AuditLogger::new(1000));
         let permission_manager = Arc::new(PermissionManager::new(audit_logger));
         
+        let tdai_client = Arc::new(crate::memory::tencentdb_client::TdaiClient::new(
+            db_manager
+                .with_conn(|c| crate::memory::tencentdb_client::load_config(c))
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default()
+        ));
+        // One-time legacy -> tiered memory migration (dedup makes reruns safe)
+        match db_manager.with_conn(|c| crate::memory::tiered::migrate_legacy_memories(c)) {
+            Ok(Ok(n)) if n > 0 => tracing::info!(target: "bridge", "[Bridge] Migrated {} legacy memories into tiered store", n),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target: "bridge", "[Bridge] Legacy memory migration failed: {}", e),
+        }
         let native_engine = Arc::new(Mutex::new(Some(NativeEngine::new(
             provider_manager,
             db_manager.clone(),
             data_dir.join("workspaces"),
             permission_manager,
+            tdai_client.clone(),
         ))));
-        println!("[Bridge] NativeEngine initialized");
+        tracing::info!(target: "bridge", "[Bridge] NativeEngine initialized");
 
         let config_path = std::path::Path::new("config/orchestration.toml");
-        let orchestrator_config = if config_path.exists() {
-            OrchestratorConfigFile::load_or_default(config_path)
-        } else {
-            OrchestratorConfigFile::default()
-        };
-        let orchestrator = MultiAgentOrchestrator::new(
-            (&orchestrator_config).into(),
-            &data_dir,
-        );
-        let orchestrator = Arc::new(Mutex::new(Some(orchestrator)));
-        println!("[Bridge] MultiAgentOrchestrator initialized");
+                tracing::info!(target: "bridge", "[Bridge] MultiAgentOrchestrator initialized");
 
         Self {
             engine_pool: Arc::new(Mutex::new(EnginePool::new())),
@@ -244,35 +223,55 @@ impl BridgeServer {
             notification_manager: Arc::new(Mutex::new(NotificationManager::new())),
             logger: Arc::new(Mutex::new(logger)),
             active_research: Arc::new(Mutex::new(HashMap::new())),
-            orchestrator,
+            tdai_client,
         }
+    }
+
+    /// Try ports starting from base, using SO_REUSEADDR to recover from zombies.
+    pub async fn start_with_fallback(&self, base_port: u16) -> Result<()> {
+        for offset in 0..10 {
+            let port = base_port + offset;
+            tracing::info!(target: "bridge", "Trying port {}...", port);
+            match self.start(port).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(target: "bridge", "Port {} failed: {}", port, e);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("All ports exhausted"))
     }
 
     pub async fn start(&self, port: u16) -> Result<()> {
         if let Err(e) = self.mcp_server_manager.initialize().await {
-            eprintln!("[Bridge] Failed to initialize MCP server manager: {}", e);
+            tracing::error!(target: "bridge", "Failed to initialize MCP server manager: {}", e);
         }
 
-        let state: AppState = (
-            self.engine_pool.clone(),
-            self.mcp_server_manager.clone(),
-            self.stream_manager.clone(),
-            self.research_mode.clone(),
-            self.config_manager.clone(),
-            self.skill_manager.clone(),
-            self.db_manager.clone(),
-            self.task_executor.clone(),
-            self.process_manager.clone(),
-            self.terminal_manager.clone(),
-            self.file_watcher.clone(),
-            self.clipboard_manager.clone(),
-            self.notification_manager.clone(),
-            self.logger.clone(),
-            self.native_engine.clone(),
-            self.active_research.clone(),
-            self.orchestrator.clone(),
-        );
-        println!("[Bridge] Database manager ready");
+        // Initialize embedding engine (auto-detect: fastembed ONNX → TF-IDF fallback)
+        let embedding_engine = Arc::new(crate::memory::embedding::EmbeddingEngine::new_auto(384).await);
+        // Use the shared TdaiClient instance (initialized in BridgeServer::new)
+        let tdai_client = self.tdai_client.clone();
+        let state = AppState {
+            engine_pool: self.engine_pool.clone(),
+            mcp_server_manager: self.mcp_server_manager.clone(),
+            stream_manager: self.stream_manager.clone(),
+            research_mode: self.research_mode.clone(),
+            config_manager: self.config_manager.clone(),
+            skill_manager: self.skill_manager.clone(),
+            db_manager: self.db_manager.clone(),
+            task_executor: self.task_executor.clone(),
+            process_manager: self.process_manager.clone(),
+            terminal_manager: self.terminal_manager.clone(),
+            file_watcher: self.file_watcher.clone(),
+            clipboard_manager: self.clipboard_manager.clone(),
+            notification_manager: self.notification_manager.clone(),
+            logger: self.logger.clone(),
+            native_engine: self.native_engine.clone(),
+            active_research: self.active_research.clone(),
+            embedding_engine,
+            tdai_client,
+        };
+        tracing::info!(target: "bridge", "Database manager ready");
 
         let allowed_origins = vec![
             "tauri://localhost".parse::<axum::http::HeaderValue>().unwrap(),
@@ -302,6 +301,7 @@ impl BridgeServer {
 
         let app = Router::new()
             .route("/api/system-status", get(system_status))
+            .route("/api/open-folder", post(open_folder_handler))
             .route("/api/workspace-config", get(workspace_config_get))
             .route("/api/workspace-config", post(workspace_config_set))
             .route("/api/chat", post(chat_handler))
@@ -348,15 +348,18 @@ impl BridgeServer {
             .route("/api/skills/{name}/enable", post(skill_enable))
             .route("/api/skills/{name}/execute", post(skill_execute))
             .route("/api/skills/match", post(skills_match))
-            .route("/api/workflow/execute", post(workflow_execute))
-            .route("/api/workflow/stats", get(workflow_stats))
-            .route("/api/workflow/config", get(workflow_config_get))
-            .route("/api/workflow/config", post(workflow_config_set))
+                                                                        .route("/api/workflow/v2/stream", post(metagpt_workflow_stream))
             .route("/api/tasks", post(task_execute))
             .route("/api/tasks/{id}/status", get(task_status))
             .route("/api/tasks/{id}/cancel", post(task_cancel))
             .route("/api/mcp/servers", get(mcp_servers_list))
             .route("/api/mcp/servers", post(mcp_servers_update))
+            .route("/api/mcp/tools", get(mcp_all_tools))
+            .route("/api/mcp/servers/{name}", put(mcp_server_update_one).delete(mcp_server_delete))
+            .route("/api/mcp/servers/{name}/toggle", patch(mcp_server_toggle))
+            .route("/api/mcp/servers/{name}/start", post(mcp_server_start))
+            .route("/api/mcp/servers/{name}/stop", post(mcp_server_stop))
+            .route("/api/mcp/servers/{name}/restart", post(mcp_server_restart))
             .route("/api/mcp/servers/{name}/tools", get(mcp_tools_list))
             .route("/api/mcp/servers/{name}/resources", get(mcp_resources_list))
             .route("/api/mcp/servers/{name}/resources/{uri}", get(mcp_resource_read))
@@ -419,15 +422,49 @@ impl BridgeServer {
             .route("/api/analytics/summary", get(analytics_summary))
             .route("/api/analytics/event-counts", get(analytics_event_counts))
             .route("/api/analytics/recent-events", get(analytics_recent_events))
-            .route("/api/memories", get(memories_list))
+            .route("/api/memories", get(memories_list).post(memory_handlers_v2::memories_create))
             .route("/api/memories/search", get(memories_search))
             .route("/api/memories/stats", get(memories_stats))
-            .route("/api/memories/{id}", delete(memories_delete))
+            .route("/api/memories/tags", get(memory_handlers_v2::memories_tags))
+            .route("/api/memories/tags/rename", post(memory_handlers_v2::memories_tag_rename))
+            .route("/api/memories/tags/merge", post(memory_handlers_v2::memories_tags_merge))
+            .route("/api/memories/tags/delete", post(memory_handlers_v2::memories_tag_delete))
+            .route("/api/memories/{id}", delete(memories_delete).put(memory_handlers_v2::memories_update))
+            .route("/api/memories/backfill", post(memories_backfill))
+        .route("/api/memories/vector-search", post(memory_handlers_v2::memories_vector_search))
+        .route("/api/memories/vector-stats", get(memory_handlers_v2::memories_vector_stats))
+            .route("/api/memories/{id}/associations", get(memory_handlers_v2::memories_associations))
+            .route("/api/memories/cluster", post(memory_handlers_v2::memories_cluster))
+            .route("/api/memories/compress", post(memory_handlers_v2::memories_compress))
+        .route("/api/knowledge", get(memory_handlers_v2::knowledge_list).post(memory_handlers_v2::knowledge_create))
+        .route("/api/knowledge/search", post(memory_handlers_v2::knowledge_search))
+            .route("/api/swarm/sessions", get(swarm_sessions_list).post(swarm_sessions_create))
+            .route("/api/swarm/sessions/{id}", get(swarm_sessions_get).delete(swarm_sessions_delete))
+            .route("/api/swarm/sessions/{id}/messages", get(swarm_messages_get).post(swarm_messages_add))
+            .route("/api/swarm/sessions/{id}/status", post(swarm_status_update))
+            .route("/api/swarm/sessions/{id}/title", post(swarm_session_rename))
+            .route("/api/tdai/health", get(tdai_health))
+            .route("/api/tdai/config", get(tdai_get_config).post(tdai_set_config))
+            .route("/api/tdai/auth/verify", post(tdai_auth_verify))
+            .route("/api/tdai/search", post(tdai_search))
+            .route("/api/tdai/memory", post(tdai_add_memory))
+            .route("/api/tdai/memory/{id}/promote", post(tdai_promote))
+            .route("/api/tdai/stats", get(tdai_stats))
+
             .layer(cors)
             .with_state(state);
 
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-        println!("[Bridge] Server running on http://127.0.0.1:{}", port);
+        // Use SO_REUSEADDR to recover from zombie sockets after crash
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+        socket.set_reuse_address(true)?;
+        #[cfg(windows)]
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        let std_listener: std::net::TcpListener = socket.into();
+        std_listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        tracing::info!(target: "bridge", "[Bridge] Server running on http://127.0.0.1:{}", port);
         axum::serve(listener, app).await?;
         Ok(())
     }
@@ -445,6 +482,51 @@ async fn system_status() -> Json<SystemStatus> {
             path: git_bash_path,
         },
     })
+}
+
+#[derive(Deserialize)]
+struct OpenFolderRequest {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct OpenFolderResponse {
+    ok: bool,
+    error: Option<String>,
+}
+
+async fn open_folder_handler(Json(body): Json<OpenFolderRequest>) -> Json<OpenFolderResponse> {
+    let path = body.path.trim().to_string();
+    if path.is_empty() {
+        return Json(OpenFolderResponse { ok: false, error: Some("path is empty".to_string()) });
+    }
+    let pb = std::path::PathBuf::from(&path);
+    if !pb.exists() {
+        return Json(OpenFolderResponse { ok: false, error: Some(format!("path does not exist: {}", path)) });
+    }
+    let result: Result<(), String> = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+    match result {
+        Ok(()) => Json(OpenFolderResponse { ok: true, error: None }),
+        Err(e) => Json(OpenFolderResponse { ok: false, error: Some(e) }),
+    }
 }
 
 #[derive(Serialize)]
@@ -493,8 +575,8 @@ async fn chat_handler(
     State(state): State<AppState>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
-    let native_engine = state.14.clone();
-    let config_manager = state.4.clone();
+    let native_engine = state.native_engine.clone();
+    let config_manager = state.config_manager.clone();
     let conv_id = req.conversation_id.clone();
     let model = req.model.clone();
     let messages = req.get_messages();
@@ -513,7 +595,7 @@ async fn chat_handler(
                         id: p.id.clone(), name: p.name.clone(), base_url: p.base_url.clone(),
                         api_key: p.api_key.clone().unwrap_or_default(),
                         api_format: { let d = p.base_url.contains("deepseek"); if p.provider_type=="anthropic" && !d { crate::native_engine::provider_manager::ApiFormat::Anthropic } else { crate::native_engine::provider_manager::ApiFormat::OpenAI } },
-                        models: p.models.iter().map(|m| crate::native_engine::provider_manager::ModelConfig { id: m.id.clone(), name: m.name.clone(), enabled: m.enabled, max_tokens: m.max_tokens, context_window: None, supports_vision: m.supports_vision, supports_web_search: false }).collect(),
+                        models: p.models.iter().map(|m| crate::native_engine::provider_manager::ModelConfig { id: m.id.clone(), name: m.name.clone(), enabled: m.enabled, max_tokens: m.max_tokens, context_window: None, supports_vision: m.supports_vision, supports_web_search: false, context_size: None }).collect(),
                         enabled: p.enabled, web_search_strategy: p.web_search_strategy.clone(),
                     }
                 }).collect::<Vec<_>>()
@@ -529,18 +611,18 @@ async fn chat_handler(
         }};
         let api_key = resolved.provider.api_key.clone(); let base_url = resolved.provider.base_url.clone();
         let api_fmt = match resolved.provider.api_format { crate::native_engine::provider_manager::ApiFormat::Anthropic => "anthropic", _ => "openai" }.to_string();
-        let rid = uuid::Uuid::new_v4().to_string(); let ar = state.15.clone();
+        let rid = uuid::Uuid::new_v4().to_string(); let ar = state.active_research.clone();
         let (btx, _) = broadcast::channel::<ResearchEvent>(256); let (mtx, mrx) = tokio::sync::mpsc::unbounded_channel::<ResearchEvent>();
         let btx2 = btx.clone(); let req2 = ResearchRequest { query, api_key, base_url, model: model.clone(), api_format: api_fmt };
         let handle = tokio::spawn(async move {
             let b = btx2.clone(); let mut mrx = mrx;
             let fh = tokio::spawn(async move { while let Some(ev) = mrx.recv().await { let _ = b.send(ev); } });
             let o = ResearchOrchestrator::new(reqwest::Client::new());
-            if let Err(e) = o.run_pipeline(req2, mtx).await { eprintln!("[Research] Error: {}", e); }
+            if let Err(e) = o.run_pipeline(req2, mtx).await { tracing::error!(target: "research", "Error: {}", e); }
             let _ = fh.await;
         });
         { ar.lock().await.insert(rid.clone(), ResearchTask { handle, event_tx: btx.clone() }); }
-        let mut rx = btx.subscribe(); let cid = conv_id.clone(); let db = state.6.clone();
+        let mut rx = btx.subscribe(); let cid = conv_id.clone(); let db = state.db_manager.clone();
         let stream = async_stream::stream! {
             let mut report = String::new();
             while let Ok(ev) = rx.recv().await {
@@ -598,6 +680,7 @@ async fn chat_handler(
                         max_tokens: m.max_tokens, context_window: None,
                         supports_vision: m.supports_vision,
                         supports_web_search: false,
+                        context_size: None,
                     }).collect(),
                     enabled: p.enabled,
                     web_search_strategy: p.web_search_strategy.clone(),
@@ -632,17 +715,18 @@ async fn chat_handler(
                 top_p: None,
                 web_search_enabled: req.web_search_enabled,
                 reasoning_effort: req.reasoning_effort.clone(),
+                extended_thinking: req.extended_thinking.unwrap_or(false) || model.ends_with("-thinking"),
             };
                     log_to_file!("[Chat] Calling send_message...");
             match engine.send_message(chat_req).await {
                 Ok(rx) => Some(rx),
                 Err(e) => {
-                    eprintln!("[Chat] NativeEngine send_message error: {}", e);
+                    tracing::error!(target: "chat", "NativeEngine send_message error: {}", e);
                     None
                 }
             }
         } else {
-            eprintln!("[Chat] NativeEngine not initialized");
+            tracing::error!(target: "chat", "NativeEngine not initialized");
             None
         }
     };
@@ -723,7 +807,7 @@ async fn chat_handler(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::Error(err) => {
-                    eprintln!("[Chat] Engine error: {}", err);
+                    tracing::error!(target: "chat", "Engine error: {}", err);
                     Some(serde_json::json!({
                         "type": "error",
                         "error": err,
@@ -776,7 +860,7 @@ async fn chat_stream_handler(
     State(state): State<AppState>,
     Query(query): Query<StreamQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let stream_manager = state.2.clone();
+    let stream_manager = state.stream_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, StreamManager> = stream_manager.lock().await;
 
     let receiver = manager.add_listener(&query.conversation_id)
@@ -841,7 +925,7 @@ async fn tools_list_handler() -> Json<Vec<ToolDefinition>> {
 }
 
 async fn conversations_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| crate::db::conversation_repo::list_conversations(conn))
     }).await;
@@ -853,7 +937,7 @@ async fn conversations_list(State(state): State<AppState>) -> Json<serde_json::V
 
 async fn conversations_create(State(state): State<AppState>) -> Json<serde_json::Value> {
     let id = uuid::Uuid::new_v4().to_string();
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let id_clone = id.clone();
     let _ = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
@@ -865,19 +949,44 @@ async fn conversations_create(State(state): State<AppState>) -> Json<serde_json:
 }
 
 async fn conversation_get(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let id_clone = id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        db.with_conn(|conn| crate::db::message_repo::get_messages_by_conversation(conn, &id_clone))
+        db.with_conn(|conn| -> anyhow::Result<(Vec<crate::db::message_repo::MessageRow>, Vec<crate::db::message_repo::ToolCallRow>)> {
+            let messages = crate::db::message_repo::get_messages_by_conversation(conn, &id_clone)?;
+            let tool_calls = crate::db::message_repo::list_tool_calls_for_conversation(conn, &id_clone).unwrap_or_default();
+            Ok((messages, tool_calls))
+        })
     }).await;
     match result {
-        Ok(Ok(Ok(messages))) => Json(serde_json::json!({ "id": id, "messages": messages })),
+        Ok(Ok(Ok((messages, tool_calls)))) => {
+            // 按消息聚合工具调用，前端重载会话后仍能渲染工具卡片
+            let mut by_msg: std::collections::HashMap<String, Vec<&crate::db::message_repo::ToolCallRow>> = std::collections::HashMap::new();
+            for tc in &tool_calls {
+                by_msg.entry(tc.message_id.clone()).or_default().push(tc);
+            }
+            let messages: Vec<serde_json::Value> = messages.into_iter().map(|m| {
+                let mut v = serde_json::to_value(&m).unwrap_or(serde_json::json!({}));
+                let mid = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                if let Some(list) = by_msg.get(&mid) {
+                    v["tool_calls"] = serde_json::json!(list.iter().map(|tc| serde_json::json!({
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": serde_json::from_str::<serde_json::Value>(&tc.input).unwrap_or(serde_json::json!({})),
+                        "output": tc.output,
+                        "is_error": tc.is_error,
+                    })).collect::<Vec<_>>());
+                }
+                v
+            }).collect();
+            Json(serde_json::json!({ "id": id, "messages": messages }))
+        }
         _ => Json(serde_json::json!({ "id": id, "messages": [] })),
     }
 }
 
 async fn conversation_update(Path(id): Path<String>, State(state): State<AppState>, Json(messages): Json<Vec<serde_json::Value>>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let _ = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn: &rusqlite::Connection| {
             let tx = conn.unchecked_transaction()?;
@@ -912,64 +1021,143 @@ struct CompactRequest {
 async fn compact_handler(
     Path(id): Path<String>,
     State(state): State<AppState>,
-    Json(_req): Json<CompactRequest>,
+    Json(req): Json<CompactRequest>,
 ) -> Json<serde_json::Value> {
-    let db = state.6.clone();
-    
+    let db = state.db_manager.clone();
+
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| -> anyhow::Result<serde_json::Value> {
-            // Get all messages
             let messages = crate::db::message_repo::get_messages_by_conversation(conn, &id)?;
-            
+
             if messages.len() < 4 {
                 return Ok(serde_json::json!({
                     "success": false,
                     "error": "Not enough messages to compact (minimum 4)"
                 }));
             }
-            
-            // Split: keep last 3 messages, compact the rest
-            let split_point = messages.len().saturating_sub(3);
+
+            // Smart compaction strategy:
+            // 1. Keep last 5 messages intact (recent context is most valuable)
+            // 2. Keep all system messages (they contain instructions)
+            // 3. Summarize older user/assistant exchanges
+            let keep_count = 5.min(messages.len());
+            let split_point = messages.len().saturating_sub(keep_count);
             let old_messages = &messages[..split_point];
             let new_messages = &messages[split_point..];
-            
-            // Generate summary from old messages
-            let mut summary_parts = Vec::new();
+
+            // Build structured summary with key information extraction
+            let mut topics: Vec<String> = Vec::new();
+            let mut decisions: Vec<String> = Vec::new();
+            let mut code_changes: Vec<String> = Vec::new();
+            let mut file_refs: Vec<String> = Vec::new();
+
             for msg in old_messages.iter() {
-                if msg.role == "user" || msg.role == "assistant" {
-                    let preview: String = msg.content.chars().take(200).collect();
-                    summary_parts.push(format!("[{}]: {}", msg.role, preview));
+                if msg.role == "system" {
+                    continue; // Skip system messages in summary
+                }
+
+                let content = &msg.content;
+
+                // Extract file references
+                for word in content.split_whitespace() {
+                    if (word.ends_with(".rs") || word.ends_with(".ts") || word.ends_with(".tsx")
+                        || word.ends_with(".py") || word.ends_with(".js") || word.ends_with(".json"))
+                        && (word.contains('/') || word.contains('\\'))
+                        && !file_refs.contains(&word.to_string())
+                    {
+                        file_refs.push(word.to_string());
+                    }
+                }
+
+                // Extract decision patterns
+                let lower = content.to_lowercase();
+                if lower.contains("decided") || lower.contains("chose") || lower.contains("going with")
+                    || lower.contains("let's use") || lower.contains("we'll") {
+                    let preview: String = content.chars().take(150).collect();
+                    decisions.push(format!("[{}]: {}", msg.role, preview));
+                }
+
+                // Extract code change descriptions
+                if lower.contains("added") || lower.contains("fixed") || lower.contains("refactored")
+                    || lower.contains("changed") || lower.contains("updated") || lower.contains("removed") {
+                    let preview: String = content.chars().take(150).collect();
+                    code_changes.push(format!("[{}]: {}", msg.role, preview));
+                }
+
+                // Extract topic from user messages
+                if msg.role == "user" {
+                    let preview: String = content.chars().take(100).collect();
+                    topics.push(preview);
                 }
             }
-            let summary = format!("**Previous conversation summary:**\n\n{}", summary_parts.join("\n\n"));
-            
-            // Calculate tokens saved
+
+            // Build the summary
+            let mut summary_parts = Vec::new();
+
+            if !topics.is_empty() {
+                summary_parts.push(format!("**Topics discussed:**\n{}", topics.join("\n")));
+            }
+            if !decisions.is_empty() {
+                let recent_decisions: Vec<&str> = decisions.iter().take(5).map(|s| s.as_str()).collect();
+                summary_parts.push(format!("**Key decisions:**\n{}", recent_decisions.join("\n")));
+            }
+            if !code_changes.is_empty() {
+                let recent_changes: Vec<&str> = code_changes.iter().take(5).map(|s| s.as_str()).collect();
+                summary_parts.push(format!("**Code changes:**\n{}", recent_changes.join("\n")));
+            }
+            if !file_refs.is_empty() {
+                let recent_files: Vec<&str> = file_refs.iter().take(10).map(|s| s.as_str()).collect();
+                summary_parts.push(format!("**Files referenced:**\n{}", recent_files.join(", ")));
+            }
+
+            let summary = if summary_parts.is_empty() {
+                format!("**Previous conversation summary:** {} messages compacted.", old_messages.len())
+            } else {
+                format!("**Previous conversation summary ({} messages):**\n\n{}",
+                    old_messages.len(), summary_parts.join("\n\n"))
+            };
+
+            // Custom instruction if provided
+            let summary = if let Some(ref instruction) = req.instruction {
+                if !instruction.is_empty() {
+                    format!("{}\n\n**User instruction:** {}", summary, instruction)
+                } else {
+                    summary
+                }
+            } else {
+                summary
+            };
+
             let old_tokens: usize = old_messages.iter().map(|m| m.content.len()).sum();
             let new_tokens = summary.len();
             let tokens_saved = old_tokens.saturating_sub(new_tokens);
-            
-            // Delete old messages
+
+            // Delete old messages and insert summary
             let split_order = old_messages.last().map(|m| m.sort_order + 1).unwrap_or(0);
             crate::db::message_repo::delete_messages_before(conn, &id, split_order)?;
-            
-            // Insert summary message as compact boundary
+
             let summary_id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().to_rfc3339();
             crate::db::message_repo::insert_message(
-                conn, &summary_id, &id, "system", &summary, 
+                conn, &summary_id, &id, "system", &summary,
                 None, &now, true, 0
             )?;
-            
+
+            tracing::info!(target: "compact", "Compacted conversation {}: {} messages -> {} + summary (saved ~{} chars)",
+                id, messages.len(), keep_count, tokens_saved);
+
             Ok(serde_json::json!({
                 "success": true,
                 "summary": summary,
                 "tokensSaved": tokens_saved,
                 "messagesCompacted": old_messages.len(),
-                "messagesRemaining": new_messages.len() + 1
+                "messagesRemaining": new_messages.len() + 1,
+                "filesReferenced": file_refs.len(),
+                "topicsExtracted": topics.len()
             }))
         })
     }).await;
-    
+
     match result {
         Ok(Ok(Ok(data))) => Json(data),
         Ok(Ok(Err(e))) => Json(serde_json::json!({"success": false, "error": e.to_string()})),
@@ -980,37 +1168,30 @@ async fn context_size_handler(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    let log_path = std::path::PathBuf::from("F:/Projects/claude-code-rust/mcp_debug.log");
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
-        .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] Called for conversation: {}", id) });
-    let db = state.6.clone();
-    
+    tracing::debug!(target: "context", conversation_id = %id, "Context size query");
+    let db = state.db_manager.clone();
+
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            // Get conversation info
             let conv = crate::db::conversation_repo::get_conversation(conn, &id)?;
             let messages = crate::db::message_repo::get_messages_by_conversation(conn, &id)?;
-            
-            // Estimate current token count
-            // Simplified: Chinese chars ~2 tokens each, English words ~1.5 tokens
+
             let total_chars: usize = messages.iter()
                 .map(|m| m.content.len())
                 .sum();
             let estimated_tokens = (total_chars as f64 * 1.5) as u32;
-            
-            // Get model context limit
+
             let model_id = conv.as_ref()
                 .and_then(|c| c.model.as_deref())
                 .unwrap_or("default");
             let context_limit = crate::native_engine::provider_manager::get_default_context_size(model_id);
-            
-            // Calculate usage percentage
+
             let usage_percent = if context_limit > 0 {
                 (estimated_tokens as f64 / context_limit as f64 * 100.0).round() as u32
             } else {
                 0
             };
-            
+
             Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({
                 "tokens": estimated_tokens,
                 "limit": context_limit,
@@ -1020,26 +1201,22 @@ async fn context_size_handler(
             }))
         })
     }).await;
-    
+
     match result {
         Ok(Ok(Ok(data))) => {
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
-                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] Success: {}", data) });
+            tracing::debug!(target: "context", "Context size result: {}", data);
             Json(data)
         },
         Err(e) => {
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
-                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] spawn_blocking error: {}", e) });
+            tracing::error!(target: "context", "spawn_blocking error: {}", e);
             Json(serde_json::json!({"tokens": 0, "limit": 200000, "error": format!("spawn error: {}", e)}))
         },
         Ok(Err(e)) => {
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
-                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] with_conn error: {}", e) });
+            tracing::error!(target: "context", "with_conn error: {}", e);
             Json(serde_json::json!({"tokens": 0, "limit": 200000, "error": format!("conn error: {}", e)}))
         },
         Ok(Ok(Err(e))) => {
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
-                .and_then(|mut f| { use std::io::Write; writeln!(f, "[ctx] query error: {}", e) });
+            tracing::error!(target: "context", "query error: {}", e);
             Json(serde_json::json!({"tokens": 0, "limit": 200000, "error": format!("query error: {}", e)}))
         },
     }
@@ -1057,7 +1234,7 @@ struct ConversationPatch {
 }
 
 async fn conversation_patch(Path(id): Path<String>, State(state): State<AppState>, Json(patch): Json<ConversationPatch>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let now = chrono::Utc::now().to_rfc3339();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
@@ -1083,7 +1260,7 @@ async fn conversation_patch(Path(id): Path<String>, State(state): State<AppState
 }
 
 async fn conversation_delete(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let _ = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             crate::db::message_repo::delete_messages_from(conn, &id, 0).ok();
@@ -1094,7 +1271,7 @@ async fn conversation_delete(Path(id): Path<String>, State(state): State<AppStat
 }
 
 async fn conversation_messages(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| crate::db::message_repo::get_messages_by_conversation(conn, &id))
     }).await;
@@ -1108,7 +1285,7 @@ async fn conversation_message_delete(
     Path((id, mid)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             let msg = crate::db::message_repo::get_message(conn, &mid)?;
@@ -1120,8 +1297,8 @@ async fn conversation_message_delete(
     }).await;
     match result {
         Ok(Ok(Ok(messages))) => Ok(Json(serde_json::json!({ "success": true, "messages": messages }))),
-        Ok(Ok(Err(e))) => { eprintln!("[MessageDelete] Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Ok(Err(e)) => { eprintln!("[MessageDelete] DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+        Ok(Ok(Err(e))) => { tracing::error!(target: "messagedelete", "Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+        Ok(Err(e)) => { tracing::error!(target: "chat", "MessageDelete DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -1130,7 +1307,7 @@ async fn conversation_messages_tail_delete(
     Path((id, count)): Path<(String, i64)>,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             crate::db::message_repo::delete_messages_tail(conn, &id, count)?;
@@ -1139,8 +1316,8 @@ async fn conversation_messages_tail_delete(
     }).await;
     match result {
         Ok(Ok(Ok(messages))) => Ok(Json(serde_json::json!({ "success": true, "messages": messages }))),
-        Ok(Ok(Err(e))) => { eprintln!("[MessagesTailDelete] Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Ok(Err(e)) => { eprintln!("[MessagesTailDelete] DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+        Ok(Ok(Err(e))) => { tracing::error!(target: "messagestaildelete", "Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+        Ok(Err(e)) => { tracing::error!(target: "chat", "MessagesTailDelete DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -1155,7 +1332,7 @@ async fn conversation_branch_handler(
     State(state): State<AppState>,
     Json(req): Json<BranchRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             let new_id = uuid::Uuid::new_v4().to_string();
@@ -1183,8 +1360,8 @@ async fn conversation_branch_handler(
     }).await;
     match result {
         Ok(Ok(Ok(new_id))) => Ok(Json(serde_json::json!({ "success": true, "new_conversation_id": new_id }))),
-        Ok(Ok(Err(e))) => { eprintln!("[Branch] Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
-        Ok(Err(e)) => { eprintln!("[Branch] DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+        Ok(Ok(Err(e))) => { tracing::error!(target: "branch", "Failed: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
+        Ok(Err(e)) => { tracing::error!(target: "chat", "Branch DB lock error: {}", e); Err(StatusCode::INTERNAL_SERVER_ERROR) }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -1201,7 +1378,7 @@ async fn conversation_answer_handler(
     State(state): State<AppState>,
     Json(req): Json<AnswerRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let engine_pool = state.0.clone();
+    let engine_pool = state.engine_pool.clone();
     let mut pool: tokio::sync::MutexGuard<'_, EnginePool> = engine_pool.lock().await;
 
     let original_input = pool.get_ask_user_pending(&id).unwrap_or(serde_json::json!({}));
@@ -1221,19 +1398,27 @@ async fn conversation_answer_handler(
         Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
         Err(_) => {
             drop(pool);
-            let native_engine = state.14.clone();
+            let native_engine = state.native_engine.clone();
             let engine_guard: tokio::sync::MutexGuard<'_, Option<NativeEngine>> = native_engine.lock().await;
             if let Some(engine) = engine_guard.as_ref() {
-                let answer_str = serde_json::to_string(&answers).unwrap_or_default();
-                match engine.resume_with_answer(&id, answer_str).await {
+                // Extract the actual answer value from the answers object.
+                // Frontend sends: {"question text": "Yes"} — we need just "Yes".
+                let answer_value = if let Some(obj) = answers.as_object() {
+                    obj.values().next().and_then(|v| v.as_str()).unwrap_or("Yes").to_string()
+                } else if let Some(s) = answers.as_str() {
+                    s.to_string()
+                } else {
+                    "Yes".to_string()
+                };
+                match engine.resume_with_answer(&id, answer_value).await {
                     Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
                     Err(e) => {
-                        eprintln!("[AskUser] Native engine answer failed: {}", e);
+                        tracing::error!(target: "chat", "AskUser engine answer failed: {}", e);
                         Err(StatusCode::NOT_FOUND)
                     }
                 }
             } else {
-                eprintln!("[AskUser] No engine available for conversation {}", id);
+                tracing::error!(target: "askuser", "No engine available for conversation {}", id);
                 Err(StatusCode::NOT_FOUND)
             }
         }
@@ -1258,9 +1443,9 @@ async fn conversation_warm_handler(
             "bypass_permissions" => PermissionMode::BypassPermissions,
             _ => PermissionMode::AskPermissions,
         };
-        if let Some(engine) = state.14.lock().await.as_ref() {
+        if let Some(engine) = state.native_engine.lock().await.as_ref() {
             engine.set_permission_mode(perm_mode).await;
-            eprintln!("[Bridge] Warm: permission_mode set to {:?} for conversation {}", perm_mode, id);
+            tracing::info!(target: "bridge", "Warm: permission_mode set to {:?} for conversation {}", perm_mode, id);
         }
     }
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1278,7 +1463,7 @@ async fn conversation_permission_handler(
     State(state): State<AppState>,
     Json(req): Json<PermissionRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let engine_pool = state.0.clone();
+    let engine_pool = state.engine_pool.clone();
     let mut pool: tokio::sync::MutexGuard<'_, EnginePool> = engine_pool.lock().await;
 
     let pending = pool.get_tool_permission_pending(&id);
@@ -1294,19 +1479,19 @@ async fn conversation_permission_handler(
         Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
         Err(_) => {
             drop(pool);
-            let native_engine = state.14.clone();
+            let native_engine = state.native_engine.clone();
             let engine_guard: tokio::sync::MutexGuard<'_, Option<NativeEngine>> = native_engine.lock().await;
             if let Some(engine) = engine_guard.as_ref() {
                 let answer = if behavior == "allow" { "allow".to_string() } else { "deny".to_string() };
                 match engine.resume_with_answer(&id, answer).await {
                     Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
                     Err(e) => {
-                        eprintln!("[Permission] Native engine answer failed: {}", e);
+                        tracing::error!(target: "permission", "Native engine answer failed: {}", e);
                         Err(StatusCode::NOT_FOUND)
                     }
                 }
             } else {
-                eprintln!("[Permission] No pool engine and no native engine for conversation {}", id);
+                tracing::error!(target: "permission", "No pool engine and no native engine for conversation {}", id);
                 Err(StatusCode::NOT_FOUND)
             }
         }
@@ -1314,7 +1499,7 @@ async fn conversation_permission_handler(
 }
 
 async fn projects_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             let projects = crate::db::project_repo::list_projects(conn).unwrap_or_default();
@@ -1333,7 +1518,7 @@ async fn projects_create(State(state): State<AppState>, Json(body): Json<serde_j
     let description = body.get("description").and_then(|v| v.as_str()).map(String::from);
     let workspace_path = body.get("workspace_path").and_then(|v| v.as_str()).map(String::from);
     let now = chrono::Utc::now().to_rfc3339();
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let id_clone = id.clone();
     let name_clone = name.clone();
     let _ = tokio::task::spawn_blocking(move || {
@@ -1345,13 +1530,14 @@ async fn projects_create(State(state): State<AppState>, Json(body): Json<serde_j
 }
 
 async fn projects_update(Path(id): Path<String>, State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             if let Ok(Some(mut project)) = crate::db::project_repo::get_project(conn, &id) {
                 if let Some(name) = body.get("name").and_then(|v| v.as_str()) { project.name = name.to_string(); }
                 if let Some(desc) = body.get("description") { project.description = desc.as_str().map(String::from); }
                 if let Some(instr) = body.get("instructions") { project.instructions = instr.as_str().map(String::from); }
+                if let Some(wp) = body.get("workspace_path") { project.workspace_path = wp.as_str().map(String::from); }
                 let _ = crate::db::project_repo::update_project(conn, &id, Some(&project.name), project.description.as_deref(), project.instructions.as_deref(), project.workspace_path.as_deref(), Some(project.is_archived));
             }
             Ok::<(), anyhow::Error>(())
@@ -1361,7 +1547,7 @@ async fn projects_update(Path(id): Path<String>, State(state): State<AppState>, 
 }
 
 async fn projects_delete(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let _ = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| crate::db::project_repo::delete_project(conn, &id))
     }).await;
@@ -1369,7 +1555,7 @@ async fn projects_delete(Path(id): Path<String>, State(state): State<AppState>) 
 }
 
 async fn projects_get(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
             crate::db::project_repo::get_project(conn, &id)
@@ -1392,7 +1578,7 @@ async fn projects_get(Path(id): Path<String>, State(state): State<AppState>) -> 
 }
 
 async fn project_conversations_list(Path(project_id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let pid = project_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
@@ -1418,20 +1604,22 @@ async fn project_conversation_create(Path(project_id): Path<String>, State(state
     let conv_id = uuid::Uuid::new_v4().to_string();
     let title = body.get("title").and_then(|v| v.as_str()).map(String::from);
     let model = body.get("model").and_then(|v| v.as_str()).map(String::from);
+    let workspace_path = body.get("workspace_path").and_then(|v| v.as_str()).map(String::from);
     let now = chrono::Utc::now().to_rfc3339();
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let conv_id_clone = conv_id.clone();
     let project_id_clone = project_id.clone();
+    let workspace_path_clone = workspace_path.clone();
     let _ = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            crate::db::conversation_repo::insert_conversation(conn, &conv_id_clone, title.as_deref(), model.as_deref(), None, None, Some(&project_id_clone), false, false, false, &now, &now, 0)
+            crate::db::conversation_repo::insert_conversation(conn, &conv_id_clone, title.as_deref(), model.as_deref(), None, workspace_path_clone.as_deref(), Some(&project_id_clone), false, false, false, &now, &now, 0)
         })
     }).await;
-    Json(serde_json::json!({ "id": conv_id, "project_id": project_id }))
+    Json(serde_json::json!({ "id": conv_id, "project_id": project_id, "workspace_path": workspace_path }))
 }
 
 async fn project_file_delete(Path((project_id, file_id)): Path<(String, String)>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let _ = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| crate::db::project_repo::delete_project_file(conn, &file_id))
     }).await;
@@ -1441,8 +1629,8 @@ async fn project_file_delete(Path((project_id, file_id)): Path<(String, String)>
 async fn project_file_upload(Path(project_id): Path<String>, State(state): State<AppState>, body: axum::extract::Multipart) -> Json<serde_json::Value> {
     Json(serde_json::json!({"error": "file upload not yet implemented"}))
 }
-static UPLOAD_DIR: once_cell::sync::Lazy<std::sync::Mutex<Option<PathBuf>>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(None));
+static UPLOAD_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 fn get_upload_dir() -> PathBuf {
     let guard = UPLOAD_DIR.lock().unwrap_or_else(|e| e.into_inner());
@@ -1462,12 +1650,12 @@ fn get_upload_dir() -> PathBuf {
 async fn upload_handler(mut multipart: Multipart) -> Result<Json<serde_json::Value>, StatusCode> {
     let upload_dir = get_upload_dir();
     std::fs::create_dir_all(&upload_dir).map_err(|e| {
-        eprintln!("[Upload] Failed to create upload dir: {}", e);
+        tracing::error!(target: "upload", "Failed to create upload dir: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        eprintln!("[Upload] Multipart error: {}", e);
+        tracing::error!(target: "upload", "Multipart error: {}", e);
         StatusCode::BAD_REQUEST
     })? {
         let name = field.name().unwrap_or("").to_string();
@@ -1499,11 +1687,11 @@ async fn upload_handler(mut multipart: Multipart) -> Result<Json<serde_json::Val
 
             let dest_path = upload_dir.join(&file_id);
             tokio::fs::write(&dest_path, &data).await.map_err(|e| {
-                eprintln!("[Upload] Failed to save file: {}", e);
+                tracing::error!(target: "upload", "Failed to save file: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-            println!("[Upload] File saved: {} ({} bytes, type: {})", file_name, file_size, file_type);
+            tracing::info!(target: "bridge", "[Upload] File saved: {} ({} bytes, type: {})", file_name, file_size, file_type);
 
             return Ok(Json(serde_json::json!({
                 "fileId": file_id,
@@ -1567,14 +1755,14 @@ async fn upload_delete_handler(Path(id): Path<String>) -> Result<Json<serde_json
 
     if file_path.exists() {
         tokio::fs::remove_file(&file_path).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        println!("[Upload] File deleted: {}", id);
+        tracing::info!(target: "bridge", "[Upload] File deleted: {}", id);
     }
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 async fn providers_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_ref() {
         let config = m.get_config();
@@ -1615,7 +1803,7 @@ struct CreateProviderRequest {
 }
 
 async fn providers_create(State(state): State<AppState>, Json(req): Json<CreateProviderRequest>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_mut() {
         let id = uuid::Uuid::new_v4().to_string();
@@ -1648,6 +1836,7 @@ async fn providers_create(State(state): State<AppState>, Json(req): Json<CreateP
             web_search_strategy: None,
             web_search_tested_at: None,
             web_search_test_reason: None,
+            api_format: None,
         };
         match m.add_provider(new_provider) {
             Ok(()) => {
@@ -1655,7 +1844,7 @@ async fn providers_create(State(state): State<AppState>, Json(req): Json<CreateP
                 drop(manager);
                 let state_clone = state.clone();
                 sync_provider_manager_owned(state_clone).await;
-                let config_manager2 = state.4.clone();
+                let config_manager2 = state.config_manager.clone();
                 let manager2: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager2.lock().await;
                 if let Some(m2) = manager2.as_ref() {
                     if let Some(created) = m2.get_provider(&created_id) {
@@ -1698,7 +1887,7 @@ struct UpdateProviderRequest {
 }
 
 async fn providers_patch(Path(id): Path<String>, State(state): State<AppState>, Json(updates): Json<HashMap<String, serde_json::Value>>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_mut() {
         let config = m.get_config();
@@ -1753,7 +1942,7 @@ async fn providers_patch(Path(id): Path<String>, State(state): State<AppState>, 
             drop(manager);
             sync_provider_manager_owned(state.clone()).await;
             
-            let config_manager2 = state.4.clone();
+            let config_manager2 = state.config_manager.clone();
             let manager2: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager2.lock().await;
             if let Some(m2) = manager2.as_ref() {
                 if let Some(p) = m2.get_provider(&id) {
@@ -1782,7 +1971,7 @@ async fn providers_patch(Path(id): Path<String>, State(state): State<AppState>, 
 }
 
 async fn providers_delete(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_mut() {
         match m.remove_provider(&id) {
@@ -1799,7 +1988,7 @@ async fn providers_delete(Path(id): Path<String>, State(state): State<AppState>)
 }
 
 async fn providers_models_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_ref() {
         let config = m.get_config();
@@ -1822,7 +2011,7 @@ async fn providers_models_list(State(state): State<AppState>) -> Json<serde_json
 }
 
 async fn providers_test_websearch(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_ref() {
         if let Some(provider) = m.get_provider(&id) {
@@ -1833,7 +2022,7 @@ async fn providers_test_websearch(Path(id): Path<String>, State(state): State<Ap
 
             let result = test_web_search_capability(&id, &api_key, &base_url, &provider_type).await;
 
-            let config_manager = state.4.clone();
+            let config_manager = state.config_manager.clone();
             let mut manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
             if let Some(m) = manager.as_mut() {
                 if let Some(provider) = m.get_provider_mut(&id) {
@@ -1852,8 +2041,8 @@ async fn providers_test_websearch(Path(id): Path<String>, State(state): State<Ap
 
 #[allow(dead_code)]
 async fn sync_provider_manager(state: &AppState) {
-    let config_manager = state.4.clone();
-    let native_engine = state.14.clone();
+    let config_manager = state.config_manager.clone();
+    let native_engine = state.native_engine.clone();
     
     let providers_to_sync = {
         let cm_guard = config_manager.lock().await;
@@ -1879,6 +2068,7 @@ async fn sync_provider_manager(state: &AppState) {
                         max_tokens: m.max_tokens, context_window: None,
                         supports_vision: m.supports_vision,
                         supports_web_search: p.supports_web_search,
+                        context_size: None,
                     }).collect(),
                     enabled: p.enabled,
                     web_search_strategy: p.web_search_strategy.clone(),
@@ -1892,13 +2082,13 @@ async fn sync_provider_manager(state: &AppState) {
     let mut engine_guard = native_engine.lock().await;
     if let Some(engine) = engine_guard.as_mut() {
         engine.sync_providers(providers_to_sync).await;
-        println!("[Bridge] ProviderManager synced with ConfigManager providers");
+        tracing::info!(target: "bridge", "[Bridge] ProviderManager synced with ConfigManager providers");
     }
 }
 
 async fn sync_provider_manager_owned(state: AppState) {
-    let config_manager = state.4.clone();
-    let native_engine = state.14.clone();
+    let config_manager = state.config_manager.clone();
+    let native_engine = state.native_engine.clone();
     
     let providers_to_sync = {
         let cm_guard = config_manager.lock().await;
@@ -1924,6 +2114,7 @@ async fn sync_provider_manager_owned(state: AppState) {
                         max_tokens: m.max_tokens, context_window: None,
                         supports_vision: m.supports_vision,
                         supports_web_search: p.supports_web_search,
+                        context_size: None,
                     }).collect(),
                     enabled: p.enabled,
                     web_search_strategy: p.web_search_strategy.clone(),
@@ -1937,7 +2128,7 @@ async fn sync_provider_manager_owned(state: AppState) {
     let mut engine_guard = native_engine.lock().await;
     if let Some(engine) = engine_guard.as_mut() {
         engine.sync_providers(providers_to_sync).await;
-        println!("[Bridge] ProviderManager synced with ConfigManager providers");
+        tracing::info!(target: "bridge", "[Bridge] ProviderManager synced with ConfigManager providers");
     }
 }
 
@@ -1953,7 +2144,7 @@ async fn test_web_search_capability(_id: &str, _api_key: &str, _base_url: &str, 
 }
 
 async fn config_get(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_ref() {
         return Json(serde_json::to_value(m.get_config()).unwrap_or_default());
@@ -1962,7 +2153,7 @@ async fn config_get(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn config_update(State(state): State<AppState>, Json(config): Json<AppConfig>) -> Json<serde_json::Value> {
-    let config_manager = state.4.clone();
+    let config_manager = state.config_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
     if let Some(m) = manager.as_mut() {
         let _ = m.update_config(|c| *c = config);
@@ -1971,7 +2162,7 @@ async fn config_update(State(state): State<AppState>, Json(config): Json<AppConf
 }
 
 async fn skills_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
+    let skill_manager = state.skill_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     match manager.load_skills().await {
         Ok(skills) => Json(serde_json::json!({ "skills": skills })),
@@ -1980,7 +2171,7 @@ async fn skills_list(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn skills_create(State(state): State<AppState>, Json(skill): Json<Skill>) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
+    let skill_manager = state.skill_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     match manager.create_skill(&skill.name, &skill.description, &skill.content.unwrap_or_default()) {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -1989,7 +2180,7 @@ async fn skills_create(State(state): State<AppState>, Json(skill): Json<Skill>) 
 }
 
 async fn skill_get(Path(name): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
+    let skill_manager = state.skill_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     match manager.get_skill_by_id(&name).await {
         Ok(Some(skill)) => Json(serde_json::to_value(skill).unwrap_or_default()),
@@ -1999,7 +2190,7 @@ async fn skill_get(Path(name): Path<String>, State(state): State<AppState>) -> J
 }
 
 async fn skill_update(Path(name): Path<String>, State(state): State<AppState>, Json(updates): Json<HashMap<String, serde_json::Value>>) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
+    let skill_manager = state.skill_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     match manager.update_skill(&name, updates) {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2008,7 +2199,7 @@ async fn skill_update(Path(name): Path<String>, State(state): State<AppState>, J
 }
 
 async fn skill_delete(Path(name): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
+    let skill_manager = state.skill_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     match manager.delete_skill(&name) {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2022,7 +2213,7 @@ pub struct SkillEnableRequest {
 }
 
 async fn skill_enable(Path(name): Path<String>, State(state): State<AppState>, Json(_req): Json<SkillEnableRequest>) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
+    let skill_manager = state.skill_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     match manager.toggle_skill(&name).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2043,8 +2234,8 @@ async fn skill_execute(
     State(state): State<AppState>,
     Json(req): Json<SkillExecuteRequest>,
 ) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
-    let mcp_server_manager = state.1.clone();
+    let skill_manager = state.skill_manager.clone();
+    let mcp_server_manager = state.mcp_server_manager.clone();
     
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     
@@ -2080,7 +2271,7 @@ pub struct SkillMatchRequest {
 }
 
 async fn skills_match(State(state): State<AppState>, Json(req): Json<SkillMatchRequest>) -> Json<serde_json::Value> {
-    let skill_manager = state.5.clone();
+    let skill_manager = state.skill_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, SkillsManager> = skill_manager.lock().await;
     match manager.execute_skill("match", &req.input, None).await {
         Ok(result) => Json(serde_json::json!({ "matched": true, "result": result })),
@@ -2101,7 +2292,7 @@ async fn task_execute(
     State(state): State<AppState>,
     Json(req): Json<TaskExecuteRequest>,
 ) -> Result<Json<TaskResult>, StatusCode> {
-    let task_executor = state.7.clone();
+    let task_executor = state.task_executor.clone();
     let executor: tokio::sync::MutexGuard<'_, Option<TaskExecutor>> = task_executor.lock().await;
     if let Some(e) = executor.as_ref() {
         let task_request = TaskRequest {
@@ -2123,7 +2314,7 @@ async fn task_execute(
 }
 
 async fn task_status(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let task_executor = state.7.clone();
+    let task_executor = state.task_executor.clone();
     let executor: tokio::sync::MutexGuard<'_, Option<TaskExecutor>> = task_executor.lock().await;
     if let Some(e) = executor.as_ref() {
         if let Some(status) = e.get_task_status(&id).await {
@@ -2134,7 +2325,7 @@ async fn task_status(Path(id): Path<String>, State(state): State<AppState>) -> J
 }
 
 async fn task_cancel(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let task_executor = state.7.clone();
+    let task_executor = state.task_executor.clone();
     let executor: tokio::sync::MutexGuard<'_, Option<TaskExecutor>> = task_executor.lock().await;
     if let Some(e) = executor.as_ref() {
         let cancelled = e.cancel_task(&id).await;
@@ -2144,7 +2335,7 @@ async fn task_cancel(Path(id): Path<String>, State(state): State<AppState>) -> J
 }
 
 async fn mcp_servers_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mcp_server_manager = state.1.clone();
+    let mcp_server_manager = state.mcp_server_manager.clone();
     let servers: Vec<crate::mcp::McpServerStatus> = mcp_server_manager.list_servers().await;
     let servers_json: Vec<serde_json::Value> = servers
         .iter()
@@ -2153,6 +2344,7 @@ async fn mcp_servers_list(State(state): State<AppState>) -> Json<serde_json::Val
             "name": s.name,
             "command": s.command,
             "args": s.args,
+            "env": s.env,
             "enabled": s.enabled,
             "running": s.running,
             "pid": s.pid,
@@ -2166,20 +2358,115 @@ async fn mcp_servers_list(State(state): State<AppState>) -> Json<serde_json::Val
     Json(serde_json::json!({ "servers": servers_json }))
 }
 
-async fn mcp_servers_update(State(state): State<AppState>, Json(servers): Json<Vec<McpServerConfig>>) -> Json<serde_json::Value> {
-    let mcp_server_manager = state.1.clone();
-    
-    for server in servers {
-        if let Err(e) = mcp_server_manager.add_server(server).await {
-            eprintln!("[Bridge] Failed to add MCP server: {}", e);
+async fn mcp_servers_update(State(state): State<AppState>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+    // 兼容单对象与数组两种提交格式（McpManagementPanel 提交单对象，旧调用方提交数组）；
+    // 补齐 id/args/env/enabled 缺省值后再解析，避免前端字段不全时静默丢弃
+    let arr = match body {
+        serde_json::Value::Array(a) => a,
+        v @ serde_json::Value::Object(_) => vec![v],
+        _ => vec![],
+    };
+    let items: Vec<McpServerConfig> = arr.into_iter().filter_map(|mut item| {
+        let obj = item.as_object_mut()?;
+        let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        if name.is_empty() { return None; }
+        let id_empty = obj.get("id").and_then(|i| i.as_str()).unwrap_or("").is_empty();
+        if id_empty {
+            obj.insert("id".into(), serde_json::Value::String(name.to_lowercase().replace(' ', "-")));
+        }
+        obj.entry("args".to_string()).or_insert(serde_json::Value::Array(vec![]));
+        obj.entry("env".to_string()).or_insert(serde_json::Value::Object(Default::default()));
+        obj.entry("enabled".to_string()).or_insert(serde_json::Value::Bool(true));
+        serde_json::from_value(item).ok()
+    }).collect();
+
+    let mcp_server_manager = state.mcp_server_manager.clone();
+    let mut added = 0usize;
+    for server in items {
+        match mcp_server_manager.add_server(server).await {
+            Ok(()) => added += 1,
+            Err(e) => tracing::error!(target: "bridge", "Failed to add MCP server: {}", e),
         }
     }
 
-    Json(serde_json::json!({ "ok": true }))
+    Json(serde_json::json!({ "ok": true, "added": added }))
+}
+
+/// 统一的 {ok} / (500, {error}) 响应封装：供增删改/启停处理器复用
+type McpOpResult = Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)>;
+
+fn mcp_op_err(action: &str, name: &str, e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    tracing::error!(target: "bridge", "MCP {} '{}' failed: {}", action, name, e);
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+async fn mcp_all_tools(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let tools: Vec<crate::mcp::McpTool> = state.mcp_server_manager.get_all_tools().await;
+    let tools_json: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| serde_json::json!({
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.input_schema,
+            "server_name": t.server_name
+        }))
+        .collect();
+    Json(serde_json::json!({ "tools": tools_json }))
+}
+
+async fn mcp_server_update_one(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+    Json(mut config): Json<McpServerConfig>,
+) -> McpOpResult {
+    config.id = name.clone();
+    state.mcp_server_manager.update_server(&name, config).await
+        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map_err(|e| mcp_op_err("update", &name, e))
+}
+
+async fn mcp_server_delete(Path(name): Path<String>, State(state): State<AppState>) -> McpOpResult {
+    state.mcp_server_manager.remove_server(&name).await
+        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map_err(|e| mcp_op_err("remove", &name, e))
+}
+
+#[derive(Deserialize)]
+struct McpToggleRequest {
+    enabled: bool,
+}
+
+async fn mcp_server_toggle(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<McpToggleRequest>,
+) -> McpOpResult {
+    state.mcp_server_manager.set_server_enabled(&name, req.enabled).await
+        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map_err(|e| mcp_op_err("toggle", &name, e))
+}
+
+/// 启动/停止/重启处理器
+async fn mcp_server_start(Path(name): Path<String>, State(state): State<AppState>) -> McpOpResult {
+    state.mcp_server_manager.start_server(&name).await
+        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map_err(|e| mcp_op_err("start", &name, e))
+}
+
+async fn mcp_server_stop(Path(name): Path<String>, State(state): State<AppState>) -> McpOpResult {
+    state.mcp_server_manager.stop_server(&name).await
+        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map_err(|e| mcp_op_err("stop", &name, e))
+}
+
+async fn mcp_server_restart(Path(name): Path<String>, State(state): State<AppState>) -> McpOpResult {
+    state.mcp_server_manager.restart_server(&name).await
+        .map(|_| Json(serde_json::json!({ "ok": true })))
+        .map_err(|e| mcp_op_err("restart", &name, e))
 }
 
 async fn mcp_tools_list(Path(name): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mcp_server_manager = state.1.clone();
+    let mcp_server_manager = state.mcp_server_manager.clone();
     let tools: Vec<crate::mcp::McpTool> = mcp_server_manager.get_all_tools().await;
     
     let tools_json: Vec<serde_json::Value> = tools
@@ -2195,9 +2482,9 @@ async fn mcp_tools_list(Path(name): Path<String>, State(state): State<AppState>)
     Ok(Json(serde_json::json!({ "tools": tools_json })))
 }
 
-async fn mcp_resources_list(Path(_name): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mcp_server_manager = state.1.clone();
-    let resources: Vec<crate::mcp::McpResource> = mcp_server_manager.get_all_resources().await;
+async fn mcp_resources_list(Path(name): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mcp_server_manager = state.mcp_server_manager.clone();
+    let resources: Vec<crate::mcp::McpResource> = mcp_server_manager.get_server_resources(&name).await;
 
     let resources_json: Vec<serde_json::Value> = resources
         .iter()
@@ -2212,7 +2499,7 @@ async fn mcp_resources_list(Path(_name): Path<String>, State(state): State<AppSt
 }
 
 async fn mcp_resource_read(Path((name, uri)): Path<(String, String)>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mcp_server_manager = state.1.clone();
+    let mcp_server_manager = state.mcp_server_manager.clone();
     
     match mcp_server_manager.read_resource(&name, &uri, None).await {
         Ok(content) => Ok(Json(serde_json::json!({
@@ -2222,14 +2509,14 @@ async fn mcp_resource_read(Path((name, uri)): Path<(String, String)>, State(stat
             "metadata": content.metadata
         }))),
         Err(e) => {
-            eprintln!("[Bridge] Failed to read resource: {}", e);
+            tracing::error!(target: "bridge", "Failed to read resource: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
 async fn mcp_resource_monitor(Path((name, uri)): Path<(String, String)>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mcp_server_manager = state.1.clone();
+    let mcp_server_manager = state.mcp_server_manager.clone();
     
     match mcp_server_manager.monitor_resource(&name, &uri, true).await {
         Ok(enabled) => Ok(Json(serde_json::json!({
@@ -2237,14 +2524,14 @@ async fn mcp_resource_monitor(Path((name, uri)): Path<(String, String)>, State(s
             "enabled": enabled
         }))),
         Err(e) => {
-            eprintln!("[Bridge] Failed to monitor resource: {}", e);
+            tracing::error!(target: "bridge", "Failed to monitor resource: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
 async fn mcp_connect_handler(Path(name): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mcp_server_manager = state.1.clone();
+    let mcp_server_manager = state.mcp_server_manager.clone();
     
     match mcp_server_manager.start_server(&name).await {
         Ok(_) => {
@@ -2261,26 +2548,26 @@ async fn mcp_connect_handler(Path(name): Path<String>, State(state): State<AppSt
             }
         },
         Err(e) => {
-            eprintln!("[Bridge] Failed to connect MCP server: {}", e);
+            tracing::error!(target: "bridge", "Failed to connect MCP server: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
 async fn mcp_disconnect_handler(Path(name): Path<String>, State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let mcp_server_manager = state.1.clone();
+    let mcp_server_manager = state.mcp_server_manager.clone();
     
     match mcp_server_manager.stop_server(&name).await {
         Ok(_) => Ok(Json(serde_json::json!({ "ok": true }))),
         Err(e) => {
-            eprintln!("[Bridge] Failed to disconnect MCP server: {}", e);
+            tracing::error!(target: "bridge", "Failed to disconnect MCP server: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
 
 async fn engine_status_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let pool = state.0.clone();
+    let pool = state.engine_pool.clone();
     let pool_guard: tokio::sync::MutexGuard<'_, EnginePool> = pool.lock().await;
     let engines: Vec<serde_json::Value> = pool_guard.list_engines()
         .iter()
@@ -2308,7 +2595,7 @@ pub struct SpawnRequest {
 }
 
 async fn engine_spawn_handler(State(state): State<AppState>, Json(req): Json<SpawnRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
-    let pool = state.0.clone();
+    let pool = state.engine_pool.clone();
     let mut pool_guard: tokio::sync::MutexGuard<'_, EnginePool> = pool.lock().await;
     match pool_guard.spawn_engine(&req.conv_id, &req.model, req.cwd).await {
         Ok(handle) => Ok(Json(serde_json::json!({
@@ -2322,14 +2609,14 @@ async fn engine_spawn_handler(State(state): State<AppState>, Json(req): Json<Spa
 }
 
 async fn engine_kill_handler(Path(conv_id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let pool = state.0.clone();
+    let pool = state.engine_pool.clone();
     let mut pool_guard: tokio::sync::MutexGuard<'_, EnginePool> = pool.lock().await;
     pool_guard.remove_engine(&conv_id).await;
     Json(serde_json::json!({ "ok": true }))
 }
 
 async fn stream_events_handler(Path(conv_id): Path<String>, State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
-    let stream_manager = state.2.clone();
+    let stream_manager = state.stream_manager.clone();
     let mut manager: tokio::sync::MutexGuard<'_, StreamManager> = stream_manager.lock().await;
 
     let receiver = manager.add_listener(&conv_id)
@@ -2356,9 +2643,9 @@ async fn stream_events_handler(Path(conv_id): Path<String>, State(state): State<
 
 async fn research_start_handler(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Json<serde_json::Value> {
     let research_id = uuid::Uuid::new_v4().to_string();
-    let native_engine = state.14.clone();
-    let config_manager = state.4.clone();
-    let active_research = state.15.clone();
+    let native_engine = state.native_engine.clone();
+    let config_manager = state.config_manager.clone();
+    let active_research = state.active_research.clone();
 
     let model = if req.model.is_empty() { "claude-sonnet-4-20250514".to_string() } else { req.model.clone() };
     let query = req.get_messages().last()
@@ -2389,6 +2676,7 @@ async fn research_start_handler(State(state): State<AppState>, Json(req): Json<C
                         max_tokens: m.max_tokens, context_window: None,
                         supports_vision: m.supports_vision,
                         supports_web_search: false,
+                        context_size: None,
                     }).collect(),
                     enabled: p.enabled,
                     web_search_strategy: p.web_search_strategy.clone(),
@@ -2433,7 +2721,7 @@ async fn research_start_handler(State(state): State<AppState>, Json(req): Json<C
 
         let orchestrator = ResearchOrchestrator::new(reqwest::Client::new());
         if let Err(e) = orchestrator.run_pipeline(research_request, mpsc_tx).await {
-            eprintln!("[Research] Pipeline error: {}", e);
+            tracing::info!(target: "research", "Pipeline error: {}", e);
         }
 
         let _ = forward_handle.await;
@@ -2451,7 +2739,7 @@ async fn research_start_handler(State(state): State<AppState>, Json(req): Json<C
 }
 
 async fn research_stop_handler(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let active_research = state.15.clone();
+    let active_research = state.active_research.clone();
     let mut research: tokio::sync::MutexGuard<'_, HashMap<String, ResearchTask>> = active_research.lock().await;
     if let Some(task) = research.remove(&id) {
         task.handle.abort();
@@ -2462,7 +2750,7 @@ async fn research_stop_handler(Path(id): Path<String>, State(state): State<AppSt
 }
 
 async fn research_status_handler(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let active_research = state.15.clone();
+    let active_research = state.active_research.clone();
     let research: tokio::sync::MutexGuard<'_, HashMap<String, ResearchTask>> = active_research.lock().await;
     if let Some(task) = research.get(&id) {
         if task.handle.is_finished() {
@@ -2479,7 +2767,7 @@ async fn research_events_handler(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let active_research = state.15.clone();
+    let active_research = state.active_research.clone();
     let research: tokio::sync::MutexGuard<'_, HashMap<String, ResearchTask>> = active_research.lock().await;
     let task = research.get(&id).ok_or(StatusCode::NOT_FOUND)?;
     let mut rx = task.event_tx.subscribe();
@@ -2512,8 +2800,8 @@ async fn multiagent_research_handler(
     State(state): State<AppState>,
     Json(req): Json<MultiAgentResearchRequest>,
 ) -> Json<serde_json::Value> {
-    let native_engine = state.14.clone();
-    let config_manager = state.4.clone();
+    let native_engine = state.native_engine.clone();
+    let config_manager = state.config_manager.clone();
 
     let model = req.model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
 
@@ -2541,6 +2829,7 @@ async fn multiagent_research_handler(
                         max_tokens: m.max_tokens, context_window: None,
                         supports_vision: m.supports_vision,
                         supports_web_search: false,
+                        context_size: None,
                     }).collect(),
                     enabled: p.enabled,
                     web_search_strategy: p.web_search_strategy.clone(),
@@ -2721,7 +3010,7 @@ pub struct TerminalCreateRequest {
 }
 
 async fn terminal_create(State(state): State<AppState>, Json(req): Json<TerminalCreateRequest>) -> Json<serde_json::Value> {
-    let terminal_manager = state.9.clone();
+    let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
     match manager.create_session(req.cwd, req.shell).await {
         Ok(session) => Json(serde_json::to_value(session).unwrap_or_default()),
@@ -2736,7 +3025,7 @@ pub struct TerminalWriteRequest {
 }
 
 async fn terminal_write(State(state): State<AppState>, Json(req): Json<TerminalWriteRequest>) -> Json<serde_json::Value> {
-    let terminal_manager = state.9.clone();
+    let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
     match manager.write_input(&req.session_id, &req.data).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2752,7 +3041,7 @@ pub struct TerminalResizeRequest {
 }
 
 async fn terminal_resize(State(state): State<AppState>, Json(req): Json<TerminalResizeRequest>) -> Json<serde_json::Value> {
-    let terminal_manager = state.9.clone();
+    let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
     match manager.resize(&req.session_id, req.cols, req.rows).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2761,7 +3050,7 @@ async fn terminal_resize(State(state): State<AppState>, Json(req): Json<Terminal
 }
 
 async fn terminal_close(State(state): State<AppState>, Json(session_id): Json<String>) -> Json<serde_json::Value> {
-    let terminal_manager = state.9.clone();
+    let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
     match manager.close_session(&session_id).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2770,7 +3059,7 @@ async fn terminal_close(State(state): State<AppState>, Json(session_id): Json<St
 }
 
 async fn terminal_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let terminal_manager = state.9.clone();
+    let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
     let sessions = manager.list_sessions().await;
     Json(serde_json::json!({ "sessions": sessions }))
@@ -2784,7 +3073,7 @@ pub struct ProcessSpawnRequest {
 }
 
 async fn process_spawn(State(state): State<AppState>, Json(req): Json<ProcessSpawnRequest>) -> Json<serde_json::Value> {
-    let process_manager = state.8.clone();
+    let process_manager = state.process_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, ProcessManager> = process_manager.lock().await;
     match manager.spawn(&req.command, req.cwd.as_deref(), req.env_vars).await {
         Ok(info) => Json(serde_json::to_value(info).unwrap_or_default()),
@@ -2793,7 +3082,7 @@ async fn process_spawn(State(state): State<AppState>, Json(req): Json<ProcessSpa
 }
 
 async fn process_kill(Path(pid): Path<u32>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let process_manager = state.8.clone();
+    let process_manager = state.process_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, ProcessManager> = process_manager.lock().await;
     match manager.kill(pid).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2802,14 +3091,14 @@ async fn process_kill(Path(pid): Path<u32>, State(state): State<AppState>) -> Js
 }
 
 async fn process_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let process_manager = state.8.clone();
+    let process_manager = state.process_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, ProcessManager> = process_manager.lock().await;
     let processes = manager.list_processes().await;
     Json(serde_json::json!({ "processes": processes }))
 }
 
 async fn clipboard_read(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let clipboard_manager = state.11.clone();
+    let clipboard_manager = state.clipboard_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, ClipboardManager> = clipboard_manager.lock().await;
     match manager.read() {
         Ok(content) => Json(serde_json::to_value(content).unwrap_or_default()),
@@ -2823,7 +3112,7 @@ pub struct ClipboardWriteRequest {
 }
 
 async fn clipboard_write(State(state): State<AppState>, Json(req): Json<ClipboardWriteRequest>) -> Json<serde_json::Value> {
-    let clipboard_manager = state.11.clone();
+    let clipboard_manager = state.clipboard_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, ClipboardManager> = clipboard_manager.lock().await;
     let content = crate::clipboard::ClipboardContent {
         text: req.text,
@@ -2844,7 +3133,7 @@ pub struct NotificationRequest {
 }
 
 async fn notification_show(State(state): State<AppState>, Json(req): Json<NotificationRequest>) -> Json<serde_json::Value> {
-    let notification_manager = state.12.clone();
+    let notification_manager = state.notification_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, NotificationManager> = notification_manager.lock().await;
     let options = crate::notification::NotificationOptions {
         title: req.title,
@@ -2869,7 +3158,7 @@ pub struct LogsReadRequest {
 }
 
 async fn logs_read(State(state): State<AppState>, Query(req): Query<LogsReadRequest>) -> Json<serde_json::Value> {
-    let logger = state.13.clone();
+    let logger = state.logger.clone();
     let logger_guard: tokio::sync::MutexGuard<'_, Logger> = logger.lock().await;
     let filter = crate::logger::LogFilter {
         level: req.level,
@@ -2890,7 +3179,7 @@ pub struct LogsClearRequest {
 }
 
 async fn logs_clear(State(state): State<AppState>, Json(req): Json<LogsClearRequest>) -> Json<serde_json::Value> {
-    let logger = state.13.clone();
+    let logger = state.logger.clone();
     let logger_guard: tokio::sync::MutexGuard<'_, Logger> = logger.lock().await;
     match logger_guard.clear_old_logs(req.days.unwrap_or(30)) {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2899,7 +3188,7 @@ async fn logs_clear(State(state): State<AppState>, Json(req): Json<LogsClearRequ
 }
 
 async fn watcher_start(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let file_watcher = state.10.clone();
+    let file_watcher = state.file_watcher.clone();
     let watcher: tokio::sync::MutexGuard<'_, FileWatcher> = file_watcher.lock().await;
     match watcher.start().await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2913,7 +3202,7 @@ pub struct WatcherWatchRequest {
 }
 
 async fn watcher_watch(State(state): State<AppState>, Json(req): Json<WatcherWatchRequest>) -> Json<serde_json::Value> {
-    let file_watcher = state.10.clone();
+    let file_watcher = state.file_watcher.clone();
     let watcher: tokio::sync::MutexGuard<'_, FileWatcher> = file_watcher.lock().await;
     match watcher.watch(&req.path).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2922,7 +3211,7 @@ async fn watcher_watch(State(state): State<AppState>, Json(req): Json<WatcherWat
 }
 
 async fn watcher_unwatch(State(state): State<AppState>, Json(req): Json<WatcherWatchRequest>) -> Json<serde_json::Value> {
-    let file_watcher = state.10.clone();
+    let file_watcher = state.file_watcher.clone();
     let watcher: tokio::sync::MutexGuard<'_, FileWatcher> = file_watcher.lock().await;
     match watcher.unwatch(&req.path).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
@@ -2963,11 +3252,11 @@ async fn update_download(Json(req): Json<UpdateDownloadRequest>) -> Json<serde_j
 use crate::worktree::{WorktreeManager, CreateWorktreeRequest, MergeWorktreeRequest};
 use crate::ide::{IdeBridge, IdeConfig};
 
-static WORKTREE_MANAGER: once_cell::sync::Lazy<tokio::sync::Mutex<Option<WorktreeManager>>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+static WORKTREE_MANAGER: std::sync::LazyLock<tokio::sync::Mutex<Option<WorktreeManager>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
-static IDE_BRIDGE: once_cell::sync::Lazy<tokio::sync::Mutex<Option<IdeBridge>>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+static IDE_BRIDGE: std::sync::LazyLock<tokio::sync::Mutex<Option<IdeBridge>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
 async fn worktree_create(Json(req): Json<CreateWorktreeRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut guard = WORKTREE_MANAGER.lock().await;
@@ -2978,7 +3267,7 @@ async fn worktree_create(Json(req): Json<CreateWorktreeRequest>) -> Result<Json<
         match mgr.create_worktree(req).await {
             Ok(info) => Ok(Json(serde_json::json!({ "success": true, "worktree": info }))),
             Err(e) => {
-                eprintln!("[Worktree] Create failed: {}", e);
+                tracing::info!(target: "worktree", "Create failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -2993,7 +3282,7 @@ async fn worktree_list() -> Result<Json<serde_json::Value>, StatusCode> {
         match mgr.list_worktrees().await {
             Ok(list) => Ok(Json(serde_json::json!({ "success": true, "worktrees": list }))),
             Err(e) => {
-                eprintln!("[Worktree] List failed: {}", e);
+                tracing::info!(target: "worktree", "List failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3020,7 +3309,7 @@ async fn worktree_remove(Path(id): Path<String>) -> Result<Json<serde_json::Valu
         match mgr.remove_worktree(&id).await {
             Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
             Err(e) => {
-                eprintln!("[Worktree] Remove failed: {}", e);
+                tracing::info!(target: "worktree", "Remove failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3035,7 +3324,7 @@ async fn worktree_merge(Json(req): Json<MergeWorktreeRequest>) -> Result<Json<se
         match mgr.merge_worktree(req).await {
             Ok(output) => Ok(Json(serde_json::json!({ "success": true, "output": output }))),
             Err(e) => {
-                eprintln!("[Worktree] Merge failed: {}", e);
+                tracing::info!(target: "worktree", "Merge failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3053,7 +3342,7 @@ async fn worktree_sync() -> Result<Json<serde_json::Value>, StatusCode> {
         match mgr.sync_from_git().await {
             Ok(list) => Ok(Json(serde_json::json!({ "success": true, "worktrees": list }))),
             Err(e) => {
-                eprintln!("[Worktree] Sync failed: {}", e);
+                tracing::info!(target: "worktree", "Sync failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3090,7 +3379,7 @@ async fn agent_cancel(Path(id): Path<String>) -> Result<Json<serde_json::Value>,
         match mgr.cancel_agent(&id).await {
             Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
             Err(e) => {
-                eprintln!("[Agent] Cancel failed: {}", e);
+                tracing::info!(target: "agent", "Cancel failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3121,7 +3410,7 @@ async fn ide_start() -> Result<Json<serde_json::Value>, StatusCode> {
         match bridge.start_server().await {
             Ok(port) => Ok(Json(serde_json::json!({ "success": true, "port": port }))),
             Err(e) => {
-                eprintln!("[IDE] Start failed: {}", e);
+                tracing::error!(target: "ide", "Start failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3156,7 +3445,7 @@ async fn ide_disconnect(Path(id): Path<String>) -> Result<Json<serde_json::Value
         match bridge.disconnect(&id).await {
             Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
             Err(e) => {
-                eprintln!("[IDE] Disconnect failed: {}", e);
+                tracing::error!(target: "ide", "Disconnect failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3167,8 +3456,8 @@ async fn ide_disconnect(Path(id): Path<String>) -> Result<Json<serde_json::Value
 
 use crate::analytics::{AnalyticsStore, TrackEventRequest};
 
-static ANALYTICS_STORE: once_cell::sync::Lazy<tokio::sync::Mutex<Option<AnalyticsStore>>> =
-    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(None));
+static ANALYTICS_STORE: std::sync::LazyLock<tokio::sync::Mutex<Option<AnalyticsStore>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
 
 async fn analytics_track(Json(req): Json<TrackEventRequest>) -> Result<Json<serde_json::Value>, StatusCode> {
     let mut guard = ANALYTICS_STORE.lock().await;
@@ -3180,7 +3469,7 @@ async fn analytics_track(Json(req): Json<TrackEventRequest>) -> Result<Json<serd
         match store.track_event(&req).await {
             Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
             Err(e) => {
-                eprintln!("[Analytics] Track failed: {}", e);
+                tracing::info!(target: "analytics", "Track failed: {}", e);
                 Err(StatusCode::INTERNAL_SERVER_ERROR)
             }
         }
@@ -3271,133 +3560,20 @@ pub struct WorkflowExecuteRequest {
     pub goal: String,
     pub provider_id: Option<String>,
     pub model: Option<String>,
-}
-
-async fn workflow_execute(
-    State(state): State<AppState>,
-    Json(req): Json<WorkflowExecuteRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let config_manager: Arc<Mutex<Option<ConfigManager>>> = state.4.clone();
-    let orchestrator: Arc<Mutex<Option<crate::orchestration::MultiAgentOrchestrator>>> = state.16.clone();
-    
-    let orchestrator_guard: tokio::sync::MutexGuard<'_, Option<crate::orchestration::MultiAgentOrchestrator>> = orchestrator.lock().await;
-    let orchestrator = orchestrator_guard.as_ref()
-        .ok_or_else(|| {
-            eprintln!("[Bridge] Orchestrator not initialized");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
-
-    let config_guard: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
-    let config = config_guard.as_ref()
-        .ok_or_else(|| {
-            eprintln!("[Bridge] Config manager not initialized");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
-
-    let provider_config = match req.provider_id {
-        Some(id) => config.get_provider(&id),
-        None => config.get_default_provider(),
-    };
-
-    let provider_config = provider_config
-        .ok_or_else(|| {
-            eprintln!("[Bridge] No provider configured");
-            StatusCode::BAD_REQUEST
-        })?;
-
-    let model_config = provider_config.models.first()
-        .ok_or_else(|| {
-            eprintln!("[Bridge] No model configured for provider");
-            StatusCode::BAD_REQUEST
-        })?;
-
-    let api_format = if provider_config.provider_type.to_lowercase() == "anthropic" {
-        crate::native_engine::provider_manager::ApiFormat::Anthropic
-    } else {
-        crate::native_engine::provider_manager::ApiFormat::OpenAI
-    };
-
-    let provider = crate::native_engine::provider_manager::Provider {
-        id: provider_config.id.clone(),
-        name: provider_config.name.clone(),
-        base_url: provider_config.base_url.clone(),
-        api_key: provider_config.api_key.clone().unwrap_or_default(),
-        api_format,
-        models: provider_config.models.iter().map(|m| crate::native_engine::provider_manager::ModelConfig {
-            id: m.id.clone(),
-            name: m.name.clone(),
-            enabled: m.enabled,
-            max_tokens: m.max_tokens, context_window: None,
-            supports_vision: m.supports_vision,
-            supports_web_search: false,
-        }).collect(),
-        enabled: provider_config.enabled,
-        web_search_strategy: provider_config.web_search_strategy.clone(),
-    };
-
-    let model = crate::native_engine::provider_manager::ModelConfig {
-        id: model_config.id.clone(),
-        name: model_config.name.clone(),
-        enabled: model_config.enabled,
-        max_tokens: model_config.max_tokens,
-        context_window: model_config.context_window,
-        supports_vision: model_config.supports_vision,
-        supports_web_search: false,
-    };
-
-    let resolved_provider = crate::native_engine::provider_manager::ResolvedProvider {
-        provider,
-        model,
-    };
-
-    match orchestrator.execute_workflow(&req.goal, &resolved_provider).await {
-        Ok(result) => Ok(Json(serde_json::json!({ "success": true, "result": result }))),
-        Err(e) => {
-            eprintln!("[Bridge] Workflow execution failed: {}", e);
-            Ok(Json(serde_json::json!({ "success": false, "error": format!("{}", e) })))
-        }
-    }
-}
-
-async fn workflow_stats(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let orchestrator: Arc<Mutex<Option<crate::orchestration::MultiAgentOrchestrator>>> = state.16.clone();
-    
-    let orchestrator_guard: tokio::sync::MutexGuard<'_, Option<crate::orchestration::MultiAgentOrchestrator>> = orchestrator.lock().await;
-    if let Some(orchestrator) = orchestrator_guard.as_ref() {
-        let stats: serde_json::Value = orchestrator.get_scheduling_stats().await;
-        Ok(Json(stats))
-    } else {
-        Ok(Json(serde_json::json!({ "success": false, "error": "Orchestrator not initialized" })))
-    }
-}
-
-async fn workflow_config_get() -> Result<Json<serde_json::Value>, StatusCode> {
-    let config_path = std::path::Path::new("config/orchestration.toml");
-    let config = OrchestratorConfigFile::load_or_default(config_path);
-    Ok(Json(serde_json::json!({ "success": true, "config": config })))
-}
-
-async fn workflow_config_set(
-    Json(config): Json<OrchestratorConfigFile>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let config_path = std::path::Path::new("config/orchestration.toml");
-    let config_dir = config_path.parent().unwrap_or(std::path::Path::new("."));
-    std::fs::create_dir_all(config_dir).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    config.save_to_file(config_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
-    Ok(Json(serde_json::json!({ "success": true })))
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub resume_roles: Option<Vec<serde_json::Value>>,
 }
 
 // === Memory Handlers ===
 async fn memories_list(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            let memories = crate::db::memory_repo::list_all_memories(conn, 200)
-                .unwrap_or_default()
+            // Primary source: TencentDB tiered store (legacy table retired)
+            let memories = crate::memory::tiered::list_all_tiered(conn, "", 200)
+                .unwrap_or_default();
+            let memories = crate::memory::tiered::tiered_to_legacy(memories)
                 .iter()
                 .map(|m| serde_json::json!({
                     "id": m.id,
@@ -3407,7 +3583,7 @@ async fn memories_list(State(state): State<AppState>) -> Json<serde_json::Value>
                     "importance": m.importance,
                     "created_at": m.created_at,
                     "tags": m.tags,
-                    
+
                 }))
                 .collect::<Vec<_>>();
             Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({"memories": memories}))
@@ -3423,15 +3599,19 @@ async fn memories_search(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let query = params.get("q").cloned().unwrap_or_default();
     let workspace = params.get("workspace").cloned().unwrap_or_default();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            let memories = if query.is_empty() {
-                crate::db::memory_repo::list_all_memories(conn, 100).unwrap_or_default()
+            // Primary source: TencentDB tiered store (legacy table retired)
+            let memories: Vec<crate::db::memory_repo::MemoryRow> = if query.is_empty() {
+                crate::memory::tiered::tiered_to_legacy(
+                    crate::memory::tiered::list_all_tiered(conn, "", 100).unwrap_or_default(),
+                )
             } else {
-                crate::db::memory_repo::search_all_memories(conn, &query, 100).unwrap_or_default()
+                crate::memory::tiered::search_with_fallback(conn, "", "default", &query, None, 100)
+                    .unwrap_or_default()
             };
             let items: Vec<_> = memories.iter()
                 .filter(|m| workspace.is_empty() || m.workspace_path.contains(&workspace))
@@ -3442,6 +3622,7 @@ async fn memories_search(
                     "content": m.summary,
                     "importance": m.importance,
                     "created_at": m.created_at,
+                    "tags": m.tags,
                 }))
                 .collect();
             Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({"memories": items}))
@@ -3454,10 +3635,12 @@ async fn memories_search(
 }
 
 async fn memories_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            let all = crate::db::memory_repo::list_all_memories(conn, 1000).unwrap_or_default();
+            let all = crate::memory::tiered::tiered_to_legacy(
+                crate::memory::tiered::list_all_tiered(conn, "", 1000).unwrap_or_default(),
+            );
             let total = all.len() as i64;
             let mut by_type: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
             let mut by_importance: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
@@ -3484,16 +3667,448 @@ async fn memories_delete(
     Path(id): Path<String>,
     State(state): State<AppState>,
 ) -> Json<serde_json::Value> {
-    let db = state.6.clone();
+    let db = state.db_manager.clone();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| {
-            conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
-                .map_err(|e| anyhow::anyhow!(e))?;
+            // Delete from primary tiered store (and legacy leftovers for a clean UI)
+            crate::memory::tiered::delete_tiered_memory(conn, &id).ok();
+            let _ = conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id]);
             Ok::<(), anyhow::Error>(())
         })
     }).await;
     match result {
         Ok(Ok(Ok(()))) => Json(serde_json::json!({"ok": true})),
         _ => Json(serde_json::json!({"ok": false})),
+    }
+}
+
+async fn memories_backfill(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| {
+            let conversations = crate::db::conversation_repo::list_conversations(conn).unwrap_or_default();
+            let existing = crate::db::memory_repo::list_all_memories(conn, 10000).unwrap_or_default();
+            let existing_conv_ids: std::collections::HashSet<String> = existing.iter().map(|m| m.conversation_id.clone()).collect();
+            let mut created = 0i64;
+            let batch: Vec<_> = conversations.iter().filter(|c| !existing_conv_ids.contains(&c.id)).take(20).collect();
+            for conv in &batch {
+                let msgs = crate::db::message_repo::get_messages_by_conversation(conn, &conv.id).unwrap_or_default();
+                if msgs.len() < 2 { continue; }
+                let (sum, mem_tags, mem_importance) = crate::db::memory_repo::build_smart_summary(&msgs);
+                let summary = if sum.is_empty() {
+                    msgs.iter().rev()
+                        .find(|m| m.role == "user")
+                        .map(|m| format!("Context: {}", m.content.chars().take(200).collect::<String>()))
+                        .unwrap_or_else(|| "conversation".to_string())
+                } else { sum };
+                let mem_type = if summary.contains("Decisions:") || summary.contains("决定") { "decision" }
+                    else if summary.contains("Preferences:") || summary.contains("偏好") { "preference" }
+                    else if summary.contains("Key facts:") { "fact" }
+                    else { "context" };
+                let ws = conv.workspace_path.clone().unwrap_or_default();
+                // Write into primary tiered store (legacy table retired)
+                let tier_row = crate::memory::tiered::TieredMemoryRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    workspace_path: ws,
+                    team_id: "default".to_string(),
+                    conversation_id: conv.id.clone(),
+                    tier: crate::memory::tiered::Tier::from_i32(
+                        if mem_type == "decision" || mem_type == "preference" { 2 } else { 1 },
+                    ),
+                    visibility: crate::memory::tiered::Visibility::from_str("private"),
+                    content: summary.clone(),
+                    tags: mem_tags.clone(),
+                    importance: mem_importance,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+                let _ = crate::memory::tiered::insert_tiered_memory(conn, &tier_row);
+                created += 1;
+            }
+            tracing::info!(target: "memory", "Backfill: created {} memories from {} conversations", created, conversations.len());
+            Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({"created": created}))
+        })
+    }).await;
+    match result {
+        Ok(Ok(Ok(data))) => Json(data),
+        _ => Json(serde_json::json!({"created": 0, "error": "Failed"})),
+    }
+}
+
+// === Swarm Session Persistence Handlers ===
+
+async fn swarm_sessions_list(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::list_sessions(conn))
+    }).await;
+    match result {
+        Ok(Ok(Ok(sessions))) => Json(serde_json::json!({ "sessions": sessions })),
+        _ => Json(serde_json::json!({ "sessions": [] })),
+    }
+}
+
+async fn swarm_sessions_create(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("new task").to_string();
+    let workspace = body.get("workspace").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let db = state.db_manager.clone();
+    let sid = id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::create_session(conn, &sid, &title, workspace.as_deref()))
+    }).await;
+    match result {
+        Ok(Ok(Ok(_))) => Json(serde_json::json!({ "id": id })),
+        other => {
+            tracing::error!(target: "bridge", "swarm session create failed: {:?}", other);
+            Json(serde_json::json!({ "error": "Failed to create session" }))
+        }
+    }
+}
+
+async fn swarm_sessions_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::get_session(conn, &id))
+    }).await;
+    match result {
+        Ok(Ok(Ok(Some(session)))) => Json(serde_json::json!(session)),
+        _ => Json(serde_json::json!({ "error": "Session not found" })),
+    }
+}
+
+async fn swarm_sessions_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::delete_session(conn, &id))
+    }).await;
+    match result {
+        Ok(Ok(Ok(_))) => Json(serde_json::json!({ "ok": true })),
+        _ => Json(serde_json::json!({ "error": "Failed to delete session" })),
+    }
+}
+
+async fn swarm_messages_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::get_messages(conn, &id))
+    }).await;
+    match result {
+        Ok(Ok(Ok(msgs))) => Json(serde_json::json!({ "messages": msgs })),
+        _ => Json(serde_json::json!({ "messages": [] })),
+    }
+}
+
+async fn swarm_messages_add(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let id_clone = id.clone();
+    let role = body.get("role").and_then(|v| v.as_str()).unwrap_or("system").to_string();
+    let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let agent_name = body.get("agent_name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let agent_icon = body.get("agent_icon").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let agent_color = body.get("agent_color").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let msg_type = body.get("type").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::insert_message(
+            conn, &id_clone, &session_id, &role, &content,
+            agent_name.as_deref(), agent_icon.as_deref(), agent_color.as_deref(), msg_type.as_deref(),
+        ))
+    }).await;
+    match result {
+        Ok(Ok(Ok(_))) => Json(serde_json::json!({ "id": id })),
+        _ => Json(serde_json::json!({ "error": "Failed to add message" })),
+    }
+}
+
+async fn swarm_status_update(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("running").to_string();
+    let agent_status = body.get("agent_status").map(|v| {
+        if v.is_string() { v.as_str().unwrap_or("").to_string() } else { serde_json::to_string(v).unwrap_or_default() }
+    });
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::update_session_status(conn, &id, &status, agent_status.as_deref()))
+    }).await;
+    match result {
+        Ok(Ok(Ok(_))) => Json(serde_json::json!({ "ok": true })),
+        _ => Json(serde_json::json!({ "error": "Failed to update status" })),
+    }
+}
+
+async fn swarm_session_rename(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let db = state.db_manager.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.with_conn(|conn| crate::db::swarm_repo::update_session_title(conn, &id, &title))
+    }).await;
+    match result {
+        Ok(Ok(Ok(_))) => Json(serde_json::json!({ "ok": true })),
+        _ => Json(serde_json::json!({ "error": "Failed to rename" })),
+    }
+}
+/// MetaGPT workflow endpoint - uses the ported MetaGPT orchestration system
+async fn metagpt_workflow_stream(
+    State(state): State<AppState>,
+    Json(req): Json<WorkflowExecuteRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let native_engine = state.native_engine.clone();
+    let model = req.model.clone().unwrap_or_else(|| "deepseek-v4-flash-free".to_string());
+    let workspace = req.workspace.clone();
+    let goal = req.goal.clone();
+
+    let engine_guard = native_engine.lock().await;
+    let resolved_provider = if let Some(engine) = engine_guard.as_ref() {
+        engine.resolve_provider(&model).await
+    } else {
+        None
+    };
+    drop(engine_guard);
+
+    let resolved_provider = match resolved_provider {
+        Some(rp) => rp,
+        None => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<crate::orchestration::WorkflowEvent>(256);
+    let workspace_str = workspace.clone();
+
+    // 续跑参数：已完成角色的 (name, cause_by, output) 列表
+    let resume_outputs: Vec<(String, String, String)> = req.resume_roles
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| Some((
+            v.get("name")?.as_str()?.to_string(),
+            v.get("cause_by")?.as_str()?.to_string(),
+            v.get("output")?.as_str()?.to_string(),
+        )))
+        .collect();
+
+    let db_for_workflow = state.db_manager.clone();
+    let embedding_for_workflow = state.embedding_engine.clone();
+    let tx_panic = tx.clone();
+    tokio::spawn(async move {
+        // 内层 spawn 隔离 panic：任务崩溃时广播 workflow_failed，
+        // 否则 broadcast sender 直接 drop，SSE 静默断流，前端表现为"中途卡住"
+        let inner = tokio::spawn(async move {
+            let _ = crate::orchestration::metagpt_workflow(&goal, &resolved_provider, workspace_str.as_deref(), tx, Some(db_for_workflow), Some(embedding_for_workflow), resume_outputs).await;
+        });
+        if let Err(je) = inner.await {
+            if je.is_panic() {
+                tracing::error!(target: "metagpt", "Workflow task panicked: {}", je);
+                let _ = tx_panic.send(crate::orchestration::WorkflowEvent {
+                    event_type: "workflow_failed".to_string(),
+                    task_id: None,
+                    message: format!("Workflow panicked: {}", je),
+                    data: None,
+                    timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                });
+            }
+        }
+    });
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let data = serde_json::to_string(&event).unwrap_or_default();
+                    let is_done = event.event_type == "workflow_completed" || event.event_type == "workflow_failed";
+                    yield Ok::<axum::response::sse::Event, std::convert::Infallible>(
+                        axum::response::sse::Event::default().event("workflow").data(data)
+                    );
+                    if is_done { break; }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(target: "metagpt", "SSE stream lagged, skipped {} events", n);
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::info!(target: "metagpt", "SSE stream closed (all senders dropped)");
+                    break;
+                }
+            }
+        }
+    };
+
+    Ok(axum::response::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new()))
+}
+
+// ─── TencentDB Agent Memory bridge handlers ──────────────────────────────
+//
+// Inlined TencentDB Agent Memory client (see memory::tencentdb_client).
+// These endpoints expose configuration, health, search, insert and promote
+// operations over the local bridge so the React frontend can drive the
+// memory system without spawning an external service.
+
+async fn tdai_health(
+    State(state): State<AppState>,
+) -> Json<crate::memory::tencentdb_client::HealthInfo> {
+    Json(state.tdai_client.health().await)
+}
+
+async fn tdai_get_config(
+    State(state): State<AppState>,
+) -> Json<crate::memory::tencentdb_client::TencentDBConfig> {
+    Json(state.tdai_client.config().await)
+}
+
+#[derive(Deserialize)]
+struct TdaiConfigPayload {
+    base_url: Option<String>,
+    user_key: Option<String>,
+    team_id: Option<String>,
+    agent_id: Option<String>,
+    user_id: Option<String>,
+    space_id: Option<String>,
+    enabled: Option<bool>,
+}
+
+async fn tdai_set_config(
+    State(state): State<AppState>,
+    Json(p): Json<TdaiConfigPayload>,
+) -> Json<serde_json::Value> {
+    let mut cur = state.tdai_client.config().await;
+    if let Some(v) = p.base_url { cur.base_url = v; }
+    if let Some(v) = p.user_key { cur.user_key = v; }
+    if let Some(v) = p.team_id { cur.team_id = v; }
+    if let Some(v) = p.agent_id { cur.agent_id = v; }
+    if let Some(v) = p.user_id { cur.user_id = v; }
+    if let Some(v) = p.space_id { cur.space_id = v; }
+    if let Some(v) = p.enabled { cur.enabled = v; }
+    state.tdai_client.update_config(cur.clone()).await;
+    // Persist to DB
+    let db = state.db_manager.clone();
+    let cfg = cur.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = db.with_conn(|conn| crate::memory::tencentdb_client::save_config(conn, &cfg));
+    }).await;
+    Json(serde_json::json!({ "ok": true, "config": cur }))
+}
+
+async fn tdai_auth_verify(
+    State(state): State<AppState>,
+) -> Json<crate::memory::tencentdb_client::AuthVerifyResponse> {
+    Json(state.tdai_client.verify_auth().await)
+}
+
+#[derive(Deserialize)]
+struct TdaiSearchPayload {
+    workspace_path: Option<String>,
+    query: String,
+    top_k: Option<i64>,
+}
+
+async fn tdai_search(
+    State(state): State<AppState>,
+    Json(p): Json<TdaiSearchPayload>,
+) -> Json<crate::memory::tencentdb_client::TdaiSearchResponse> {
+    let workspace = p.workspace_path.unwrap_or_default();
+    let top_k = p.top_k.unwrap_or(5);
+    let db = state.db_manager.clone();
+    let client = state.tdai_client.clone();
+    let q = p.query.clone();
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::memory::tencentdb_client::TdaiSearchResponse> {
+        db.with_conn(|conn| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async move { client.search(&workspace, &q, top_k, conn).await })
+        }).and_then(|inner| inner)
+    }).await;
+    match res {
+        Ok(Ok(v)) => Json(v),
+        _ => Json(crate::memory::tencentdb_client::TdaiSearchResponse::default()),
+    }
+}
+
+#[derive(Deserialize)]
+struct TdaiAddPayload {
+    workspace_path: String,
+    content: String,
+    importance: Option<i32>,
+    tags: Option<String>,
+    tier: Option<i32>,
+}
+
+async fn tdai_add_memory(
+    State(state): State<AppState>,
+    Json(p): Json<TdaiAddPayload>,
+) -> Json<serde_json::Value> {
+    let db = state.db_manager.clone();
+    let client = state.tdai_client.clone();
+    let ws = p.workspace_path.clone();
+    let content = p.content.clone();
+    let imp = p.importance.unwrap_or(3);
+    let tags = p.tags.clone().unwrap_or_default();
+    let tier = p.tier.unwrap_or(1);
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        db.with_conn(|conn| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async move { client.add_memory_with_tier(&ws, &content, imp, &tags, tier, conn).await })
+        }).and_then(|inner| inner)
+    }).await;
+    match res {
+        Ok(Ok(id)) => Json(serde_json::json!({ "ok": true, "id": id })),
+        Ok(Err(e)) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+async fn tdai_promote(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let db = state.db_manager.clone();
+    let client = state.tdai_client.clone();
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::memory::tiered::TieredMemoryRow>> {
+        db.with_conn(|conn| client.promote(conn, &id)).and_then(|inner| inner)
+    }).await;
+    match res {
+        Ok(Ok(Some(row))) => Json(serde_json::json!({ "ok": true, "tier": row.tier.as_i32() })),
+        Ok(Ok(None)) => Json(serde_json::json!({ "ok": false, "error": "not found" })),
+        Ok(Err(e)) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+#[derive(Deserialize)]
+struct TdaiStatsQuery {
+    workspace_path: Option<String>,
+}
+
+async fn tdai_stats(
+    State(state): State<AppState>,
+    Query(q): Query<TdaiStatsQuery>,
+) -> Json<serde_json::Value> {
+    let workspace = q.workspace_path.unwrap_or_default();
+    let db = state.db_manager.clone();
+    let client = state.tdai_client.clone();
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        db.with_conn(|conn| client.stats(conn, &workspace)).and_then(|inner| inner)
+    }).await;
+    match res {
+        Ok(Ok(m)) => Json(serde_json::json!({ "ok": true, "stats": m })),
+        _ => Json(serde_json::json!({ "ok": false, "stats": {} })),
     }
 }

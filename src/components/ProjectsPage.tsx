@@ -85,6 +85,8 @@ const ProjectsPage = () => {
         defaultModel,
         createWorkspacePath || undefined
       );
+      // Notify sidebar to refresh project cards and conversations
+      window.dispatchEvent(new CustomEvent('conversationsUpdated'));
       navigate(`/chat/${conv.id}`);
       loadProjects();
     } catch (_) { }
@@ -99,6 +101,8 @@ const ProjectsPage = () => {
       const project = await createProject(folderName, '', selectedPath);
       const defaultModel = localStorage.getItem('default_model') || 'claude-sonnet-4-6';
       const conv = await createProjectConversation(project.id, folderName, defaultModel, selectedPath);
+      // Notify sidebar to refresh project cards and conversations
+      window.dispatchEvent(new CustomEvent('conversationsUpdated'));
       navigate(`/chat/${conv.id}`);
       loadProjects();
     } catch (err) {
@@ -113,6 +117,7 @@ const ProjectsPage = () => {
     try {
       await deleteProject(currentProject.id);
       setCurrentProject(null);
+      window.dispatchEvent(new CustomEvent('conversationsUpdated'));
       loadProjects();
     } catch (_) { }
   };
@@ -123,6 +128,7 @@ const ProjectsPage = () => {
       if (currentProject && currentProject.id === p.id) {
         setCurrentProject(null);
       }
+      window.dispatchEvent(new CustomEvent('conversationsUpdated'));
       setProjectToDelete(null);
       loadProjects();
     } catch (_) { }
@@ -766,15 +772,16 @@ const ProjectsPage = () => {
                   </div>
                 </div>
 
-                <p className="text-[14px] text-claude-textSecondary line-clamp-3 leading-relaxed flex-1">
+                <p className="text-[14px] text-claude-textSecondary line-clamp-2 leading-relaxed flex-1">
                   {p.description || t('customize.noDescriptionProvided')}
                 </p>
 
-                {p.workspace_path && (
-                  <div className="text-[12px] text-claude-textSecondary/60 truncate mt-1">
-                    {p.workspace_path}
-                  </div>
-                )}
+                <div className="flex items-center gap-1.5 mt-2 text-[12px] text-claude-textSecondary/70 truncate">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="flex-shrink-0 opacity-60">
+                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                  </svg>
+                  <span className="truncate">{p.workspace_path || 'No workspace path'}</span>
+                </div>
 
                 <div className="mt-4 pt-1 flex items-center gap-4 text-[12px] text-claude-textSecondary/80">
                   <span>{t('customize.updated')} {new Date(p.updated_at).toLocaleDateString()}</span>

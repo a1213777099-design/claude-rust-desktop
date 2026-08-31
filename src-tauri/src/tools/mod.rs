@@ -1,3 +1,5 @@
+pub mod retry;
+
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -660,7 +662,12 @@ async fn tool_computer_use_async(input: serde_json::Value) -> Result<serde_json:
 
 async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let command = input["command"].as_str().ok_or_else(|| anyhow!("command required"))?;
-    let timeout_secs = input["timeout"].as_u64().unwrap_or(60);
+    let timeout_secs = input["timeout"].as_u64().unwrap_or(60).min(600);
+
+    // Dangerous command detection
+    if let Some(warning) = detect_dangerous_command(command) {
+        tracing::warn!(target: "bash", "Potentially dangerous command: {} - {}", command, warning);
+    }
 
     let (shell, flag) = if cfg!(target_os = "windows") {
         let git_bash = find_git_bash();
@@ -673,18 +680,9 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         ("sh".to_string(), "-c".to_string())
     };
 
-    let mut cmd = if cfg!(target_os = "windows") && find_git_bash().is_some() {
-        Command::new(&shell)
-    } else {
-        Command::new(&shell)
-    };
-
-    if shell == "cmd" {
-        cmd.arg(flag);
-    } else {
-        cmd.arg(&flag);
-    }
-    cmd.arg(command)
+    let mut cmd = Command::new(&shell);
+    cmd.arg(&flag)
+        .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -700,11 +698,18 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let exit_code = output.status.code().unwrap_or(-1);
 
+            // Truncate large output
+            const MAX_OUTPUT: usize = 102_400; // 100KB
+            let (stdout, stdout_truncated) = truncate_str(&stdout, MAX_OUTPUT);
+            let (stderr, stderr_truncated) = truncate_str(&stderr, MAX_OUTPUT);
+
             Ok(serde_json::json!({
                 "stdout": stdout,
                 "stderr": stderr,
                 "exit_code": exit_code,
-                "success": output.status.success()
+                "success": output.status.success(),
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated
             }))
         }
         Ok(Err(e)) => Ok(serde_json::json!({
@@ -719,9 +724,43 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
     }
 }
 
+/// Detect potentially dangerous shell commands.
+fn detect_dangerous_command(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.trim().to_lowercase();
+    if lower.contains("rm -rf /") || lower.contains("rm -rf /*") {
+        return Some("Recursive delete from root filesystem");
+    }
+    if lower.starts_with("git push") && lower.contains("--force") && (lower.contains("main") || lower.contains("master")) {
+        return Some("Force push to main/master branch");
+    }
+    if lower.starts_with("git reset") && lower.contains("--hard") {
+        return Some("Hard reset discards all changes");
+    }
+    if lower.contains("mkfs") || lower.contains("dd if=") {
+        return Some("Low-level disk operation");
+    }
+    if lower.contains("chmod 777") || lower.contains("chmod -r 777") {
+        return Some("Setting world-writable permissions");
+    }
+    None
+}
+
+/// Truncate a string to max_len bytes, returning (truncated_string, was_truncated).
+fn truncate_str(s: &str, max_len: usize) -> (String, bool) {
+    if s.len() <= max_len {
+        (s.to_string(), false)
+    } else {
+        let truncated = &s[..max_len];
+        // Don't break in the middle of a UTF-8 char
+        let safe_end = truncated.len();
+        let truncated = &s[..safe_end];
+        (format!("{}\n... (truncated, {} bytes total)", truncated, s.len()), true)
+    }
+}
+
 fn tool_bash(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let command = input["command"].as_str().ok_or_else(|| anyhow!("command required"))?;
-    let _timeout_secs = input["timeout"].as_u64().unwrap_or(60);
+    let timeout_secs = input["timeout"].as_u64().unwrap_or(60).min(300);
 
     let (shell, flag) = if cfg!(target_os = "windows") {
         let git_bash = find_git_bash();
@@ -734,39 +773,50 @@ fn tool_bash(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
         ("sh".to_string(), "-c".to_string())
     };
 
-    let mut cmd = if cfg!(target_os = "windows") && find_git_bash().is_some() {
-        std::process::Command::new(&shell)
-    } else {
-        std::process::Command::new(&shell)
-    };
-
-    if shell == "cmd" {
-        cmd.arg(flag);
-    } else {
-        cmd.arg(&flag);
-    }
-    cmd.arg(command)
+    let mut cmd = std::process::Command::new(&shell);
+    cmd.arg(&flag)
+        .arg(command)
         .current_dir(cwd)
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    match cmd.output() {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let exit_code = output.status.code().unwrap_or(-1);
+    let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to spawn: {}", e))?;
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
 
-            Ok(serde_json::json!({
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": exit_code,
-                "success": output.status.success()
-            }))
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(serde_json::json!({
+                        "error": format!("Command timed out after {} seconds", timeout_secs),
+                        "is_error": true,
+                        "timed_out": true
+                    }));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Ok(serde_json::json!({
+                "error": format!("Wait error: {}", e),
+                "is_error": true
+            })),
         }
-        Err(e) => Ok(serde_json::json!({
-            "error": format!("Command failed: {}", e),
-            "is_error": true
-        })),
     }
+
+    let output = child.wait_with_output().map_err(|e| anyhow!("Output error: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    Ok(serde_json::json!({
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code,
+        "success": output.status.success()
+    }))
 }
 
 fn find_git_bash() -> Option<String> {
@@ -792,15 +842,48 @@ fn tool_glob(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let pattern = input["pattern"].as_str().ok_or_else(|| anyhow!("pattern required"))?;
     let base_path = input["path"].as_str().unwrap_or(cwd);
 
+    // Dirs to always skip
+    const SKIP_DIRS: &[&str] = &[
+        ".git", "node_modules", "target", "__pycache__", ".venv", "venv",
+        ".next", "dist", "build", ".idea", ".vscode", ".cache",
+    ];
+
+    let start_time = std::time::Instant::now();
+    let max_duration = std::time::Duration::from_secs(30);
+    let max_files = 10000usize;
     let mut matches: Vec<String> = Vec::new();
-    for entry in walkdir::WalkDir::new(base_path).into_iter().filter_map(|e| e.ok()) {
+    let mut file_count = 0usize;
+
+    let base = std::path::Path::new(base_path);
+    let Ok(glob_pattern) = glob::Pattern::new(pattern) else {
+        return Ok(serde_json::json!({"files": [], "count": 0, "error": "Invalid glob pattern"}));
+    };
+
+    for entry in walkdir::WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_str().unwrap_or("");
+            !SKIP_DIRS.contains(&name)
+        })
+        .filter_map(|e| e.ok())
+    {
+        if start_time.elapsed() > max_duration { break; }
+        if file_count >= max_files { break; }
+
         let path = entry.path();
-        if let Some(path_str) = path.to_str() {
-            if let Ok(glob_pattern) = glob::Pattern::new(pattern) {
-                if glob_pattern.matches(path_str) {
-                    matches.push(path_str.to_string());
-                }
-            }
+        file_count += 1;
+
+        let Some(path_str) = path.to_str() else { continue };
+
+        // Match against filename for simple patterns (*.tsx, *.rs)
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // Match against relative path for deep patterns (src/**/*.tsx)
+        let rel_path = path.strip_prefix(base).ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or(path_str);
+
+        if glob_pattern.matches(file_name) || glob_pattern.matches(rel_path) || glob_pattern.matches(path_str) {
+            matches.push(path_str.to_string());
         }
     }
 
@@ -813,50 +896,202 @@ fn tool_glob(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
 fn tool_grep(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
     let pattern = input["pattern"].as_str().ok_or_else(|| anyhow!("pattern required"))?;
     let search_path = input["path"].as_str().unwrap_or(cwd);
+    let include_glob = input["include"].as_str();
+    let context_lines = input["context"].as_u64().unwrap_or(0) as usize;
+    let max_results: usize = input["max_results"].as_u64().unwrap_or(500) as usize;
 
     let re = regex::Regex::new(pattern)?;
     let mut results: Vec<serde_json::Value> = Vec::new();
 
-    for entry in walkdir::WalkDir::new(search_path).into_iter().filter_map(|e| e.ok()) {
+    // Dirs to always skip — prevent walkdir from entering them
+    const SKIP_DIRS: &[&str] = &[
+        ".git", "node_modules", "target", "__pycache__", ".venv", "venv",
+        ".next", "dist", "build", ".idea", ".vscode", ".cache",
+    ];
+
+    // Max file size to search (1MB)
+    const MAX_FILE_SIZE: u64 = 1_048_576;
+    // Max files to scan (prevent hanging on huge dirs)
+    const MAX_FILES_SCANNED: usize = 10_000;
+    // Max search duration (30 seconds)
+    let start_time = std::time::Instant::now();
+    let max_duration = std::time::Duration::from_secs(30);
+
+    let mut files_scanned: usize = 0;
+
+    let walker = walkdir::WalkDir::new(search_path)
+        .into_iter()
+        .filter_entry(|e| {
+            // Prevent descending into skip directories
+            if e.file_type().is_dir() {
+                if let Some(name) = e.file_name().to_str() {
+                    if SKIP_DIRS.contains(&name) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        // Check limits
+        if results.len() >= max_results { break; }
+        if files_scanned >= MAX_FILES_SCANNED { break; }
+        if start_time.elapsed() > max_duration { break; }
+
         let path = entry.path();
-        if !path.is_file() {
+
+        if !path.is_file() { continue; }
+        files_scanned += 1;
+
+        // Apply include glob filter
+        if let Some(glob_pattern) = include_glob {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !glob_match(glob_pattern, file_name) {
+                continue;
+            }
+        }
+
+        // Skip large files
+        if let Ok(metadata) = path.metadata() {
+            if metadata.len() > MAX_FILE_SIZE { continue; }
+        }
+
+        // Skip binary files (quick check: first 512 bytes for null)
+        if let Ok(bytes) = std::fs::read(path) {
+            let check_len = bytes.len().min(512);
+            if bytes[..check_len].contains(&0) { continue; }
+        } else {
             continue;
         }
 
         if let Ok(content) = fs::read_to_string(path) {
-            for (line_num, line) in content.lines().enumerate() {
+            let all_lines: Vec<&str> = content.lines().collect();
+            for (line_idx, line) in all_lines.iter().enumerate() {
+                if results.len() >= max_results { break; }
                 if re.is_match(line) {
-                    results.push(serde_json::json!({
+                    let line_num = line_idx + 1;
+                    let mut match_entry = serde_json::json!({
                         "file": path.to_string_lossy(),
-                        "line": line_num + 1,
+                        "line": line_num,
                         "content": line
-                    }));
+                    });
+
+                    // Add context lines if requested
+                    if context_lines > 0 {
+                        let start = line_idx.saturating_sub(context_lines);
+                        let end = (line_idx + context_lines + 1).min(all_lines.len());
+                        let context: Vec<String> = all_lines[start..end]
+                            .iter()
+                            .enumerate()
+                            .map(|(i, l)| format!("{:>6}: {}", start + i + 1, l))
+                            .collect();
+                        if let Some(obj) = match_entry.as_object_mut() {
+                            obj.insert("context".to_string(), serde_json::json!(context.join("\n")));
+                        }
+                    }
+
+                    results.push(match_entry);
                 }
             }
         }
     }
 
+    let timed_out = start_time.elapsed() > max_duration;
+
     Ok(serde_json::json!({
         "matches": results,
-        "count": results.len()
+        "count": results.len(),
+        "truncated": results.len() >= max_results,
+        "files_scanned": files_scanned,
+        "timed_out": timed_out
     }))
 }
 
-fn tool_list_dir(input: serde_json::Value, _cwd: &str) -> Result<serde_json::Value> {
-    let dir_path = input["path"].as_str().ok_or_else(|| anyhow!("path required"))?;
+fn glob_match(pattern: &str, name: &str) -> bool {
+    // Simple glob matching: * matches any chars, ? matches single char
+    let regex_pattern: String = pattern
+        .chars()
+        .fold((String::new(), false), |(mut s, escaped), c| {
+            if escaped {
+                s.push(c);
+                (s, false)
+            } else {
+                match c {
+                    '*' => { s.push_str(".*"); (s, false) }
+                    '?' => { s.push('.'); (s, false) }
+                    '.' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '^' | '$' | '|' | '\\' => {
+                        s.push('\\'); s.push(c); (s, false)
+                    }
+                    _ => { s.push(c); (s, false) }
+                }
+            }
+        }).0;
+    regex::Regex::new(&format!("^{}$", regex_pattern))
+        .map(|re| re.is_match(name))
+        .unwrap_or(false)
+}
 
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for entry in fs::read_dir(dir_path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        entries.push(serde_json::json!({
-            "name": entry.file_name().to_string_lossy(),
-            "is_dir": metadata.is_dir(),
-            "size": metadata.len()
-        }));
+fn tool_list_dir(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
+    let dir_path = input["path"].as_str().unwrap_or(cwd);
+
+    let path = std::path::Path::new(dir_path);
+    if !path.exists() {
+        return Ok(serde_json::json!({ "entries": [], "error": format!("Path does not exist: {}", dir_path) }));
+    }
+    if !path.is_dir() {
+        return Ok(serde_json::json!({ "entries": [], "error": format!("Not a directory: {}", dir_path) }));
     }
 
-    Ok(serde_json::json!({ "entries": entries }))
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let max_entries = 500usize;
+
+    let read_dir = match fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(e) => return Ok(serde_json::json!({ "entries": [], "error": format!("Permission denied or error: {}", e) })),
+    };
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,  // Skip entries we can't read
+        };
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,  // Skip entries we can't stat
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let size = if file_type.is_file() {
+            entry.metadata().map(|m| m.len()).unwrap_or(0)
+        } else { 0 };
+
+        entries.push(serde_json::json!({
+            "name": name,
+            "is_dir": file_type.is_dir(),
+            "is_file": file_type.is_file(),
+            "is_symlink": file_type.is_symlink(),
+            "size": size
+        }));
+
+        if entries.len() >= max_entries { break; }
+    }
+
+    // Sort: dirs first, then by name
+    entries.sort_by(|a, b| {
+        let a_dir = a["is_dir"].as_bool().unwrap_or(false);
+        let b_dir = b["is_dir"].as_bool().unwrap_or(false);
+        b_dir.cmp(&a_dir).then_with(|| {
+            let a_name = a["name"].as_str().unwrap_or("");
+            let b_name = b["name"].as_str().unwrap_or("");
+            a_name.to_lowercase().cmp(&b_name.to_lowercase())
+        })
+    });
+
+    Ok(serde_json::json!({
+        "entries": entries,
+        "count": entries.len(),
+        "path": dir_path
+    }))
 }
 
 fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value> {
@@ -904,6 +1139,7 @@ async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Va
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
 
     let mut request = client.get(url);
@@ -930,13 +1166,81 @@ async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Va
         .unwrap_or("text/plain")
         .to_string();
 
+    // Limit content size to 1MB
+    const MAX_CONTENT_SIZE: usize = 1_048_576;
     let body = response.text().await?;
+    let truncated = body.len() > MAX_CONTENT_SIZE;
+    let body = if truncated { &body[..MAX_CONTENT_SIZE] } else { &body };
+
+    // For HTML content, convert to plain text
+    let output = if content_type.contains("text/html") {
+        html_to_text(body)
+    } else {
+        body.to_string()
+    };
 
     Ok(serde_json::json!({
-        "content": body,
+        "content": output,
         "content_type": content_type,
-        "url": url
+        "url": url,
+        "truncated": truncated
     }))
+}
+
+/// Convert HTML to readable plain text by stripping tags.
+fn html_to_text(html: &str) -> String {
+    let mut result = String::new();
+    let mut in_tag = false;
+    let mut in_script = false;
+    let mut in_style = false;
+
+    for c in html.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                // Check for script/style tags
+                let remaining = &html[html.len() - html.len()..]; // placeholder
+                if result.ends_with('\n') || result.is_empty() {
+                    // Already have a newline
+                }
+            }
+            '>' => {
+                in_tag = false;
+                if in_script {
+                    in_script = false;
+                }
+                if in_style {
+                    in_style = false;
+                }
+                result.push('\n');
+            }
+            _ if in_tag => {
+                // Inside a tag, skip content but detect script/style
+            }
+            _ if in_script || in_style => {}
+            _ => {
+                result.push(c);
+            }
+        }
+    }
+
+    // Collapse multiple newlines and trim
+    let mut final_result = String::new();
+    let mut prev_newline = false;
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !prev_newline {
+                final_result.push('\n');
+                prev_newline = true;
+            }
+        } else {
+            final_result.push_str(trimmed);
+            final_result.push('\n');
+            prev_newline = false;
+        }
+    }
+    final_result.trim().to_string()
 }
 
 fn tool_web_search_blocking(input: serde_json::Value) -> Result<serde_json::Value> {

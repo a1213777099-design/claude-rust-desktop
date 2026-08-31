@@ -1,6 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, Play, Square, RotateCw, Trash2, Edit2, ChevronDown, ChevronRight, Wrench, Globe, Server } from 'lucide-react';
-import { invoke } from '@tauri-apps/api/core';
+
+// 统一走 bridge HTTP API（与聊天引擎同一个 McpServerManager 实例）：
+// 之前走 Tauri invoke 命令操作的是 main.rs 里的另一个实例，编辑/开关不会生效到引擎
+const MCP_API = 'http://127.0.0.1:30080/api/mcp';
+
+async function mcpFetch(path: string, init?: RequestInit) {
+  const res = await fetch(`${MCP_API}${path}`, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error((data as { error?: string })?.error || `HTTP ${res.status}`);
+  return data;
+}
 
 interface McpServer {
   id: string;
@@ -40,6 +53,8 @@ const McpSettingsPage = () => {
   });
   const [msg, setMsg] = useState('');
   const [msgType, setMsgType] = useState<'success' | 'error'>('success');
+  // 两段式删除确认：第一次点击进入待确认态，3 秒内再点确认（Tauri WebView 不保证支持原生 confirm 弹窗）
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   useEffect(() => {
     loadServers();
@@ -48,24 +63,21 @@ const McpSettingsPage = () => {
 
   const loadServers = async () => {
     try {
-      console.log('[MCP] Calling mcp_list_servers...');
-      const result = await invoke<McpServer[]>('mcp_list_servers');
-      console.log('[MCP] mcp_list_servers returned:', result);
-      setServers(result);
+      const data = await mcpFetch('/servers');
+      setServers((data?.servers || []) as McpServer[]);
     } catch (e: any) {
       console.error('[MCP] Failed to load MCP servers:', e);
       setMsg(`Failed to load MCP servers: ${e}`);
       setMsgType('error');
     } finally {
-      console.log('[MCP] Setting loading to false');
       setLoading(false);
     }
   };
 
   const loadTools = async () => {
     try {
-      const result = await invoke<McpTool[]>('mcp_list_tools');
-      setTools(result);
+      const data = await mcpFetch('/tools');
+      setTools((data?.tools || []) as McpTool[]);
     } catch (e: any) {
       console.error('Failed to load MCP tools:', e);
     }
@@ -79,7 +91,7 @@ const McpSettingsPage = () => {
 
   const handleStart = async (id: string) => {
     try {
-      await invoke('mcp_start_server', { id });
+      await mcpFetch(`/servers/${encodeURIComponent(id)}/start`, { method: 'POST' });
       showMessage('Server started');
       loadServers();
     } catch (e: any) {
@@ -89,7 +101,7 @@ const McpSettingsPage = () => {
 
   const handleStop = async (id: string) => {
     try {
-      await invoke('mcp_stop_server', { id });
+      await mcpFetch(`/servers/${encodeURIComponent(id)}/stop`, { method: 'POST' });
       showMessage('Server stopped');
       loadServers();
     } catch (e: any) {
@@ -99,7 +111,7 @@ const McpSettingsPage = () => {
 
   const handleRestart = async (id: string) => {
     try {
-      await invoke('mcp_restart_server', { id });
+      await mcpFetch(`/servers/${encodeURIComponent(id)}/restart`, { method: 'POST' });
       showMessage('Server restarted');
       loadServers();
     } catch (e: any) {
@@ -109,18 +121,28 @@ const McpSettingsPage = () => {
 
   const handleToggle = async (id: string, enabled: boolean) => {
     try {
-      await invoke('mcp_toggle_server', { id, enabled });
+      await mcpFetch(`/servers/${encodeURIComponent(id)}/toggle`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled }),
+      });
       showMessage(enabled ? 'Server enabled' : 'Server disabled');
       loadServers();
     } catch (e: any) {
       showMessage(`Failed to toggle: ${e}`, 'error');
+      loadServers();
     }
   };
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Are you sure you want to remove this MCP server?')) return;
+    // 两段式确认：第一次点击进入待确认态，第二次点击才真正删除
+    if (confirmDeleteId !== id) {
+      setConfirmDeleteId(id);
+      setTimeout(() => setConfirmDeleteId(prev => (prev === id ? null : prev)), 3000);
+      return;
+    }
+    setConfirmDeleteId(null);
     try {
-      await invoke('mcp_remove_server', { id });
+      await mcpFetch(`/servers/${encodeURIComponent(id)}`, { method: 'DELETE' });
       showMessage('Server removed');
       loadServers();
       loadTools();
@@ -134,8 +156,8 @@ const McpSettingsPage = () => {
     setFormData({
       name: server.name,
       command: server.command,
-      args: server.args.join(' '),
-      env: server.env ? JSON.stringify(server.env, null, 2) : '',
+      args: (server.args || []).join(' '),
+      env: server.env && Object.keys(server.env).length > 0 ? JSON.stringify(server.env, null, 2) : '',
       transport_type: server.transport_type,
     });
     setShowAddForm(true);
@@ -149,31 +171,34 @@ const McpSettingsPage = () => {
 
     try {
       const args = formData.args.trim() ? formData.args.trim().split(/\s+/) : [];
-      const env = formData.env ? JSON.parse(formData.env) : undefined;
+      let env: Record<string, string> = {};
+      if (formData.env.trim()) {
+        env = JSON.parse(formData.env);
+      }
 
       if (editingServer) {
-        await invoke('mcp_update_server', {
-          id: editingServer,
-          config: {
+        await mcpFetch(`/servers/${encodeURIComponent(editingServer)}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            id: editingServer,
             name: formData.name,
             command: formData.command,
             args,
             env,
-            transport_type: formData.transport_type,
             enabled: true,
-          },
+          }),
         });
         showMessage('Server updated');
       } else {
-        await invoke('mcp_add_server', {
-          config: {
+        await mcpFetch('/servers', {
+          method: 'POST',
+          body: JSON.stringify({
             name: formData.name,
             command: formData.command,
             args,
             env,
-            transport_type: formData.transport_type,
             enabled: true,
-          },
+          }),
         });
         showMessage('Server added');
       }
@@ -352,7 +377,13 @@ const McpSettingsPage = () => {
                     )}
                     {server.running && <button onClick={() => handleRestart(server.id)} className="p-1.5 hover:bg-blue-50 rounded-md transition-colors text-blue-500" title="Restart"><RotateCw size={14} /></button>}
                     <button onClick={() => handleEdit(server)} className="p-1.5 hover:bg-gray-100 rounded-md transition-colors text-[#666]" title="Edit"><Edit2 size={13} /></button>
-                    <button onClick={() => handleDelete(server.id)} className="p-1.5 hover:bg-red-50 rounded-md transition-colors text-red-500" title="Delete"><Trash2 size={13} /></button>
+                    <button
+                      onClick={() => handleDelete(server.id)}
+                      className={`p-1.5 rounded-md transition-colors ${confirmDeleteId === server.id ? 'bg-red-500 text-white font-medium' : 'hover:bg-red-50 text-red-500'}`}
+                      title={confirmDeleteId === server.id ? '再点一次确认删除' : 'Delete'}
+                    >
+                      {confirmDeleteId === server.id ? <span className="text-[10px] leading-none">确认?</span> : <Trash2 size={13} />}
+                    </button>
                     <label className="flex items-center gap-1 ml-1.5 cursor-pointer">
                       <input type="checkbox" checked={server.enabled} onChange={(e) => handleToggle(server.id, e.target.checked)} className="w-3.5 h-3.5 rounded border-[#d0d0d0] text-[#D97757] focus:ring-[#D97757]/30" />
                     </label>

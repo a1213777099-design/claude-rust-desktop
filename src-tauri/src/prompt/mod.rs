@@ -1,3 +1,5 @@
+pub mod prompts;
+
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,7 +21,7 @@ Do not claim to be Claude or created by Anthropic unless the active model actual
 </identity>"#;
 
 static RE_OVERRIDE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<override_instructions>[\s\S]*?</override_instructions>\s*").unwrap());
+    LazyLock::new(|| Regex::new(r"<override_instructions>[\s\S]*?</override_instructions>").unwrap());
 static RE_IDENTITY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"<identity>[\s\S]*?</identity>").unwrap());
 static RE_IDENTITY_WITH_WS: LazyLock<Regex> =

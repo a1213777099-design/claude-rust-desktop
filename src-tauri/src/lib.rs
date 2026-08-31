@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_variables, unused_imports, unused_mut, unused_assignments)]
+
 pub mod bridge;
 pub mod commands;
 pub mod engine;
@@ -33,5 +35,6 @@ pub mod sandbox;
 pub mod multiagent;
 pub mod orchestration;
 pub mod computer_use;
+pub mod memory;
 pub mod db;
 pub mod permissions;

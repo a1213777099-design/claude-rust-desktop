@@ -147,4 +147,4 @@ pub fn get_default_rules() -> PermissionRuleset {
     ruleset
 }
 
-pub const DANGEROUS_TOOLS: &[&str] = &["bash", "command", "computer_use", "file_write", "file_delete"];
+pub const DANGEROUS_TOOLS: &[&str] = &["Bash", "Delete", "ComputerUse", "Command", "FileWrite", "FileDelete"];

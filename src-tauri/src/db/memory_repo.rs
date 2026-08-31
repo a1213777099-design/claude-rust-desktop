@@ -326,3 +326,90 @@ pub fn search_all_memories(conn: &Connection, query: &str, limit: i64) -> Result
     }
     Ok(result)
 }
+
+
+// === Vector embedding integration ===
+
+/// Insert a memory and store its vector embedding.
+pub fn insert_memory_with_vector(
+    conn: &Connection,
+    id: &str,
+    workspace_path: &str,
+    conversation_id: &str,
+    summary: &str,
+    tags: &str,
+    memory_type: &str,
+    importance: i32,
+    created_at: &str,
+    embedding: &[f32],
+) -> Result<()> {
+    // Insert the memory record
+    insert_memory(conn, id, workspace_path, conversation_id, summary, tags, memory_type, importance, created_at)?;
+    // Store the vector
+    crate::memory::vector_index::upsert_vector(conn, id, embedding, "api", created_at)?;
+    Ok(())
+}
+
+/// Semantic search using vector similarity.
+/// Returns memories sorted by similarity score.
+pub fn search_memories_vector(
+    conn: &Connection,
+    workspace_path: &str,
+    query_embedding: &[f32],
+    limit: i64,
+    threshold: f32,
+) -> Result<Vec<(MemoryRow, f32)>> {
+    let vector_results = crate::memory::vector_index::search_vectors(
+        conn, query_embedding, Some(workspace_path), limit as usize, threshold,
+    )?;
+
+    let mut results = Vec::new();
+    for (memory_id, score) in vector_results {
+        if let Some(row) = get_memory_by_id(conn, &memory_id)? {
+            results.push((row, score));
+        }
+    }
+    Ok(results)
+}
+
+/// Get a single memory by ID.
+fn get_memory_by_id(conn: &Connection, id: &str) -> Result<Option<MemoryRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, workspace_path, conversation_id, summary, tags, memory_type, importance, created_at FROM memories WHERE id = ?1"
+    )?;
+    let mut rows = stmt.query_map(params![id], |row| row_to_memory(row))?;
+    match rows.next() {
+        Some(Ok(row)) => Ok(Some(row)),
+        _ => Ok(None),
+    }
+}
+
+/// Hybrid search: try vector search first, fallback to FTS5.
+pub fn search_memories_hybrid(
+    conn: &Connection,
+    workspace_path: &str,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    limit: i64,
+) -> Result<Vec<MemoryRow>> {
+    // Try vector search first if embedding is available
+    if let Some(embedding) = query_embedding {
+        let has_vectors: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM memory_vectors",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if has_vectors {
+            match search_memories_vector(conn, workspace_path, embedding, limit, 0.3) {
+                Ok(results) if !results.is_empty() => {
+                    return Ok(results.into_iter().map(|(row, _)| row).collect());
+                }
+                _ => {} // Fallback to FTS5
+            }
+        }
+    }
+
+    // Fallback to existing FTS5 + LIKE search
+    search_memories(conn, workspace_path, query, limit)
+}

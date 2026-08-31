@@ -75,7 +75,8 @@ const EFFORT_LEVELS = [
   { id: 'low', label: 'Low' },
   { id: 'medium', label: 'Medium' },
   { id: 'high', label: 'High' },
-  { id: 'xhigh', label: 'Max' },
+  { id: 'xhigh', label: 'XHigh' },
+  { id: 'max', label: 'Max' },
 ];
 
 interface ModelSelectorProps {
@@ -199,7 +200,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
           <div className="h-[1px] bg-claude-border my-1 mx-4" />
           <div className="px-4 py-2">
             <div className="text-[14.5px] font-[500] text-claude-text mb-2">Reasoning Effort</div>
-            <div className="flex gap-1">
+            <div className="grid grid-cols-3 gap-1">
               {EFFORT_LEVELS.map(level => (
                 <button
                   key={level.id}
@@ -207,7 +208,7 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({
                     e.stopPropagation();
                     onEffortChange?.(level.id);
                   }}
-                  className={`flex-1 px-1.5 py-1 text-[12px] font-medium rounded-md transition-colors ${
+                  className={`px-1.5 py-1 text-[12px] font-medium rounded-md transition-colors ${
                     effort === level.id
                       ? 'bg-[#3A6FE0] text-white'
                       : 'bg-claude-border/40 text-claude-textSecondary hover:bg-claude-border'

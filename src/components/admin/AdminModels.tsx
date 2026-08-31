@@ -8,6 +8,7 @@ import {
   updateCommonModelsConfig,
 } from '../../adminApi';
 import { Plus, Trash2, Edit2, X, Check, RefreshCw } from 'lucide-react';
+import { useUIStore } from '../../stores/useUIStore';
 
 interface Model {
   id: string;
@@ -27,6 +28,7 @@ const EMPTY_FORM = {
 };
 
 export default function AdminModels() {
+  const bumpModelVersion = useUIStore((state) => state.bumpModelVersion);
   const [models, setModels] = useState<Model[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
@@ -102,6 +104,7 @@ export default function AdminModels() {
       setEditId(null);
       setForm(EMPTY_FORM);
       await load();
+      bumpModelVersion();
     } catch (e: any) {
       setError(e.message);
     }
@@ -113,6 +116,7 @@ export default function AdminModels() {
     try {
       await deleteModel(id);
       await load();
+      bumpModelVersion();
     } catch (e: any) {
       setError(e.message);
     }
@@ -122,6 +126,7 @@ export default function AdminModels() {
     try {
       await updateModel(m.id, { enabled: m.enabled ? 0 : 1 });
       await load();
+      bumpModelVersion();
     } catch (e: any) {
       setError(e.message);
     }
@@ -145,6 +150,7 @@ export default function AdminModels() {
     try {
       await updateCommonModelsConfig(ids);
       await load();
+      bumpModelVersion();
     } catch (e: any) {
       setError(e.message);
     }

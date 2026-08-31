@@ -1,4 +1,4 @@
-const DEFAULT_BRIDGE_PORT = 30080;
+﻿const DEFAULT_BRIDGE_PORT = 30080;
 let detectedBridgePort: number | null = null;
 
 async function detectBridgePort(): Promise<number> {
@@ -509,6 +509,14 @@ export async function deleteProject(id: string) {
   return res.json();
 }
 
+export async function openFolder(path: string): Promise<{ ok: boolean; error?: string }> {
+  const res = await request('/open-folder', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  });
+  return res.json();
+}
+
 export async function uploadProjectFile(projectId: string, file: File): Promise<ProjectFile> {
   const formData = new FormData();
   formData.append('file', file);
@@ -551,6 +559,7 @@ export async function getConversations() {
       title: c.title,
       model: c.model,
       workspace_path: c.workspace_path,
+      project_id: c.project_id ?? null,
       created_at: c.created_at,
       updated_at: c.updated_at,
       messages: [],
@@ -942,6 +951,7 @@ export function reconnectStream(
             if (parsed.type === 'content_block_delta' && parsed.delta) {
               if (parsed.delta.type === 'text_delta' && parsed.delta.text) {
                 fullText += parsed.delta.text;
+                console.log('[SSE]', new Date().toISOString().slice(11,19), 'text_delta fullText_len=', fullText.length, '| tail=', JSON.stringify(fullText.slice(-20)));
                 onDelta(parsed.delta.text, fullText);
               }
               if (parsed.delta.type === 'thinking_delta' && parsed.delta.thinking && onThinking) {
@@ -988,6 +998,7 @@ export function reconnectStream(
               }
             }
             if (parsed.type === 'message_stop') {
+              console.log('[SSE] message_stop fullText_len=', fullText.length);
               if (fullText) { onDone(fullText); return; }
             }
             if (parsed.type === 'error') {
@@ -1162,6 +1173,95 @@ export async function toggleSkill(id: string, enabled: boolean) {
     method: 'PATCH',
     body: JSON.stringify({ enabled }),
   });
+  return res.json();
+}
+
+export interface SkillToolResult {
+  tool_name: string;
+  input: unknown;
+  output: unknown;
+  error?: string | null;
+}
+
+// 对应后端 skills/engine.rs 的 SkillExecutionResult
+export interface SkillExecutionResultData {
+  results: SkillToolResult[];
+  summary: string;
+  frontmatter?: {
+    name?: string | null;
+    description?: string | null;
+    whenToUse?: string | null;
+    allowedTools?: string[] | null;
+    model?: string | null;
+    userInvocable?: boolean | null;
+  };
+}
+
+export interface SkillExecuteResult {
+  success: boolean;
+  result?: SkillExecutionResultData;
+  error?: string;
+}
+
+export async function executeSkill(
+  name: string,
+  input: string,
+  opts?: { conversation_id?: string; workspace_path?: string; variables?: Record<string, unknown> }
+): Promise<SkillExecuteResult> {
+  const res = await request(`/skills/${encodeURIComponent(name)}/execute`, {
+    method: 'POST',
+    body: JSON.stringify({ input, ...opts }),
+  });
+  return res.json();
+}
+
+// MCP 资源相关
+export interface McpResourceSummary {
+  uri: string;
+  name: string;
+  mime_type?: string;
+}
+
+export interface McpResourceContentResult {
+  uri: string;
+  content: string;
+  content_type?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export async function mcpResourcesList(serverName: string): Promise<McpResourceSummary[]> {
+  const res = await request(`/mcp/servers/${encodeURIComponent(serverName)}/resources`);
+  const data = await res.json();
+  return data.resources || [];
+}
+
+export async function mcpResourceRead(
+  serverName: string,
+  uri: string,
+  opts?: { offset?: number; limit?: number }
+): Promise<McpResourceContentResult> {
+  const params = new URLSearchParams();
+  if (opts?.offset != null) params.set('offset', String(opts.offset));
+  if (opts?.limit != null) params.set('limit', String(opts.limit));
+  const qs = params.toString();
+  const res = await request(
+    `/mcp/servers/${encodeURIComponent(serverName)}/resources/${encodeURIComponent(uri)}${qs ? `?${qs}` : ''}`
+  );
+  return res.json();
+}
+
+export async function mcpResourceMonitor(
+  serverName: string,
+  uri: string,
+  enable: boolean
+): Promise<{ uri: string; enabled: boolean }> {
+  const res = await request(
+    `/mcp/servers/${encodeURIComponent(serverName)}/resources/${encodeURIComponent(uri)}/monitor`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ enable }),
+    }
+  );
   return res.json();
 }
 
@@ -2460,29 +2560,255 @@ export function streamTerminalOutput(
   };
 }
 
-// === Memory API (V2) ===
-export async function getMemories(): Promise<any[]> {
-  const res = await request('/memories');
-  const data = await res.json();
-  return data.memories || [];
+// === Workflow Orchestrator API ===
+export interface WorkflowEvent {
+  event_type: string;
+  task_id?: string;
+  message: string;
+  data?: any;
+  timestamp: number;
 }
 
-export async function searchMemories(query: string, workspace?: string): Promise<any[]> {
-  const params = new URLSearchParams();
-  if (query) params.set('q', query);
-  if (workspace) params.set('workspace', workspace);
-  const res = await request(`/memories/search?${params.toString()}`);
-  const data = await res.json();
-  return data.memories || [];
+export async function* workflowEventStream(
+  goal: string,
+  providerId?: string,
+  model?: string,
+  workspace?: string,
+  resumeRoles?: Array<{ name: string; cause_by: string; output: string }>
+): AsyncGenerator<WorkflowEvent, void, unknown> {
+  const currentModel = model || localStorage.getItem('chat_model') || 'deepseek-v4-flash-free';
+  const res = await fetch(`${API_BASE}/workflow/v2/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ goal, provider_id: providerId, model: currentModel, workspace, resume_roles: resumeRoles }),
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`Workflow stream failed: ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const data = line.startsWith('data: ') ? line.slice(6) : line.slice(5);
+      if (data.trim() === '[DONE]') return;
+
+      try {
+        const parsed = JSON.parse(data);
+        yield parsed as WorkflowEvent;
+      } catch {
+        // Skip malformed JSON
+      }
+    }
+  }
+}
+// === Swarm Session API ===
+export interface SwarmSession {
+  id: string;
+  title: string;
+  workspace: string | null;
+  status: string;
+  agent_status: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
-export async function deleteMemory(id: string): Promise<boolean> {
-  const res = await request(`/memories/${id}`, { method: 'DELETE' });
-  const data = await res.json();
-  return data.ok || false;
+export interface SwarmMessage {
+  id: string;
+  session_id: string;
+  role: string;
+  content: string;
+  agent_name: string | null;
+  agent_icon: string | null;
+  agent_color: string | null;
+  type: string | null;
+  created_at: number;
 }
 
-export async function getMemoryStats(): Promise<{ total: number; by_type: [string, number][]; by_importance: [number, number][] }> {
-  const res = await request('/memories/stats');
+export async function swarmCreateSession(title: string, workspace?: string): Promise<SwarmSession> {
+  const res = await request('/swarm/sessions', {
+    method: 'POST',
+    body: JSON.stringify({ title, workspace }),
+  });
+  return res.json();
+}
+
+export async function swarmListSessions(): Promise<SwarmSession[]> {
+  const res = await request('/swarm/sessions');
+  const data = await res.json();
+  return data.sessions || [];
+}
+
+export async function swarmGetMessages(sessionId: string): Promise<SwarmMessage[]> {
+  const res = await request('/swarm/sessions/' + sessionId + '/messages');
+  const data = await res.json();
+  console.log('[API] swarmGetMessages:', sessionId, 'returned', (data.messages||[]).length, 'messages');
+  return data.messages || [];
+}
+
+export async function swarmAddMessage(sessionId: string, role: string, content: string, agentName?: string, agentIcon?: string, agentColor?: string, type?: string): Promise<void> {
+  console.log('[API] swarmAddMessage:', sessionId, role, type);
+  await request('/swarm/sessions/' + sessionId + '/messages', {
+    method: 'POST',
+    body: JSON.stringify({ role, content, agent_name: agentName, agent_icon: agentIcon, agent_color: agentColor, type }),
+  });
+}
+
+export async function swarmUpdateStatus(sessionId: string, status: string, agentStatus?: Record<string, string>): Promise<void> {
+  await request('/swarm/sessions/' + sessionId + '/status', {
+    method: 'POST',
+    body: JSON.stringify({ status, agent_status: agentStatus }),
+  });
+}
+
+export async function swarmDeleteSession(sessionId: string): Promise<void> {
+  await request('/swarm/sessions/' + sessionId, { method: 'DELETE' });
+}
+
+export async function swarmRenameSession(sessionId: string, title: string): Promise<void> {
+  await request('/swarm/sessions/' + sessionId + '/title', {
+    method: 'POST',
+    body: JSON.stringify({ title }),
+  });
+}
+// === Knowledge Base API ===
+export async function getKnowledge(): Promise<any[]> {
+  const res = await request('/knowledge');
+  const data = await res.json();
+  return data.knowledge || [];
+}
+
+export async function createKnowledge(data: { summary: string; tags?: string; importance?: number; workspace_path?: string }): Promise<{ ok: boolean; id?: string }> {
+  const res = await request('/knowledge', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+  return res.json();
+}
+
+export async function searchKnowledge(query: string, limit?: number): Promise<any[]> {
+  const res = await request('/knowledge/search', {
+    method: 'POST',
+    body: JSON.stringify({ query, limit: limit || 20 }),
+  });
+  const data = await res.json();
+  return data.results || [];
+}
+export async function compressContext(messages: unknown[], maxTokens?: number) {
+  const res = await request('/memories/compress', {
+    method: 'POST',
+    body: JSON.stringify({ messages, max_tokens: maxTokens || 4000 }),
+  });
+  return res.json();
+}
+
+// =====================================================================
+// TencentDB Agent Memory (PRIMARY memory system — direct v3 HTTP client)
+// =====================================================================
+
+export interface TencentDBConfig {
+  base_url: string;
+  user_key: string;
+  team_id: string;
+  agent_id: string;
+  user_id: string;
+  space_id: string;
+  enabled: boolean;
+}
+
+export interface TdaiHealthInfo {
+  reachable: boolean;
+  base_url: string;
+  latency_ms?: number | null;
+  error?: string | null;
+  services?: Record<string, unknown> | null;
+}
+
+export interface TdaiSearchHit {
+  id: string;
+  content: string;
+  tier: number;
+  visibility: string;
+  importance: number;
+  tags: string;
+  created_at: string;
+  score: number;
+}
+
+export interface TdaiSearchResponse {
+  hits: TdaiSearchHit[];
+  source: string; // "remote" | "local-fallback"
+}
+
+export async function getTdaiConfig(): Promise<TencentDBConfig> {
+  const res = await fetch(`${API_BASE}/tdai/config`);
+  return res.json();
+}
+
+export async function setTdaiConfig(cfg: Partial<TencentDBConfig>): Promise<{ ok: boolean; config: TencentDBConfig }> {
+  const res = await fetch(`${API_BASE}/tdai/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  });
+  return res.json();
+}
+
+export async function verifyTdaiAuth(): Promise<{ valid: boolean; user_id?: string; team_id?: string; agent_id?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/tdai/auth/verify`, { method: 'POST' });
+  return res.json();
+}
+
+export async function getTdaiHealth(): Promise<TdaiHealthInfo> {
+  const res = await fetch(`${API_BASE}/tdai/health`);
+  return res.json();
+}
+
+export async function searchTdaiMemories(
+  query: string,
+  workspacePath?: string,
+  topK = 5
+): Promise<TdaiSearchResponse> {
+  const res = await fetch(`${API_BASE}/tdai/search`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workspace_path: workspacePath, query, top_k: topK }),
+  });
+  return res.json();
+}
+
+export async function addTdaiMemory(
+  workspacePath: string,
+  content: string,
+  importance = 3,
+  tags = ''
+): Promise<{ ok: boolean; id?: string; error?: string }> {
+  const res = await fetch(`${API_BASE}/tdai/memory`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workspace_path: workspacePath, content, importance, tags }),
+  });
+  return res.json();
+}
+
+export async function promoteTdaiMemory(id: string): Promise<{ ok: boolean; tier?: number; error?: string }> {
+  const res = await fetch(`${API_BASE}/tdai/memory/${encodeURIComponent(id)}/promote`, { method: 'POST' });
+  return res.json();
+}
+
+export async function getTdaiStats(workspacePath?: string): Promise<{ ok: boolean; stats: Record<string, number> }> {
+  const qs = workspacePath ? `?workspace_path=${encodeURIComponent(workspacePath)}` : '';
+  const res = await fetch(`${API_BASE}/tdai/stats${qs}`);
   return res.json();
 }

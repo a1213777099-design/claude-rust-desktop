@@ -1,0 +1,12 @@
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=/STACK:33554432", "-C", "prefer-dynamic"]
+
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 0

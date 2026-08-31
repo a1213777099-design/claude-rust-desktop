@@ -64,7 +64,7 @@ impl PermissionManager {
     pub fn set_mode(&self, mode: PermissionMode) {
         let mut m = self.mode.lock().unwrap_or_else(|e| e.into_inner());
         *m = mode;
-        eprintln!("[Permission] Mode changed to: {}", mode.as_str());
+        tracing::info!(target: "permission", "Mode changed to: {}", mode.as_str());
     }
 
     pub fn get_mode(&self) -> PermissionMode {
@@ -130,7 +130,7 @@ impl PermissionManager {
 
         // Bypass permissions: all operations auto-approved
         if mode == PermissionMode::BypassPermissions {
-            eprintln!("[Permission] Bypass mode: {} auto-approved", context.tool_name);
+            tracing::info!(target: "permission", "Bypass mode: {} auto-approved", context.tool_name);
             self.audit_logger.log(
                 AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)
                     .with_user_id(context.user_id.as_deref())
@@ -142,7 +142,7 @@ impl PermissionManager {
         // Plan mode: only read-only operations allowed
         if mode == PermissionMode::PlanMode {
             if Self::is_read_only_tool(&context.tool_name) {
-                eprintln!("[Permission] Plan mode: {} auto-approved (read-only)", context.tool_name);
+                tracing::info!(target: "permission", "Plan mode: {} auto-approved (read-only)", context.tool_name);
                 self.audit_logger.log(
                     AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)
                         .with_user_id(context.user_id.as_deref())
@@ -151,7 +151,7 @@ impl PermissionManager {
                 return PermissionResult::Granted;
             } else {
                 let reason = "Plan mode: write operations are not allowed";
-                eprintln!("[Permission] Plan mode: {} denied", context.tool_name);
+                tracing::error!(target: "permission", "Plan mode: {} denied", context.tool_name);
                 self.audit_logger.log(
                     AuditEntry::new(AuditAction::PermissionDenied, &context.tool_name, &context.conversation_id)
                         .with_user_id(context.user_id.as_deref())
@@ -161,22 +161,15 @@ impl PermissionManager {
             }
         }
 
-        // Accept edits mode: read and edit operations auto-approved, dangerous operations need confirmation
+        // Accept edits mode: all operations auto-approved (including dangerous tools)
         if mode == PermissionMode::AcceptEdits {
-            if Self::is_read_only_tool(&context.tool_name) || Self::is_edit_tool(&context.tool_name) {
-                eprintln!("[Permission] Accept edits mode: {} auto-approved", context.tool_name);
-                self.audit_logger.log(
-                    AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)
-                        .with_user_id(context.user_id.as_deref())
-                        .with_result("Accept edits mode"),
-                );
-                return PermissionResult::Granted;
-            }
-            // Dangerous tools still need confirmation in accept_edits mode
-            if Self::is_dangerous_tool(&context.tool_name) {
-                eprintln!("[Permission] Accept edits mode: {} requires confirmation (dangerous)", context.tool_name);
-                return self.request_confirmation(context);
-            }
+            tracing::info!(target: "permission", "Accept edits mode: {} auto-approved", context.tool_name);
+            self.audit_logger.log(
+                AuditEntry::new(AuditAction::PermissionGranted, &context.tool_name, &context.conversation_id)
+                    .with_user_id(context.user_id.as_deref())
+                    .with_result("Accept edits mode"),
+            );
+            return PermissionResult::Granted;
         }
 
         // Ask permissions mode (default): fall through to existing logic

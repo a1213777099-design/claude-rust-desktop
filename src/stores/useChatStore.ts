@@ -40,6 +40,7 @@ interface ChatState {
   permissionMode: string;
   autoCompactEnabled: boolean;
   autoCompactThreshold: number;
+  crossModeWarning: CrossModeWarning | null;
 
   setMessages: (messages: any[] | ((prev: any[]) => any[])) => void;
   appendMessage: (msg: any) => void;
@@ -61,9 +62,18 @@ interface ChatState {
   setProvidersCache: (providers: any[]) => void;
   setWebSearchToast: (toast: string | null) => void;
   setWebSearchEnabled: (enabled: boolean) => void;
+  setPermissionMode: (mode: string) => void;
     setAutoCompactEnabled: (enabled: boolean) => void;
     setAutoCompactThreshold: (threshold: number) => void;
+  setCrossModeWarning: (warning: CrossModeWarning | null) => void;
   resetChat: () => void;
+}
+
+interface CrossModeWarning {
+  convId: string;
+  originalModel: string;
+  otherMode: string;
+  fallbackModel: string;
 }
 
 const initialState = {
@@ -90,6 +100,7 @@ const initialState = {
   })() as string,
   autoCompactEnabled: (() => { try { return localStorage.getItem('auto_compact_enabled') !== 'false'; } catch { return true; } })(),
   autoCompactThreshold: (() => { try { return parseInt(localStorage.getItem('auto_compact_threshold') || '80'); } catch { return 80; } })(),
+  crossModeWarning: null as CrossModeWarning | null,
 };
 
 export const useChatStore = create<ChatState>()(
@@ -184,6 +195,7 @@ export const useChatStore = create<ChatState>()(
         localStorage.setItem('auto_compact_threshold', String(autoCompactThreshold));
       } catch {}
     },
+    setCrossModeWarning: (crossModeWarning: CrossModeWarning | null) => set({ crossModeWarning }),
     resetChat: () => set(initialState),
   }))
 );

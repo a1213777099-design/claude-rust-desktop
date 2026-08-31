@@ -1,4 +1,5 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(dead_code, unused_variables, unused_imports, unused_mut, unused_assignments)]
 
 mod bridge;
 mod commands;
@@ -36,6 +37,7 @@ mod github;
 mod db;
 mod multiagent;
 mod orchestration;
+mod memory;
 mod permissions;
 
 use bridge::BridgeServer;
@@ -49,16 +51,49 @@ use tokio::sync::Notify;
 use tokio::sync::Mutex;
 
 fn main() {
-    std::env::set_var("RUST_BACKTRACE", "1");
-    // Log panics to file
+    // Initialize structured logging — write to FILE, not stdout.
+    // In Tauri dev mode, stdout pipe can break during hot-reload,
+    // causing stdio.rs panics when tracing tries to write.
+    let log_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("claude-desktop")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file = log_dir.join("app.log");
+
+    // Use env-filter with file output for robustness
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .unwrap_or_else(|_| std::fs::File::create("claude_desktop.log").unwrap());
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_ansi(false)  // No ANSI colors in file
+        .with_writer(std::sync::Mutex::new(file))
+        .init();
+
+    // Log panics DIRECTLY to file — don't use tracing (which may itself panic
+    // if the pipe is broken, causing a cascade).
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let msg = format!("[PANIC] {}: {:?}", chrono::Utc::now().to_rfc3339(), info);
-        eprintln!("{}", msg);
+        let msg = format!("[PANIC] {}: {:?}\n", chrono::Utc::now().to_rfc3339(), info);
+        // Write directly to file, bypass tracing and stdout
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("panic.log") {
             use std::io::Write;
-            let _ = writeln!(f, "{}", msg);
+            let _ = f.write_all(msg.as_bytes());
+            let _ = f.flush();
         }
+        // Also try stderr (may fail silently if pipe is broken — that's OK)
+        let mut stderr = std::io::stderr();
+        let _ = std::io::Write::write_all(&mut stderr, msg.as_bytes());
         default_hook(info);
     }));
 
@@ -87,9 +122,9 @@ fn main() {
                 tauri::async_runtime::block_on(async move {
                     let manager = mcp_manager_ref.lock().await;
                     if let Err(e) = manager.initialize().await {
-                        eprintln!("[MCP] Failed to initialize: {}", e);
+                        tracing::error!(target: "mcp", "Failed to initialize: {}", e);
                     } else {
-                        println!("[MCP] Initialized successfully");
+                        tracing::info!(target: "mcp", "Initialized successfully");
                     }
                 });
             }
@@ -104,10 +139,10 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 let bridge = BridgeServer::new(data_dir);
-                println!("[Bridge] Starting server on port 30080...");
-                match bridge.start(30080).await {
-                    Ok(()) => println!("[Bridge] Server stopped."),
-                    Err(e) => eprintln!("[Bridge] Failed to start: {}", e),
+                tracing::info!(target: "bridge", "Starting server on port 30080...");
+                match bridge.start_with_fallback(30080).await {
+                    Ok(()) => tracing::info!(target: "bridge", "Server stopped."),
+                    Err(e) => tracing::error!(target: "bridge", "Failed to start: {}", e),
                 }
             });
 
@@ -117,7 +152,7 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
                     let _ = window.show();
-                    println!("[App] Window shown after bridge startup delay.");
+                    tracing::info!(target: "app", "Window shown after bridge startup delay.");
                 });
             }
             Ok(())
@@ -163,12 +198,7 @@ fn main() {
             commands::mcp_list_tools,
         ]);
 
-    #[cfg(mobile)]
-    {
-        builder = builder
-            .plugin(tauri_plugin_haptics::init())
-            .plugin(tauri_plugin_barcode_scanner::init());
-    }
+    // Mobile-only plugins removed (desktop app)
 
     builder
         .run(tauri::generate_context!())

@@ -123,7 +123,7 @@ impl SessionManager {
             if let Ok(content) = std::fs::read_to_string(&self.db_path) {
                 if let Ok(db) = serde_json::from_str::<Database>(&content) {
                     self.db = db;
-                    eprintln!("[SessionManager] Loaded database from {}", self.db_path.display());
+                    tracing::info!(target: "sessionmanager", "Loaded database from {}", self.db_path.display());
                 }
             }
         }

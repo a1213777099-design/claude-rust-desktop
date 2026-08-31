@@ -376,7 +376,7 @@ pub struct McpManagedConnector {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct McpManagedProfile {
+pub struct McpManagedProfile {
     connector_ids: Vec<String>,
     server_name: String,
     server_url: String,

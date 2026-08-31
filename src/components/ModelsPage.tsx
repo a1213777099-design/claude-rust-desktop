@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useUIStore } from '../stores/useUIStore';
 import { useNavigate } from 'react-router-dom';
 import { ArrowLeft, Plus, Trash2, Check, X, Loader2, GripVertical } from 'lucide-react';
 import { useI18n } from '../hooks/useI18n';
@@ -13,6 +14,8 @@ interface ChatModel {
 const ModelsPage = () => {
   const { t } = useI18n();
   const navigate = useNavigate();
+  const bumpModelVersion = useUIStore((state) => state.bumpModelVersion);
+  const setPendingTierSwitch = useUIStore((state) => state.setPendingTierSwitch);
   const [models, setModels] = useState<ChatModel[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAddForm, setShowAddForm] = useState(false);
@@ -40,8 +43,33 @@ const ModelsPage = () => {
   };
 
   const saveModels = (newModels: ChatModel[]) => {
+    // Detect tier changes BEFORE saving
+    try {
+      const oldModels: ChatModel[] = JSON.parse(localStorage.getItem('chat_models') || '[]');
+      const oldTierMap: Record<string, string> = {};
+      for (const m of oldModels) {
+        if (m.tier && m.tier !== 'extra') oldTierMap[m.tier] = m.id;
+      }
+      const newTierMap: Record<string, string> = {};
+      for (const m of newModels) {
+        if (m.tier && m.tier !== 'extra') newTierMap[m.tier] = m.id;
+      }
+      const changes: Record<string, string> = {};
+      for (const tier of ['opus', 'sonnet', 'haiku']) {
+        if (oldTierMap[tier] !== newTierMap[tier] && newTierMap[tier]) {
+          changes[tier] = newTierMap[tier];
+        }
+      }
+      if (Object.keys(changes).length > 0) {
+        console.log('[ModelsPage] Tier changes:', changes);
+        setPendingTierSwitch(changes);
+      }
+    } catch {}
+
     localStorage.setItem('chat_models', JSON.stringify(newModels));
     setModels(newModels);
+    bumpModelVersion();
+    window.dispatchEvent(new CustomEvent('chat_models_changed'));
   };
 
   const handleAddModel = () => {

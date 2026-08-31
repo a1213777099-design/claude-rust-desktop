@@ -1,16 +1,18 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { ChevronDown, FileText, ArrowUp, RotateCcw, Pencil, Copy, Check, Paperclip, ListCollapse, Globe, Clock, Info, Github, Plus, X, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, FileText, ArrowUp, ArrowDown, RotateCcw, Pencil, Copy, Check, Paperclip, ListCollapse, Globe, Clock, Info, Github, Plus, X, Loader2, Brain } from 'lucide-react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconPencil, IconProjects, IconResearch, IconWebSearch } from './Icons';
 import ClaudeLogo from './ClaudeLogo';
-import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, branchConversation, uploadFile, deleteAttachment, compactConversation, answerUserQuestion, respondToolPermission, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels, getStreamStatus, reconnectStream, getProviderModels, getSkills, warmEngine, getProjects, createProject, Project, materializeGithub, getProviders, Provider } from '../api';
+import { getConversation, sendMessage, createConversation, getUser, updateConversation, deleteMessagesFrom, deleteMessagesTail, branchConversation, uploadFile, deleteAttachment, compactConversation, answerUserQuestion, respondToolPermission, getUserUsage, getAttachmentUrl, getGenerationStatus, stopGeneration, getContextSize, getUserModels, getStreamStatus, reconnectStream, getProviderModels, getSkills, warmEngine, getProjects, createProject, Project, materializeGithub, getProviders, Provider, executeSkill, SkillExecuteResult } from '../api';
 import { useChatStore } from '../stores/useChatStore';
 import { useStreamingStore } from '../stores/useStreamingStore';
+import { ToolCallList, FileChangesSummary, computeChangedFiles } from './ToolCallCard';
 import { useUIStore } from '../stores/useUIStore';
 import { useAuthStore } from '../stores/useAuthStore';
 import { useProjectStore } from '../stores/useProjectStore';
 import { useToolStore } from '../stores/useToolStore';
 import MarkdownRenderer from './MarkdownRenderer';
+import SkillExecutionResultModal from './SkillExecutionResultModal';
 import ResearchPanel from './ResearchPanel';
 import ModelSelector, { SelectableModel } from './ModelSelector';
 import PermissionModeSelector from './PermissionModeSelector';
@@ -43,6 +45,18 @@ function formatChatError(err: string): string {
   if (lower.includes('overloaded') || lower.includes('rate limit') || lower.includes('529')) {
     return '⚠️ 服务暂时繁忙，请稍后再试。';
   }
+  // Reasoning effort hint: if effort is non-default and error looks parameter-related
+  const effort = (() => { try { return localStorage.getItem('reasoning_effort') || 'medium'; } catch { return 'medium'; } })();
+  if (effort !== 'medium' && (lower.includes('422') || lower.includes('unprocessable') || lower.includes('invalid_request') || lower.includes('bad request'))) {
+    return `⚠️ ${err}` + "\n\n" + `💡 当前推理等级为「${effort}」，该模型可能不支持此参数。请尝试在右下角模型选择器中将 Reasoning Effort 改回 Medium。`;
+  }
+  // Thinking hint: if thinking is enabled and error looks parameter-related
+  try {
+    const saved = localStorage.getItem('chat_model');
+    if (saved && saved.endsWith('-thinking') && (lower.includes('422') || lower.includes('unprocessable') || lower.includes('invalid_request') || lower.includes('bad request') || lower.includes('thinking'))) {
+      return `⚠️ ${err}` + "\n\n" + `💡 当前模型可能不支持 Extended Thinking（扩展思考）。请尝试关闭 Extended Thinking 开关。`;
+    }
+  } catch {}
   return 'Error: ' + err;
 }
 
@@ -150,6 +164,19 @@ function stripThinking(model: string) {
 
 function withThinking(base: string, thinking: boolean) {
   return thinking ? `${base}-thinking` : base;
+}
+
+function formatElapsed(s: number): string {
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}m${sec}s`;
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+  return n.toString();
 }
 
 function isThinkingModel(model: string) {
@@ -534,6 +561,8 @@ interface MessageListProps {
   editingContent: string;
   copiedMessageIdx: number | null;
   compactStatus: { state: string; message?: string };
+  elapsedTime: number;
+  tokenUsage: { input_tokens: number; output_tokens: number } | null;
   onSetEditingContent: (v: string) => void;
   onEditCancel: () => void;
   onEditSave: () => void;
@@ -549,9 +578,58 @@ interface MessageListProps {
   t: (key: string, params?: Record<string, string | number>) => string;
 }
 
+// 工作计时器：模型工作期间每秒跳动，结束后冻结时长
+function fmtWorkDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}秒`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return `${m}分${rs}秒`;
+  return `${Math.floor(m / 60)}时${m % 60}分${rs}秒`;
+}
+
+const WorkTimer: React.FC<{
+  running: boolean;
+  startedAt?: number;
+  frozenMs?: number;
+  onFrozen: (ms: number) => void;
+}> = ({ running, startedAt, frozenMs, onFrozen }) => {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const iv = setInterval(() => setTick(t => t + 1), 1000);
+    return () => clearInterval(iv);
+  }, [running]);
+  // 结束瞬间冻结一次时长
+  useEffect(() => {
+    if (!running && startedAt && !frozenMs) onFrozen(Date.now() - startedAt);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+  if (running && !startedAt) {
+    return (
+      <span className="flex items-center gap-1.5 text-[12px] text-claude-textSecondary select-none">
+        <Loader2 size={12} className="animate-spin text-[#D97757]" />
+        工作中…
+      </span>
+    );
+  }
+  if (!startedAt) return null;
+  const ms = running ? Date.now() - startedAt : (frozenMs ?? Date.now() - startedAt);
+  return (
+    <span className="flex items-center gap-1.5 text-[12px] text-claude-textSecondary select-none">
+      {running ? (
+        <><Loader2 size={12} className="animate-spin text-[#D97757]" /><span>工作中 · {fmtWorkDuration(ms)}</span></>
+      ) : (
+        <><Clock size={12} /><span>已工作 {fmtWorkDuration(ms)}</span></>
+      )}
+    </span>
+  );
+};
+
 const MessageList = React.memo<MessageListProps>(({
   messages, loading, expandedMessages, editingMessageIdx, editingContent,
-  copiedMessageIdx, compactStatus, onSetEditingContent, onEditCancel, onEditSave,
+  copiedMessageIdx, compactStatus, elapsedTime, tokenUsage,
+  onSetEditingContent, onEditCancel, onEditSave,
   onToggleExpand, onResend, onEdit, onCopy, onBranch, onOpenDocument, onSetMessages,
   messageContentRefs, onOpenResearch, t,
 }) => {
@@ -709,75 +787,145 @@ const MessageList = React.memo<MessageListProps>(({
             )
           ) : (
             <div className="px-1 text-claude-text text-[16.5px] leading-normal mt-2">
-              {msg.thinking && (
-                <div className="mb-4">
-                  <div
-                    className="flex items-center gap-2 cursor-pointer select-none group/think text-claude-textSecondary hover:text-claude-text transition-colors"
-                    onClick={() => {
-                      onSetMessages(prev =>
-                        prev.map((m, i) =>
-                          i === idx ? { ...m, isThinkingExpanded: !m.isThinkingExpanded } : m
-                        )
-                      );
-                    }}
-                  >
-                    {msg.isThinking && (
-                      <ClaudeLogo autoAnimate style={{ width: '30px', height: '30px' }} />
-                    )}
-                    <span className={`text-[14px] ${msg.isThinking ? 'animate-shimmer-text' : 'text-claude-textSecondary'}`}>
-                      {(() => {
-                        if (msg.thinking_summary) return msg.thinking_summary;
-                        const text = (msg.thinking || '').trim();
-                        const lines = text.split('\n').filter((l: string) => l.trim());
-                        const last = lines[lines.length - 1] || '';
-                        const summary = last.length > 40 ? last.slice(0, 40) + '...' : last;
-                        return summary || t('chat.thinking');
-                      })()}
-                    </span>
-                    <ChevronDown size={14} className={`transform transition-transform duration-200 ${msg.isThinkingExpanded ? 'rotate-180' : ''}`} />
-                  </div>
+              {/* ── 过程区状态计算（横线区：工作时长/折叠/总结/文件卡） ── */}
+              {(() => {
+                const isCurrentlyStreaming = loading && idx === messages.length - 1;
+                (msg as any)._isStreaming = isCurrentlyStreaming;
+                if (isCurrentlyStreaming && !(msg as any).workStartedAt) (msg as any).workStartedAt = Date.now();
+                const visibleToolCalls = (msg.toolCalls || []).filter((tc: any) => !['WebSearch', 'WebFetch'].includes(tc.name));
+                // 思考只在"正在思考"或已有已保存块时计入过程，
+                // 纯"思考→正文"（无工具）的消息在正文阶段要恢复正常流式渲染
+                const thinkingCount = (msg.thinkingBlocks?.length || 0) + ((msg.isThinking && (msg.thinking || '').trim()) ? 1 : 0);
+                (msg as any)._visibleToolCalls = visibleToolCalls;
+                (msg as any)._thinkingCount = thinkingCount;
+                const hasProcess = visibleToolCalls.length > 0 || thinkingCount > 0;
+                (msg as any)._hasProcess = hasProcess;
 
-                  {msg.isThinkingExpanded && (
-                    <div className="mt-2 ml-1 pl-4 border-l-2 border-claude-border">
-                      <div className="flex flex-col">
-                        <div className="relative">
-                          <div
-                            className="text-claude-textSecondary text-[14px] leading-normal whitespace-pre-wrap overflow-hidden"
-                            style={{ maxHeight: expandedMessages.has(idx) ? 'none' : '300px' }}
-                            ref={(el) => { if (el) messageContentRefs.current.set(idx, el); }}
-                          >
-                            {msg.thinking}
-                          </div>
-                          {!expandedMessages.has(idx) && (() => {
-                            const el = messageContentRefs.current.get(idx);
-                            return el && el.scrollHeight > 300;
-                          })() && (
-                              <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-claude-bg to-transparent pointer-events-none" />
-                            )}
-                        </div>
-                        {(() => {
-                          const el = messageContentRefs.current.get(idx);
-                          const isOverflow = el && el.scrollHeight > 300;
-                          if (!isOverflow) return null;
-                          return (
-                            <div className="pt-1">
-                              <button onClick={() => onToggleExpand(idx)} className="text-[13px] text-claude-text hover:text-claude-textSecondary transition-colors font-medium">
-                                {expandedMessages.has(idx) ? 'Show less' : 'Show more'}
-                              </button>
-                            </div>
-                          );
-                        })()}
-                      </div>
-                      {!msg.isThinking && (
-                        <div className="flex items-center gap-2 mt-2 text-claude-textSecondary">
-                          <Check size={16} />
-                          <span className="text-[14px]">Done</span>
-                        </div>
-                      )}
-                    </div>
+                // 最终总结：最后一个工具之后的文本（textBefore 快照推算；
+                // 历史会话由持久化的 tool_calls 重建卡片与总结分界）
+                const fullText = extractTextContent(msg.content);
+                let finalOffset: number | undefined = msg.toolTextEndOffset;
+                if ((!finalOffset || finalOffset <= 0) && (msg.toolCalls?.length || 0) > 0) {
+                  const lastTc = msg.toolCalls[msg.toolCalls.length - 1];
+                  const tbLen = (lastTc?.textBefore || '').length;
+                  if (tbLen > 0 && tbLen < fullText.length) finalOffset = tbLen;
+                }
+                const hasOffset = finalOffset && finalOffset > 0 && finalOffset < fullText.length;
+                // 仅"有过程内容 + 流式中"才隐藏正文；无过程的消息全程正常流式渲染
+                (msg as any)._finalText = (isCurrentlyStreaming && hasProcess)
+                  ? ''
+                  : (hasOffset ? fullText.slice(finalOffset).trim() : null);
+                (msg as any)._isCollapsed = hasProcess && !isCurrentlyStreaming
+                  ? ((msg as any).processCollapsed !== undefined ? (msg as any).processCollapsed : true)
+                  : false;
+                (msg as any)._changedFiles = computeChangedFiles(visibleToolCalls);
+                return null;
+              })()}
+
+              {/* 横线上方：左＝模型工作时长，右＝折叠开关（完成后出现） */}
+              {(msg as any)._hasProcess && (
+                <div className="flex items-center justify-between gap-2 pb-1.5">
+                  <WorkTimer
+                    running={(msg as any)._isStreaming}
+                    startedAt={(msg as any).workStartedAt}
+                    frozenMs={(msg as any).workDurationMs}
+                    onFrozen={(ms: number) => onSetMessages(prev => prev.map((m, i) => i === idx ? { ...m, workDurationMs: ms } : m))}
+                  />
+                  {!(msg as any)._isStreaming && (
+                    <button
+                      onClick={() => onSetMessages(prev => prev.map((m, i) => i === idx ? { ...m, processCollapsed: !(msg as any)._isCollapsed } : m))}
+                      className="flex items-center gap-1 text-[11.5px] text-claude-textSecondary hover:text-claude-text transition-colors select-none flex-shrink-0"
+                      title={(msg as any)._isCollapsed ? '展开全部工具调用与思考过程' : '折叠全部工具调用与思考过程'}
+                    >
+                      {(msg as any)._isCollapsed
+                        ? <><ListCollapse size={13} />展开过程 ({(msg as any)._visibleToolCalls.length + (msg as any)._thinkingCount} 项)</>
+                        : <><ChevronDown size={13} />折叠过程</>}
+                    </button>
                   )}
                 </div>
               )}
+
+              {/* 折叠体：思考卡 + 工具卡（工作中始终展开；完成后默认全部折叠） */}
+              {(msg as any)._hasProcess && !(msg as any)._isCollapsed && (
+              <div className="pl-2.5 border-l-2 border-black/[0.06] dark:border-white/[0.07]">
+              {/* Thinking blocks: previous (collapsed) + current (active) */}
+              {(() => {
+                const blocks = msg.thinkingBlocks || [];
+                const currentThinking = (msg.thinking || '').trim();
+                const hasBlocks = blocks.length > 0;
+                const hasCurrent = !!currentThinking;
+                if (!hasBlocks && !hasCurrent) return null;
+
+                // 思考时长展示：毫秒 → "持续了X秒"
+                const fmtSeconds = (ms?: number) => {
+                  if (!ms || ms <= 0) return '';
+                  return t('chat.lastedSeconds', { s: Math.max(1, Math.round(ms / 1000)) });
+                };
+
+                const renderBlock = (text: string, blockIdx: number, isActive: boolean) => {
+                  const key = `think-${idx}-${blockIdx}`;
+                  // 默认折叠：仅当用户显式展开时展示内容
+                  const expanded = isActive ? msg.isThinkingExpanded === true : !!msg[`thinkBlockExpanded_${blockIdx}`];
+                  const isLive = isActive && msg.isThinking;
+                  // 完成态时长：历史块自带 durationMs；当前块（最后一轮 thinking，不经工具周期保存）退回消息级记录
+                  const durationMs: number | undefined = isActive
+                    ? (isLive ? undefined : (msg as any).thinkingDurationMs)
+                    : ((msg.thinkingBlocks?.[blockIdx] as any)?.durationMs);
+                  return (
+                    <div key={key} className="mb-1.5 rounded-lg border border-black/[0.06] dark:border-white/[0.07] bg-white/60 dark:bg-white/[0.02] overflow-hidden">
+                      <div
+                        className="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer select-none hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition-colors"
+                        onClick={() => {
+                          if (isActive) {
+                            onSetMessages(prev => prev.map((m, i) =>
+                              i === idx ? { ...m, isThinkingExpanded: m.isThinkingExpanded === false ? true : !m.isThinkingExpanded } : m
+                            ));
+                          } else {
+                            onSetMessages(prev => prev.map((m, i) => {
+                              if (i !== idx) return m;
+                              const key = `thinkBlockExpanded_${blockIdx}`;
+                              return { ...m, [key]: !m[key] };
+                            }));
+                          }
+                        }}
+                      >
+                        <Brain size={13} className={`flex-shrink-0 ${isLive ? 'text-amber-500 animate-pulse' : 'text-claude-textSecondary/70'}`} />
+                        {isLive ? (
+                          <>
+                            <span className="text-[12.5px] font-medium animate-shimmer-text flex-shrink-0">{t('chat.thinkingLabel')}</span>
+                            <span className="flex-1 min-w-0" />
+                            <span className="text-[11px] text-claude-textSecondary/60 flex-shrink-0">{formatElapsed(elapsedTime)}</span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="text-[12.5px] font-medium text-claude-textSecondary flex-shrink-0">{t('chat.thinkingLabel')}</span>
+                            <span className="flex-1 min-w-0" />
+                            {durationMs ? (
+                              <span className="flex-shrink-0 text-[11.5px] text-claude-textSecondary/60">{fmtSeconds(durationMs)}</span>
+                            ) : null}
+                          </>
+                        )}
+                        <ChevronDown size={13} className={`flex-shrink-0 text-claude-textSecondary transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`} />
+                      </div>
+                      {expanded && (
+                        <div
+                          className="border-t border-black/[0.05] dark:border-white/[0.06] px-3 py-2.5 text-claude-textSecondary text-[12.5px] leading-normal whitespace-pre-wrap overflow-y-auto"
+                          style={{ maxHeight: '240px' }}
+                        >
+                          {text}
+                        </div>
+                      )}
+                    </div>
+                  );
+                };
+
+                return (
+                  <div className="mb-2">
+                    {blocks.map((b: any, bi: number) => renderBlock(b.text, bi, false))}
+                    {hasCurrent && renderBlock(currentThinking, blocks.length, true)}
+                  </div>
+                );
+              })()}
               {/* Research badge */}
               {msg.research && (
                 <button
@@ -803,180 +951,19 @@ const MessageList = React.memo<MessageListProps>(({
                   </div>
                 </button>
               )}
-              {/* Tool calls display */}
-              {msg.toolCalls && msg.toolCalls.length > 0 && (() => {
-                const FRONTEND_HIDDEN = new Set(['WebSearch', 'WebFetch']);
-                const visibleToolCalls = msg.toolCalls.filter((tc: any) => !FRONTEND_HIDDEN.has(tc.name));
-                if (visibleToolCalls.length === 0) return null;
-                const isCurrentMsg = idx === messages.length - 1;
-                const isStale = (!loading && isCurrentMsg) || (idx < messages.length - 1);
+              {/* 工具卡（ZCode 风格：编辑/读取/搜索/查阅/终端等独立折叠卡） */}
+              {(msg as any)._visibleToolCalls.length > 0 && (
+                <ToolCallList
+                  toolCalls={(msg as any)._visibleToolCalls}
+                  isStreaming={(msg as any)._isStreaming}
+                  hideSummary
+                />
+              )}
+              </div>
+              )}
 
-                // Split text: work text (during tools) vs final text (after last tool done)
-                const fullText = extractTextContent(msg.content);
-                const offset = msg.toolTextEndOffset;
-                const hasOffset = offset && offset > 0 && offset < fullText.length;
-                const workText = hasOffset ? fullText.slice(0, offset).trim() : '';
-                const finalText = hasOffset ? fullText.slice(offset).trim() : '';
-                const isCurrentlyStreaming = loading && idx === messages.length - 1;
-                // Tag message for MarkdownRenderer below:
-                // - Streaming with tools: show nothing in main area (all text in tool section)
-                // - Complete with offset: show only final text
-                // - Complete without offset: show full text (fallback)
-                // During streaming: compute pending text (text after last tool's textBefore)
-                let consumedLen = 0;
-                for (const tc of visibleToolCalls) {
-                  if (tc.textBefore) consumedLen += tc.textBefore.length;
-                }
-                // Text currently being typed that hasn't been associated with a tool yet
-                const pendingWorkText_ui = isCurrentlyStreaming ? fullText.slice(consumedLen).trim() : '';
-
-                (msg as any)._finalText = isCurrentlyStreaming
-                  ? ''  // During streaming, all text goes in tool section
-                  : (hasOffset ? finalText : null);
-
-                const toolNames = visibleToolCalls.map((tc: any) => {
-                  const nameMap: Record<string, string> = {
-                    'Read': 'Read file', 'Write': 'Write file', 'Edit': 'Edit file',
-                    'Bash': 'Run command', 'ListDir': 'List directory',
-                    'MultiEdit': 'Edit files', 'Search': 'Search',
-                  };
-                  return nameMap[tc.name] || tc.name;
-                });
-                const uniqueNames = [...new Set(toolNames)];
-                const allDone = visibleToolCalls.every((tc: any) => {
-                  const rs = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
-                  return rs !== 'running';
-                });
-                const hasError = visibleToolCalls.some((tc: any) => tc.status === 'error');
-                const summary = uniqueNames.join(', ');
-
-                return (
-                  <div className="mb-4">
-                    <div className={`rounded-lg overflow-hidden ${!allDone ? 'bg-black/[0.04] dark:bg-white/[0.04]' : ''}`}>
-                    <div
-                      className="flex items-center gap-2 cursor-pointer select-none group/tool text-claude-textSecondary hover:text-claude-text transition-colors px-2 py-1.5"
-                      onClick={() => {
-                        onSetMessages(prev =>
-                          prev.map((m, i) =>
-                            i === idx ? { ...m, isToolCallsExpanded: !m.isToolCallsExpanded } : m
-                          )
-                        );
-                      }}
-                    >
-                      {!allDone && (
-                        <FileText size={16} className="text-claude-textSecondary animate-pulse" />
-                      )}
-                      {allDone && !hasError && (
-                        <Check size={16} className="text-claude-textSecondary" />
-                      )}
-                      {allDone && hasError && (
-                        <span className="text-red-400 text-[14px]">✗</span>
-                      )}
-                      <span className={`text-[14px] ${!allDone ? 'animate-shimmer-text' : 'text-claude-textSecondary'}`}>
-                        {summary}
-                      </span>
-                      <ChevronDown size={14} className={`transform transition-transform duration-200 ${(msg.isToolCallsExpanded ?? (isCurrentlyStreaming || !allDone)) ? 'rotate-180' : ''}`} />
-                    </div>
-                    </div>
-
-                    {(msg.isToolCallsExpanded ?? (isCurrentlyStreaming || !allDone)) && (
-                      <div className="mt-2 ml-1 pl-4 border-l-2 border-claude-border space-y-2">
-                        {visibleToolCalls.map((tc: any, tcIdx: number) => {
-                          const inputStr = tc.input ? (typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input, null, 2)) : '';
-                          const rawPath = tc.input?.file_path || tc.input?.path || '';
-                          const shortPath = rawPath ? rawPath.split(/[/\\]/).pop() || rawPath : '';
-                          const actionLabel: Record<string, string> = {
-                            'Read': 'Read', 'Write': 'Write', 'Edit': 'Edit',
-                            'MultiEdit': 'Edit', 'Bash': '', 'Grep': 'Search',
-                            'Glob': 'Find', 'ListDir': 'List', 'Skill': 'Skill',
-                          };
-                          const prefix = actionLabel[tc.name] ?? tc.name;
-                          const fileOrCmd = shortPath || tc.input?.command || (inputStr.length > 80 ? inputStr.slice(0, 80) + '...' : inputStr);
-                          const inputPreview = (prefix && fileOrCmd) ? `${prefix} ${fileOrCmd}` : (fileOrCmd || prefix || tc.name);
-                          const realStatus = (tc.status === 'running' && isStale) ? 'canceled' : tc.status;
-                          const expandable = hasExpandableContent(tc.name, tc.input, tc.result);
-                          const stats = getToolStats(tc.name, tc.input);
-
-                          return (
-                            <div key={tc.id || tcIdx}>
-                              {/* Interleaved text: what the model said BEFORE this tool call */}
-                              {tc.textBefore && (
-                                <div className="text-[13px] text-claude-textSecondary px-1 py-1.5 leading-relaxed">
-                                  {tc.textBefore}
-                                </div>
-                              )}
-                              {/* Tool card */}
-                              <div className="text-[13px] bg-black/5 dark:bg-black/20 rounded-lg overflow-hidden border border-black/5 dark:border-white/5 mx-1 w-full">
-                                <div
-                                  className={`flex items-center justify-between px-3 py-2 transition-colors ${expandable ? 'cursor-pointer hover:bg-black/5 dark:hover:bg-white/5' : ''}`}
-                                  onClick={() => {
-                                    if (!expandable) return;
-                                    onSetMessages(prev =>
-                                      prev.map((m, i) => {
-                                        if (i !== idx) return m;
-                                        const newTc = [...m.toolCalls];
-                                        newTc[tcIdx] = { ...newTc[tcIdx], isExpanded: newTc[tcIdx].isExpanded === undefined ? true : !newTc[tcIdx].isExpanded };
-                                        return { ...m, toolCalls: newTc };
-                                      })
-                                    );
-                                  }}
-                                >
-                                  <div className="flex items-center gap-2 overflow-hidden">
-                                    {tc.name === 'Bash' ? (
-                                      <span className="text-claude-textSecondary font-mono font-bold">&gt;_</span>
-                                    ) : (
-                                      <FileText size={14} className="text-claude-textSecondary flex-shrink-0" />
-                                    )}
-                                    <span className="text-claude-text font-mono text-[12px] truncate">
-                                      {inputPreview || tc.name}
-                                    </span>
-                                  </div>
-                                  <div className="flex items-center gap-2 flex-shrink-0 ml-4">
-                                    {stats && realStatus !== 'running' && (
-                                      <span className="text-[11px] font-mono flex items-center gap-1.5">
-                                        {stats.added > 0 && <span className="text-green-500 dark:text-green-400">+{stats.added}</span>}
-                                        {stats.removed > 0 && <span className="text-red-500 dark:text-red-400">-{stats.removed}</span>}
-                                      </span>
-                                    )}
-                                    {realStatus === 'running' && <span className="text-claude-textSecondary text-[12px] animate-shimmer-text">Running...</span>}
-                                    {realStatus === 'error' && <span className="text-red-400/80 text-[12px]">Failed</span>}
-                                    {expandable && (
-                                      <ChevronDown size={14} className={`text-claude-textSecondary transform transition-transform duration-200 ${(tc.isExpanded ?? false) ? 'rotate-180' : ''}`} />
-                                    )}
-                                  </div>
-                                </div>
-                                {expandable && (tc.isExpanded ?? false) && (
-                                  <div className="px-2 py-2 border-t border-black/5 dark:border-white/5">
-                                    {shouldUseDiffView(tc.name, tc.input) ? (
-                                      <ToolDiffView toolName={tc.name} input={tc.input} result={tc.result} />
-                                    ) : tc.result != null ? (
-                                      <div className="px-1 text-claude-textSecondary text-[12px] font-mono max-h-[400px] overflow-y-auto whitespace-pre-wrap bg-black/5 dark:bg-black/40 rounded-md p-2">
-                                        {typeof tc.result === 'string' ? (tc.result.length > 2000 ? tc.result.slice(0, 2000) + '...' : tc.result || '(Empty output)') : JSON.stringify(tc.result).slice(0, 2000)}
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                        {/* Streaming: show latest text being generated */}
-                        {isCurrentlyStreaming && pendingWorkText_ui && (
-                          <div className="text-[13px] text-claude-textSecondary px-1 py-1.5 leading-relaxed animate-shimmer-text">
-                            {pendingWorkText_ui}
-                          </div>
-                        )}
-                        {allDone && !isCurrentlyStreaming && (
-                          <div className="flex items-center gap-2 text-claude-textSecondary pt-1 pb-1">
-                            <Check size={14} />
-                            <span className="text-[13px]">Done</span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
+              {/* 横线：工作过程与最终总结的分界 */}
+              {(msg as any)._hasProcess && <div className="border-t border-black/[0.08] dark:border-white/[0.08] my-2.5" />}
               {msg.searchStatus && (!msg.searchLogs || msg.searchLogs.length === 0) && (!msg.content || msg.content.length === (msg._contentLenBeforeSearch || 0)) && loading && idx === messages.length - 1 && (
                 <div className="flex items-center justify-center gap-2 text-[15px] font-medium mb-4 w-full">
                   <Globe size={18} className="text-claude-textSecondary" />
@@ -995,6 +982,10 @@ const MessageList = React.memo<MessageListProps>(({
               )}
 
               <MarkdownRenderer content={(msg as any)._finalText ?? extractTextContent(msg.content)} citations={msg.citations} />
+              {/* 文件修改汇总卡：显示本轮修改了哪些文件 +增 -删 */}
+              {!(msg as any)._isStreaming && (msg as any)._changedFiles?.length > 0 && (
+                <FileChangesSummary files={(msg as any)._changedFiles} />
+              )}
               {normalizeMessageDocuments(msg).length > 0 && (
                 <div className="mt-2 mb-1 space-y-2">
                   {normalizeMessageDocuments(msg).map((doc, docIdx) => (
@@ -1026,14 +1017,26 @@ const MessageList = React.memo<MessageListProps>(({
                 </div>
               )}
               {loading && idx === messages.length - 1 && !msg.content && !msg.thinking && !msg.searchStatus && normalizeDocumentDrafts(msg).length === 0 && !(msg.toolCalls && msg.toolCalls.length > 0) && (
-                <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
-                  <ClaudeLogo breathe style={{ width: '40px', height: '40px', display: 'inline-block' }} />
-                </span>
+                <div className="flex items-center gap-3 ml-1 mt-2">
+                  <ClaudeLogo breathe style={{ width: '40px', height: '40px' }} />
+                  <div className="flex items-center gap-2 text-[12px] text-claude-textSecondary/60">
+                    <span>{formatElapsed(elapsedTime)}</span>
+                    {tokenUsage && (
+                      <span>{formatTokens((tokenUsage.input_tokens || 0) + (tokenUsage.output_tokens || 0))} tokens</span>
+                    )}
+                  </div>
+                </div>
               )}
               {loading && idx === messages.length - 1 && !msg.isThinking && (msg.content || (msg.searchStatus && msg.content)) && (
-                <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
-                  <ClaudeLogo autoAnimate style={{ width: '40px', height: '40px', display: 'inline-block' }} />
-                </span>
+                <div className="flex items-center gap-2 ml-1">
+                  <ClaudeLogo autoAnimate style={{ width: '40px', height: '40px' }} />
+                  <div className="flex items-center gap-2 text-[12px] text-claude-textSecondary/60">
+                    <span>{formatElapsed(elapsedTime)}</span>
+                    {tokenUsage && (
+                      <span>{formatTokens((tokenUsage.input_tokens || 0) + (tokenUsage.output_tokens || 0))} tokens</span>
+                    )}
+                  </div>
+                </div>
               )}
               {!loading && idx === messages.length - 1 && msg.content && (
                 <div className="flex items-start gap-4 mt-6 ml-1 mb-2">
@@ -1076,7 +1079,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     crossModeWarning, setCrossModeWarning,
     providersCache, setProvidersCache,
     webSearchToast, setWebSearchToast,
+    autoCompactEnabled, autoCompactThreshold,
   } = useChatStore();
+  // 上下文自动压缩的最近触发时间（每会话冷却，防止重复触发）
+  const autoCompactAtRef = useRef<Record<string, number>>({});
+  // 滚动位置离开底部时显示"跳到最新输出"按钮
+  const [showJumpDown, setShowJumpDown] = useState(false);
   const {
     addStreaming, removeStreaming, isStreaming,
   } = useStreamingStore();
@@ -1091,6 +1099,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     showMcpPanel, setShowMcpPanel,
     showSlashPalette, setShowSlashPalette,
     slashPaletteInput, setSlashPaletteInput,
+    modelVersion, bumpModelVersion,
+    pendingTierSwitch, setPendingTierSwitch,
   } = useUIStore();
   const {
     user, setUser,
@@ -1106,43 +1116,77 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     contextInfo, setContextInfo,
     tokenUsage, setTokenUsage,
   } = useProjectStore();
-  // Apply model context window overrides from settings
-  const applyContextOverride = (info: { tokens: number; limit: number }) => {
+  // 解析当前模型的上下文窗口覆盖值：设置页按档位（opus/sonnet/haiku）保存，
+  // 也兼容直接按模型 id 保存；-thinking 变体共享基础模型的窗口
+  const resolveContextOverride = (): number | null => {
     try {
       const overrides = JSON.parse(localStorage.getItem('model_context_overrides') || '{}');
-      const modelKey = currentModelString || '';
-      let override = overrides[modelKey];
+      const modelKey = (currentModelString || '').replace(/-thinking$/, '');
+      if (!modelKey) return null;
+      let override = overrides[modelKey] ?? overrides[currentModelString] ?? null;
+      if (!override) {
+        try {
+          const models = JSON.parse(localStorage.getItem('chat_models') || '[]');
+          const cm = models.find((m: { id?: string; tier?: string }) => m?.id && (m.id === modelKey || modelKey.includes(m.id) || m.id.includes(modelKey)));
+          if (cm?.tier && overrides[cm.tier]) override = overrides[cm.tier];
+        } catch {}
+      }
       if (!override) {
         for (const [k, v] of Object.entries(overrides)) {
           if (modelKey.includes(k) || k.includes(modelKey)) { override = v; break; }
         }
       }
-      if (override && typeof override === "number" && override > 0) return { ...info, limit: override };
+      if (override && typeof override === 'number' && override > 0) return override;
     } catch {}
-    return info;
+    return null;
+  };
+  // Apply model context window overrides from settings
+  const applyContextOverride = (info: { tokens: number; limit: number }) => {
+    const override = resolveContextOverride();
+    return override ? { ...info, limit: override } : info;
   };
 
   // Re-apply context overrides when settings change
   useEffect(() => {
     const handler = () => {
-      try {
-        const overrides = JSON.parse(localStorage.getItem('model_context_overrides') || '{}');
-        const modelKey = currentModelString || '';
-        let override = overrides[modelKey];
-        if (!override) {
-          for (const [k, v] of Object.entries(overrides)) {
-            if (modelKey.includes(k) || k.includes(modelKey)) { override = v; break; }
-          }
-        }
-        if (override && typeof override === "number" && override > 0) {
-          const base = contextInfo || { tokens: 0, limit: 200000 };
-          setContextInfo({ ...base, limit: override });
-        }
-      } catch {}
+      const override = resolveContextOverride();
+      if (override) {
+        const base = contextInfo || { tokens: 0, limit: 200000 };
+        setContextInfo({ ...base, limit: override });
+      }
     };
     window.addEventListener('context-overrides-changed', handler);
     return () => window.removeEventListener('context-overrides-changed', handler);
   }, [contextInfo?.tokens, contextInfo?.limit]);
+
+  // 上下文自动压缩：使用率超过阈值时自动触发（与手动“压缩对话”走同一端点）。
+  // 只在非流式状态下检查；每次触发后 90 秒冷却，压缩完成后 usage 下降不会循环。
+  useEffect(() => {
+    if (!autoCompactEnabled || !activeId || loading) return;
+    if (compactStatus.state === 'compacting') return;
+    const tokens = contextInfo?.tokens ?? 0;
+    const limit = contextInfo?.limit ?? 200000;
+    if (limit <= 0 || tokens <= 0) return;
+    const pct = (tokens / limit) * 100;
+    if (pct < autoCompactThreshold) return;
+
+    const now = Date.now();
+    if (now - (autoCompactAtRef.current[activeId] || 0) < 90_000) return;
+    autoCompactAtRef.current[activeId] = now;
+
+    console.log(`[AutoCompact] usage ${pct.toFixed(1)}% >= threshold ${autoCompactThreshold}%, compacting...`);
+    setCompactStatus({ state: 'compacting' });
+    compactConversation(activeId).then(async () => {
+      await loadConversation(activeId);
+      try { const ctx = await getContextSize(activeId); setContextInfo(applyContextOverride(ctx)); } catch (_) {}
+      setCompactStatus({ state: 'done', message: `上下文使用率 ${pct.toFixed(0)}% 超过阈值 ${autoCompactThreshold}%，已自动压缩` });
+      setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
+    }).catch((err) => {
+      console.error('[AutoCompact] failed:', err);
+      setCompactStatus({ state: 'error', message: '自动压缩失败' });
+      setTimeout(() => setCompactStatus({ state: 'idle' }), 3000);
+    });
+  }, [contextInfo?.tokens, contextInfo?.limit, autoCompactEnabled, autoCompactThreshold, activeId, loading, compactStatus.state]);
   const {
     activeTasks, setActiveTasks,
     toolPermissionDialog, setToolPermissionDialog,
@@ -1167,6 +1211,15 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       }
     }
   }, []);
+
+  useEffect(() => {
+    if (modelVersion > 0) {
+      const defaultModel = localStorage.getItem('default_model') || '';
+      if (defaultModel) {
+        setCurrentModelString(defaultModel);
+      }
+    }
+  }, [modelVersion]);
 
   // Initialize providersCache
   useEffect(() => {
@@ -1218,7 +1271,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         description: m.tier && tierDescMap[m.tier] ? tierDescMap[m.tier] : undefined,
       }));
     } catch { return []; }
-  }, [isSelfHostedMode]);
+  }, [isSelfHostedMode, modelVersion]);
 
   const fallbackCommonModels = useMemo<SelectableModel[]>(() => {
     // Self-hosted: use user-configured models as fallback, not hardcoded Claude models
@@ -1236,19 +1289,40 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   const displayCommonModels = modelCatalog?.common?.length ? modelCatalog.common : fallbackCommonModels;
   const selectorModels = useMemo<SelectableModel[]>(() => {
-    const visible = [...displayCommonModels];
-    // Only add extra models (e.g. GPT) for self-hosted mode
+    let result: SelectableModel[];
     if (isSelfHostedMode) {
-      const seen = new Set(visible.map(m => m.id));
-      const extraModels = (modelCatalog?.all || []).filter(m => !seen.has(m.id));
+      // Self-hosted: re-read from localStorage on every modelVersion change
+      let chatModels: any[] = [];
+      try { chatModels = JSON.parse(localStorage.getItem('chat_models') || '[]'); } catch {}
+      const tierDescMap: Record<string, string> = {
+        'opus': 'Most capable for ambitious work',
+        'sonnet': 'Most efficient for everyday tasks',
+        'haiku': 'Fastest for quick answers',
+      };
+      const all = chatModels.map((m: any) => ({
+        id: m.id,
+        name: m.name || m.id,
+        enabled: 1,
+        tier: m.tier || 'extra',
+        description: m.tier && tierDescMap[m.tier] ? tierDescMap[m.tier] : undefined,
+      }));
+      const tierOrder = ['opus', 'sonnet', 'haiku'];
+      const tiered = tierOrder.map(t => all.find((m: any) => m.tier === t)).filter(Boolean) as SelectableModel[];
+      const seen = new Set(tiered.map(m => m.id));
+      const extras = all.filter((m: any) => !seen.has(m.id));
+      result = [...tiered, ...extras];
+    } else {
+      const visible = [...displayCommonModels];
+      const extraModels = (modelCatalog?.all || []).filter(m => !visible.some(v => v.id === m.id));
       for (const model of extraModels) {
-        // Tag non-tier models as 'extra' so ModelSelector can split them into "More models"
         visible.push({ ...model, tier: model.tier || 'extra' });
-        seen.add(model.id);
       }
+      result = visible;
     }
-    return visible;
-  }, [displayCommonModels, modelCatalog, isSelfHostedMode]);
+    console.log(`[selectorModels] modelVersion=${modelVersion}, isSelfHosted=${isSelfHostedMode}, result=${result.length} models: [${result.map(m=>m.id).join(',')}]`);
+    return result;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSelfHostedMode, modelVersion, displayCommonModels, modelCatalog]);
 
   // Initial model: for self-hosted, prefer first configured model over hardcoded claude-sonnet-4-6
   // Cross-mode warning: when an existing conversation's model isn't available in the
@@ -1294,6 +1368,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const activeRequestCountRef = useRef(0);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastResetKeyRef = useRef(0);
+  const streamStartTimeRef = useRef<number | null>(null);
+  const [elapsedTime, setElapsedTime] = useState<number>(0);
   const streamConversationIdRef = useRef<string | null>(null);
   const streamRequestIdRef = useRef(0);
 
@@ -1377,6 +1453,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const toggleResearchMode = useCallback(async () => {
     const next = !researchMode;
     setResearchMode(next);
+    try { localStorage.setItem("research_mode", String(next)); } catch (_) {}
     if (activeId) {
       try { await updateConversation(activeId, { research_mode: next }); } catch (_) {}
     }
@@ -1400,6 +1477,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const t = setTimeout(() => setWebSearchToast(null), 2800);
     return () => clearTimeout(t);
   }, [webSearchToast]);
+
+  // pendingTierSwitch is consumed in loadConversation — no separate useEffect needed
+  // (loadConversation reads it from the store directly after setting the model)
+
   const plusMenuRef = useRef<HTMLDivElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
   // Add-to-project state
@@ -1725,10 +1806,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         setModelCatalog(data);
         if (!viewingIdRef.current) {
           setCurrentModelString(prev => {
-            const current = prev || localStorage.getItem('default_model') || 'claude-sonnet-4-6';
+            const defaultModel = localStorage.getItem('default_model') || '';
+            const defaultBase = stripThinking(defaultModel);
+            const all: SelectableModel[] = data?.all?.length ? data.all : fallbackCommonModels;
+            const defaultPreferred = defaultBase ? all.find((m: SelectableModel) => m.id === defaultBase && Number(m.enabled) === 1) : null;
+            if (defaultPreferred) return withThinking(defaultBase, isThinkingModel(defaultModel));
+            const current = prev || 'claude-sonnet-4-6';
             const thinking = isThinkingModel(current);
             const base = stripThinking(current);
-            const all: SelectableModel[] = data?.all?.length ? data.all : fallbackCommonModels;
             const preferred = all.find((m: SelectableModel) => m.id === base && Number(m.enabled) === 1);
             if (preferred) return withThinking(base, thinking);
             const fallbackBase = data?.fallback_model
@@ -1750,7 +1835,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       clearInterval(timer);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fallbackCommonModels]);
+  }, [fallbackCommonModels, modelVersion]);
 
   // 草稿持久化：切换对话 / 打开设置页面时保存，切回时恢复
   const draftKey = activeId || '__new__';
@@ -1801,6 +1886,23 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }).catch(() => setHasSubscription(false));
   }, [activeId]);
 
+  // Elapsed time timer during streaming
+  useEffect(() => {
+    if (!loading) {
+      streamStartTimeRef.current = null;
+      return;
+    }
+    if (!streamStartTimeRef.current) {
+      streamStartTimeRef.current = Date.now();
+    }
+    const timer = setInterval(() => {
+      if (streamStartTimeRef.current) {
+        setElapsedTime(Math.floor((Date.now() - streamStartTimeRef.current) / 1000));
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [loading]);
+
   useEffect(() => {
     // Reset state when switching conversations — each conversation has independent streaming
     setPlanMode(false);
@@ -1809,12 +1911,22 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     isCreatingRef.current = false;
     viewingIdRef.current = activeId || null;
 
+    // Clear stale buffers for OTHER conversations to prevent cross-contamination
+    if (activeId) {
+      for (const [bufId] of messagesBufferRef.current) {
+        if (bufId !== activeId) {
+          messagesBufferRef.current.delete(bufId);
+        }
+      }
+    }
+
     // Pre-warm engine when user opens a conversation (init in background before they send)
     if (activeId) warmEngine(activeId);
 
     if (activeId) {
       // Check if there's a live buffer for this conversation (e.g. streaming in background)
       const buffered = messagesBufferRef.current.get(activeId);
+      console.log(`[MainContent] Buffer check for ${activeId}: hasBuffer=${!!buffered}, bufferLen=${buffered?.length || 0}, isStreaming=${isStreaming(activeId)}`);
       if (buffered && buffered.length > 0) {
         setMessages(buffered);
         setLoading(isStreaming(activeId));
@@ -1822,12 +1934,26 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         const buffConvId = activeId;
         getConversation(buffConvId).then(data => {
           if (data?.model && viewingIdRef.current === buffConvId) {
-            setCurrentModelString(isModelSelectable(data.model) ? data.model : resolveModelForNewChat(data.model));
+            setCurrentModelString(data.model);
           }
         }).catch(() => {});
       } else {
-        setLoading(false);
-        loadConversation(activeId);
+        console.log(`[MainContent] Loading conversation: activeId=${activeId}, viewingIdRef=${viewingIdRef.current}`);
+        setLoading(true);  // Show loading while fetching conversation
+        loadConversation(activeId).then(() => {
+          console.log(`[MainContent] Conversation loaded successfully: ${activeId}`);
+        }).catch((err) => {
+          console.error('[MainContent] Failed to load conversation:', activeId, err);
+          // On error, show empty state but don't leave loading forever
+          if (viewingIdRef.current === activeId) {
+            setMessages([]);
+            setLoading(false);
+          }
+        }).finally(() => {
+          if (viewingIdRef.current === activeId) {
+            setLoading(false);
+          }
+        });
         // Check if server has an active stream we can reconnect to
         const convId = activeId;
         getStreamStatus(convId).then(status => {
@@ -1855,7 +1981,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];
-                  if (lastMsg && lastMsg.role === 'assistant') { lastMsg.content = full; lastMsg.isThinking = false; }
+                  if (lastMsg && lastMsg.role === 'assistant') { if (lastMsg.isThinking && (lastMsg as any).thinkingStartedAt) (lastMsg as any).thinkingDurationMs = Date.now() - (lastMsg as any).thinkingStartedAt; lastMsg.content = full; lastMsg.isThinking = false; }
                   return newMsgs;
                 });
               },
@@ -1881,7 +2007,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];
-                  if (lastMsg && lastMsg.role === 'assistant') { lastMsg.thinking = thinkingFull; lastMsg.isThinking = true; }
+                  if (lastMsg && lastMsg.role === 'assistant') { if (!lastMsg.thinking) lastMsg.thinkingStartedAt = Date.now(); lastMsg.thinking = thinkingFull; lastMsg.isThinking = true; }
                   return newMsgs;
                 });
               },
@@ -2061,6 +2187,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     if (scrollContainerRef.current) {
       const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
       const isBottom = Math.abs(scrollHeight - clientHeight - scrollTop) < 50;
+      setShowJumpDown(!isBottom);
       if (isBottom && userScrolledUpRef.current) {
         // 用户自己滚回了底部，重新启用自动滚动
         userScrolledUpRef.current = false;
@@ -2110,8 +2237,10 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
   const loadConversation = async (conversationId: string) => {
     stopPolling();
+    console.log(`[loadConversation] Called with conversationId=${conversationId}`);
     try {
       const data = await getConversation(conversationId);
+      console.log(`[loadConversation] Got data: id=${data?.id}, title=${data?.title}, msgs=${data?.messages?.length}`);
       // Restore conversation model. If the stored model isn't available in the
       // current user_mode (typical case: user switched modes after the conv was
       // created), DON'T silently fall back — keep showing the original model and
@@ -2119,32 +2248,30 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       // gets to explicitly choose between (a) keep using the cross-mode model or
       // (b) switch to a model from the current mode.
       if (data.model) {
-        const currentMode = (localStorage.getItem('user_mode') === 'selfhosted' ? 'selfhosted' : 'clawparrot') as 'clawparrot' | 'selfhosted';
-        const otherMode = currentMode === 'selfhosted' ? 'clawparrot' : 'selfhosted';
-        const existingOverride = getCrossModeOverride(conversationId);
-        if (isModelSelectable(data.model)) {
-          // Available in current mode → just use it.
-          setCurrentModelString(data.model);
-          setCrossModeWarning(null);
-        } else if (existingOverride === otherMode) {
-          // User already opted into cross-mode for this conv earlier; keep silent.
-          setCurrentModelString(data.model);
-          setCrossModeWarning(null);
-        } else {
-          // Cross-mode mismatch with no prior choice — arm the warning. We keep
-          // currentModelString = original model (NOT fallback) so the model
-          // selector reflects what the conversation actually uses.
-          setCurrentModelString(data.model);
-          setCrossModeWarning({
-            convId: conversationId,
-            originalModel: data.model,
-            otherMode,
-            fallbackModel: resolveModelForNewChat(data.model),
-          });
+        // Read pendingTierSwitch DIRECTLY from store (not from closure — may be stale)
+        const tierSwitch = useUIStore.getState().pendingTierSwitch;
+        let finalModel = data.model;
+
+        if (tierSwitch) {
+          const chatModels: any[] = JSON.parse(localStorage.getItem('chat_models') || '[]');
+          const base = stripThinking(data.model);
+          const entry = chatModels.find((m: any) => m.id === base);
+          const tier = entry?.tier;
+          if (tier && tier !== 'extra' && tierSwitch[tier] && tierSwitch[tier] !== base) {
+            finalModel = tierSwitch[tier];
+            console.log(`[loadConversation] Tier "${tier}" switched: ${base} → ${finalModel}`);
+            updateConversation(conversationId, { model: finalModel }).catch(() => {});
+          }
+          // Clear after consuming
+          useUIStore.getState().setPendingTierSwitch(null);
         }
+
+        setCurrentModelString(finalModel);
+        setCrossModeWarning(null);
       }
       // Restore research mode toggle
       setResearchMode(!!data.research_mode);
+      try { localStorage.setItem("research_mode", String(!!data.research_mode)); } catch (_) {}
       const normalizedMessages = (data.messages || []).map((msg: any) => {
         // Normalize attachment field names (bridge-server uses camelCase, component expects snake_case)
         if (msg.attachments && Array.isArray(msg.attachments)) {
@@ -2157,6 +2284,17 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             ...att,
           }));
         }
+        // 持久化的工具调用记录 → 运行时卡片（重载会话后仍显示工作过程）
+        if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 && !msg.toolCalls) {
+          msg.toolCalls = msg.tool_calls.map((tc: any, i: number) => ({
+            id: tc.id || `persisted_${i}`,
+            name: tc.name || 'unknown',
+            input: tc.input || {},
+            status: tc.is_error ? 'error' : 'done',
+            result: typeof tc.output === 'string' ? tc.output : JSON.stringify(tc.output ?? ''),
+            textBefore: '',
+          }));
+        }
         return sanitizeInlineArtifactMessage(msg);
       });
       setMessages(normalizedMessages);
@@ -2164,6 +2302,26 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       scheduleScrollToBottomAfterRender();
       setConversationTitle(data.title || 'New Chat');
       setCurrentProjectId(data.project_id || null);
+
+      // Fallback: if 0 messages from Tauri IPC, try direct HTTP
+      if (normalizedMessages.length === 0) {
+        console.warn(`[loadConversation] 0 messages via Tauri IPC, trying HTTP fallback...`);
+        try {
+          const resp = await fetch(`http://127.0.0.1:30080/api/conversations/${conversationId}/messages`);
+          if (resp.ok) {
+            const httpData = await resp.json();
+            const httpMsgs = (httpData.messages || []).map((msg: any) => sanitizeInlineArtifactMessage(msg));
+            if (httpMsgs.length > 0) {
+              console.log(`[loadConversation] HTTP fallback: loaded ${httpMsgs.length} messages`);
+              setMessages(httpMsgs);
+            } else {
+              console.warn('[loadConversation] HTTP fallback also returned 0 messages');
+            }
+          }
+        } catch (e) {
+          console.warn('[loadConversation] HTTP fallback failed:', e);
+        }
+      }
 
       // 检查是否有活跃的后台生成
       try {
@@ -2325,6 +2483,39 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       await handleAttachToProject(project);
     } catch (err) {
       console.error('Failed to create project', err);
+    }
+  };
+
+  // ---- Skill 执行（/skill-name 命令）----
+  const [skillResult, setSkillResult] = useState<SkillExecuteResult | null>(null);
+  const [skillResultName, setSkillResultName] = useState('');
+  const enabledSkillsRef = useRef<{ id: string; name: string }[]>([]);
+  const lastSkillRunRef = useRef<{ name: string; input: string } | null>(null);
+
+  // 挂载时加载技能列表，供 handleSlashCommand 同步判断命令是否为技能
+  useEffect(() => {
+    getSkills().then((data: any) => {
+      const list = (data?.skills || []) as any[];
+      enabledSkillsRef.current = list
+        .filter(s => s.enabled)
+        .map(s => ({ id: s.id, name: s.name }));
+    }).catch(() => {});
+  }, []);
+
+  const runSkill = async (slug: string, input: string) => {
+    lastSkillRunRef.current = { name: slug, input };
+    setMessages(prev => [...prev, {
+      id: `sys-${Date.now()}`, role: 'assistant', type: 'system',
+      content: `Executing skill **/${slug}**${input ? ` — ${input}` : ''}...`,
+      created_at: new Date().toISOString(),
+    }]);
+    try {
+      const result = await executeSkill(slug, input);
+      setSkillResultName(slug);
+      setSkillResult(result);
+    } catch (e: any) {
+      setSkillResultName(slug);
+      setSkillResult({ success: false, error: e?.message || 'Skill execution failed' });
     }
   };
 
@@ -2618,8 +2809,16 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         setInputText('');
         return true;
 
-      default:
-        return false;
+      default: {
+        const slug = cmd.slice(1);
+        const skill = enabledSkillsRef.current.find(
+          s => s.id.toLowerCase() === slug || s.name.toLowerCase() === slug
+        );
+        if (!skill) return false;
+        setInputText('');
+        void runSkill(slug, args);
+        return true;
+      }
     }
   };
 
@@ -2817,10 +3016,19 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
-          const lastMsg = newMsgs[newMsgs.length - 1];
+          const lastIdx = newMsgs.length - 1;
+          const lastMsg = newMsgs[lastIdx];
           if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.content = full;
-            lastMsg.isThinking = false; // Switch to text mode
+            // 始终创建新对象引用：onDelta 与 onToolUse 同 tick 触发的
+            // 多次 setMessages 调用 React 会批处理，浅比较看到同一引用
+            // 就会跳过重渲 → 第二轮的 delta 看似"丢"。这里用 spread 强制新引用。
+            const updated = { ...lastMsg };
+            if (lastMsg.isThinking && (lastMsg as any).thinkingStartedAt) {
+              (updated as any).thinkingDurationMs = Date.now() - (lastMsg as any).thinkingStartedAt;
+            }
+            updated.content = full;
+            updated.isThinking = false;
+            newMsgs[lastIdx] = updated;
           }
           return newMsgs;
         });
@@ -2839,10 +3047,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         if (conversationId) getContextSize(conversationId).then(info => setContextInfo(applyContextOverride(info))).catch(() => {});
         setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
-          const lastMsg = newMsgs[newMsgs.length - 1];
+          const lastIdx = newMsgs.length - 1;
+          const lastMsg = newMsgs[lastIdx];
           if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.content = full;
-            lastMsg.isThinking = false;
+            const updated = { ...lastMsg, content: full, isThinking: false };
+            newMsgs[lastIdx] = updated;
           }
           return newMsgs;
         });
@@ -2884,26 +3093,31 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         clearStreamSession(conversationId!, streamRequestId);
         setMessagesFor(conversationId!, prev => {
           const newMsgs = [...prev];
-          if (newMsgs[newMsgs.length - 1] && newMsgs[newMsgs.length - 1].role === 'assistant') {
-            newMsgs[newMsgs.length - 1].content = formatChatError(err);
-            newMsgs[newMsgs.length - 1].isThinking = false;
-          }
-          return newMsgs;
-        });
-      },
-      (thinkingDelta, thinkingFull) => {
-        if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
-        setMessagesFor(conversationId!, prev => {
-          const newMsgs = [...prev];
-          const lastMsg = newMsgs[newMsgs.length - 1];
+          const lastIdx = newMsgs.length - 1;
+          const lastMsg = newMsgs[lastIdx];
           if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.thinking = thinkingFull;
-            lastMsg.isThinking = true;
-            delete lastMsg.searchStatus;
+            newMsgs[lastIdx] = { ...lastMsg, content: formatChatError(err), isThinking: false };
           }
           return newMsgs;
         });
       },
+              (thinkingDelta, thinkingFull) => {
+                if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
+                setMessagesFor(conversationId!, prev => {
+                  const newMsgs = [...prev];
+                  const lastIdx = newMsgs.length - 1;
+                  const lastMsg = newMsgs[lastIdx];
+                  if (lastMsg && lastMsg.role === 'assistant') {
+                    const updated: any = { ...lastMsg };
+                    if (!updated.thinking) updated.thinkingStartedAt = Date.now();
+                    updated.thinking = thinkingFull;
+                    updated.isThinking = true;
+                    delete updated.searchStatus;
+                    newMsgs[lastIdx] = updated;
+                  }
+                  return newMsgs;
+                });
+              },
       (event, message, data) => {
         if (!isStreamSessionActive(conversationId!, streamRequestId)) return;
         // Handle metadata (update user message ID)
@@ -3181,6 +3395,22 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           const toolCalls = lastMsg.toolCalls || [];
 
           if (toolEvent.type === 'start') {
+            // Save current thinking as a completed block before starting new tool cycle
+            const currentThinking = lastMsg.thinking;
+            if (currentThinking && currentThinking.trim()) {
+              if (!lastMsg.thinkingBlocks) lastMsg.thinkingBlocks = [];
+              // Don't duplicate if this thinking is already saved
+              const last = lastMsg.thinkingBlocks[lastMsg.thinkingBlocks.length - 1];
+              if (!last || last.text !== currentThinking) {
+                lastMsg.thinkingBlocks.push({
+                  text: currentThinking,
+                  done: true,
+                  durationMs: (lastMsg as any).thinkingStartedAt ? Date.now() - (lastMsg as any).thinkingStartedAt : undefined,
+                });
+              }
+              lastMsg.thinking = ''; // Reset for next thinking cycle
+            }
+
             // Dedupe by id (we may receive a placeholder tool_use_start before
             // the input has finished streaming, then a tool_use_input later)
             let existing = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
@@ -3974,6 +4204,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           {webSearchToast}
         </div>
       )}
+
     </>
   );
 
@@ -4119,7 +4350,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         className="w-full flex items-center gap-3 px-4 py-2.5 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
                       >
                         <Github size={16} className="text-claude-textSecondary" />
-                        Add from GitHub
+                        {t('chat.addFromGithub')}
                       </button>
                       {/* Add to project submenu */}
                       <div className="relative" onMouseLeave={() => setShowProjectsSubmenu(false)}>
@@ -4180,7 +4411,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         >
                           <div className="flex items-center gap-3">
                             <FileText size={16} className="text-claude-textSecondary" />
-                            Skills
+                            {t('chat.skills')}
                           </div>
                           <ChevronDown size={14} className="text-claude-textSecondary -rotate-90" />
                         </button>
@@ -4201,7 +4432,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                                 {skill.name}
                               </button>
                             )) : (
-                              <div className="px-4 py-2 text-[12px] text-claude-textSecondary italic">No skills enabled</div>
+                              <div className="px-4 py-2 text-[12px] text-claude-textSecondary italic">{t('chat.noSkillsEnabled')}</div>
                             )}
                             <div className="border-t border-claude-border mt-1 pt-1">
                               <button
@@ -4209,7 +4440,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                                 className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-textSecondary hover:bg-claude-hover transition-colors"
                               >
                                 <FileText size={14} />
-                                Manage skills
+                                {t('chat.manageSkills')}
                               </button>
                             </div>
                           </div>
@@ -4224,7 +4455,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         >
                           <div className="flex items-center gap-3">
                             <IconResearch size={16} className={researchMode ? 'text-[#2E7CF6]' : 'text-claude-textSecondary'} />
-                            <span className={researchMode ? 'text-[#2E7CF6] font-medium' : 'text-claude-text'}>Research</span>
+                            <span className={researchMode ? 'text-[#2E7CF6] font-medium' : 'text-claude-text'}>{t('chat.research')}</span>
                           </div>
                           {researchMode && <Check size={14} className="text-[#2E7CF6]" />}
                         </button>
@@ -4369,6 +4600,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
               editingContent={editingContent}
               copiedMessageIdx={copiedMessageIdx}
               compactStatus={compactStatus}
+              elapsedTime={elapsedTime}
+              tokenUsage={tokenUsage}
               onSetEditingContent={setEditingContent}
               onEditCancel={handleEditCancel}
               onEditSave={handleEditSave}
@@ -4394,6 +4627,21 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
 
         {/* 输入框 - 浮动在内容上方，底部距离可调 */}
         <div className="absolute left-0 right-0 z-20 pointer-events-none" style={{ bottom: `${inputBarBottom + 28}px`, paddingLeft: '16px', paddingRight: `${16 + scrollbarWidth}px` }}>
+          {/* 跳到最新输出：离开底部时显示，居中悬浮在输入框上方 */}
+          {showJumpDown && (
+            <button
+              onClick={() => {
+                userScrolledUpRef.current = false;
+                isAtBottomRef.current = true;
+                setShowJumpDown(false);
+                scrollToBottom('smooth');
+              }}
+              className="pointer-events-auto absolute left-1/2 -translate-x-1/2 -top-11 w-8 h-8 rounded-full bg-claude-input border border-claude-border shadow-md flex items-center justify-center text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover transition-all"
+              title="跳到最新输出"
+            >
+              <ArrowDown size={16} />
+            </button>
+          )}
           <div
             className="mx-auto pointer-events-auto"
             style={{ maxWidth: `${inputBarWidth}px` }}
@@ -4490,7 +4738,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                           className="w-full flex items-center gap-3 px-4 py-2.5 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
                         >
                           <Github size={16} className="text-claude-textSecondary" />
-                          Add from GitHub
+                          从 GitHub 添加
                         </button>
                         {/* Add to project submenu */}
                         <div className="relative" onMouseLeave={() => setShowProjectsSubmenu(false)}>
@@ -4552,7 +4800,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                           >
                             <div className="flex items-center gap-3">
                               <FileText size={16} className="text-claude-textSecondary" />
-                              Skills
+                              技能
                             </div>
                             <ChevronDown size={14} className="text-claude-textSecondary -rotate-90" />
                           </button>
@@ -4584,14 +4832,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                                   className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-textSecondary hover:bg-claude-hover transition-colors"
                                 >
                                   <FileText size={14} />
-                                  Manage skills
+                                  管理技能
                                 </button>
                               </div>
                             </div>
                           )}
                           {showSkillsSubmenu && enabledSkills.length === 0 && (
                             <div className="absolute left-full bottom-0 w-[220px] bg-claude-input border border-claude-border rounded-xl shadow-[0_4px_16px_rgba(0,0,0,0.12)] py-1.5 z-50">
-                              <div className="px-4 py-2 text-[12px] text-claude-textSecondary italic">No skills enabled</div>
+                              <div className="px-4 py-2 text-[12px] text-claude-textSecondary italic">暂无已启用技能</div>
                               <div className="border-t border-claude-border mt-1 pt-1">
                                 <button
                                   onClick={() => {
@@ -4601,7 +4849,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                                   className="w-full flex items-center gap-3 px-4 py-2 text-[13px] text-claude-textSecondary hover:bg-claude-hover transition-colors"
                                 >
                                   <FileText size={14} />
-                                  Manage skills
+                                  管理技能
                                 </button>
                               </div>
                             </div>
@@ -4610,15 +4858,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                         <button
                           onMouseEnter={() => { setShowSkillsSubmenu(false); setShowProjectsSubmenu(false); }}
                           onClick={() => {
-                            setShowPlusMenu(false);
                             if (!activeId || compactStatus.state === 'compacting') return;
-                            setCompactInstruction('');
-                            setShowCompactDialog(true);
+                            setCompactStatus({ state: 'compacting' });
+                            setShowPlusMenu(false);
+                            compactConversation(activeId).then(async (result) => {
+                              await loadConversation(activeId);
+                              try { const ctx = await getContextSize(activeId); setContextInfo(ctx); } catch(_){}
+                              setCompactStatus({ state: 'done', message: `Compacted ${result.messagesCompacted} messages, saved ~${result.tokensSaved} tokens` });
+                              setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
+                            }).catch(err => {
+                              console.error('Compact failed:', err);
+                              setCompactStatus({ state: 'error', message: 'Compaction failed' });
+                              setTimeout(() => setCompactStatus({ state: 'idle' }), 3000);
+                            });
                           }}
                           className="w-full flex items-center gap-3 px-4 py-2.5 text-[13px] text-claude-text hover:bg-claude-hover transition-colors"
                         >
                           <ListCollapse size={16} className="text-claude-textSecondary" />
-                          Compact conversation
+                          压缩对话
                         </button>
                         {/* Research toggle */}
                         <div className="border-t border-claude-border mt-1 pt-1">
@@ -4629,7 +4886,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                           >
                             <div className="flex items-center gap-3">
                               <IconResearch size={16} className={researchMode ? 'text-[#2E7CF6]' : 'text-claude-textSecondary'} />
-                              <span className={researchMode ? 'text-[#2E7CF6] font-medium' : 'text-claude-text'}>Research</span>
+                              <span className={researchMode ? 'text-[#2E7CF6] font-medium' : 'text-claude-text'}>深度研究</span>
                             </div>
                             {researchMode && <Check size={14} className="text-[#2E7CF6]" />}
                           </button>
@@ -4996,7 +5253,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
               <button
                 onClick={() => {
                   // Keep cross-mode: persist override, dismiss, then proceed with the pending send
-                  setCrossModeOverride(crossModeWarning.convId, crossModeWarning.otherMode);
+                  setCrossModeOverride(crossModeWarning.convId, crossModeWarning.otherMode as 'clawparrot' | 'selfhosted');
                   const fire = pendingCrossModeSendRef.current;
                   pendingCrossModeSendRef.current = null;
                   setCrossModeWarning(null);
@@ -5044,67 +5301,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         </div>
       )}
 
-      {/* Compact conversation dialog */}
-      {showCompactDialog && (
-        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/40" onClick={() => setShowCompactDialog(false)}>
-          <div className="bg-claude-bg border border-claude-border rounded-2xl shadow-xl w-[440px] overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="px-5 pt-5 pb-3">
-              <h3 className="text-[15px] font-semibold text-claude-text mb-1">Compact conversation</h3>
-              <p className="text-[13px] text-claude-textSecondary leading-snug">
-                Summarize the conversation history to free up context space. The engine will preserve key decisions and context.
-              </p>
-            </div>
-            <div className="px-5 pb-3">
-              <textarea
-                className="w-full bg-claude-input border border-claude-border rounded-lg px-3 py-2 text-[13px] text-claude-text placeholder:text-claude-textSecondary/50 outline-none focus:border-claude-textSecondary/40 transition-colors resize-none"
-                rows={3}
-                placeholder="Optional: add instructions for the summary (e.g. 'preserve all API endpoint details')"
-                value={compactInstruction}
-                onChange={e => setCompactInstruction(e.target.value)}
-                onKeyDown={e => {
-                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                    e.preventDefault();
-                    document.getElementById('compact-confirm-btn')?.click();
-                  }
-                }}
-                autoFocus
-              />
-            </div>
-            <div className="flex items-center justify-end gap-2 px-5 pb-4">
-              <button
-                onClick={() => setShowCompactDialog(false)}
-                className="px-3.5 py-1.5 text-[13px] text-claude-textSecondary hover:text-claude-text rounded-lg hover:bg-claude-hover transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                id="compact-confirm-btn"
-                onClick={async () => {
-                  setShowCompactDialog(false);
-                  if (!activeId || compactStatus.state === 'compacting') return;
-                  setCompactStatus({ state: 'compacting' });
-                  try {
-                    const instruction = compactInstruction.trim() || undefined;
-                    const result = await compactConversation(activeId, instruction);
-                    await loadConversation(activeId);
-                    const newContextInfo = await getContextSize(activeId);
-                    setContextInfo(newContextInfo);
-                    setCompactStatus({ state: 'done', message: `Compacted ${result.messagesCompacted} messages, saved ~${result.tokensSaved} tokens` });
-                    setTimeout(() => setCompactStatus({ state: 'idle' }), 4000);
-                  } catch (err) {
-                    console.error('Compact failed:', err);
-                    setCompactStatus({ state: 'error', message: 'Compaction failed' });
-                    setTimeout(() => setCompactStatus({ state: 'idle' }), 3000);
-                  }
-                }}
-                className="px-3.5 py-1.5 text-[13px] text-white bg-[#C6613F] hover:bg-[#D97757] rounded-lg transition-colors font-medium"
-              >
-                Compact
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {sharedProjectOverlays}
 
@@ -5148,6 +5344,24 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         onClose={() => setShowVoicePanel(false)}
         onResult={handleVoiceResult}
       />
+
+      {/* Skill 执行结果弹窗 */}
+      {skillResult && (
+        <SkillExecutionResultModal
+          skillName={skillResultName}
+          result={skillResult}
+          onClose={() => setSkillResult(null)}
+          onApplyToChat={(content) => {
+            setInputText(content);
+            setSkillResult(null);
+          }}
+          onReExecute={lastSkillRunRef.current ? () => {
+            const run = lastSkillRunRef.current!;
+            setSkillResult(null);
+            void runSkill(run.name, run.input);
+          } : undefined}
+        />
+      )}
     </div>
   );
 };

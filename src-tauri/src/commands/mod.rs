@@ -219,6 +219,7 @@ pub async fn chat_send(
         top_p: None,
             web_search_enabled: None,
                 reasoning_effort: None,
+                extended_thinking: false,
         };
 
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;
@@ -263,6 +264,7 @@ pub async fn chat_stream(
         top_p: None,
             web_search_enabled: None,
                 reasoning_effort: None,
+                extended_thinking: false,
         };
 
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;
@@ -460,7 +462,7 @@ pub async fn native_engine_init(app: AppHandle) -> Result<NativeEngineState, Str
         let _ = tokio::task::spawn_blocking(move || {
             db_mgr.with_conn(|conn| {
                 if let Err(e) = crate::db::migration::check_and_migrate(&claude_dir_clone, conn) {
-                    eprintln!("[NativeEngine] Migration warning: {}", e);
+                    tracing::warn!(target: "nativeengine", "Migration warning: {}", e);
                 }
             })
         }).await.map_err(|e| e.to_string())?;
@@ -483,6 +485,13 @@ pub async fn native_engine_init(app: AppHandle) -> Result<NativeEngineState, Str
         db_manager.clone(),
         workspaces_dir,
         permission_manager,
+        Arc::new(crate::memory::tencentdb_client::TdaiClient::new(
+            db_manager
+                .with_conn(|c| crate::memory::tencentdb_client::load_config(c))
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default(),
+        )),
     );
 
     if let Some(mcp_manager) = mcp_guard.as_ref() {
@@ -544,6 +553,7 @@ pub async fn native_chat(
         top_p: None,
             web_search_enabled: None,
                 reasoning_effort: None,
+                extended_thinking: false,
         };
     
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;
@@ -613,6 +623,7 @@ pub struct ConversationInfo {
     pub title: Option<String>,
     pub model: String,
     pub workspace_path: String,
+    pub project_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -634,6 +645,7 @@ pub async fn native_create_conversation(
         title: request.title.clone(),
         model: request.model.clone(),
         workspace_path: String::new(),
+        project_id: None,
         created_at: now.clone(),
         updated_at: now,
     })
@@ -654,6 +666,7 @@ pub async fn native_list_conversations(_app: AppHandle) -> Result<Vec<Conversati
         title: c.get("title").and_then(|v| v.as_str()).map(String::from),
         model: c.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         workspace_path: c.get("workspace_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        project_id: c.get("project_id").and_then(|v| v.as_str()).map(String::from),
         created_at: c.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         updated_at: c.get("updated_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
     }).collect())
@@ -702,7 +715,17 @@ pub async fn native_get_messages(
     let client = reqwest::Client::new();
     let resp = client.get(&format!("http://localhost:30080/api/conversations/{}/messages", conversation_id))
         .send().await.map_err(|e| e.to_string())?;
-    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let mut body = resp.text().await.map_err(|e| e.to_string())?;
+
+    // Sanitize: replace lone Unicode surrogates (U+D800-U+DFFF) that break JSON parsing
+    // These can end up in SQLite from improperly decoded input
+    body = sanitize_surrogates(&body);
+
+    let data: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| {
+            tracing::error!(target: "native_get_messages", "JSON parse failed: {}", e);
+            serde_json::json!({ "messages": [] })
+        });
     let msgs = data.get("messages")
         .and_then(|v| v.as_array())
         .cloned()
@@ -711,10 +734,28 @@ pub async fn native_get_messages(
         id: m.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         conversation_id: conversation_id.clone(),
         role: m.get("role").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        content: m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        content: match m.get("content") {
+            Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+            Some(v) => serde_json::to_string(v).unwrap_or_default(),
+            None => String::new(),
+        },
         created_at: m.get("created_at").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         tool_calls: None,
     }).collect())
+}
+
+/// Replace lone Unicode surrogates (U+D800-U+DFFF) with the replacement character.
+/// These are invalid in UTF-8 and JSON, but can appear in SQLite data.
+fn sanitize_surrogates(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch as u32 >= 0xD800 && ch as u32 <= 0xDFFF {
+            result.push('\u{FFFD}'); // Unicode replacement character
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 #[derive(Serialize)]
@@ -827,6 +868,7 @@ pub async fn native_update_provider(
                 context_window: None,
                 supports_vision: false,
                 supports_web_search: false,
+                context_size: None,
             }
         }).collect(),
         enabled: request.enabled,

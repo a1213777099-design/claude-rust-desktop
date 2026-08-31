@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, Trash2, Check, Eye, EyeOff, RefreshCw, ChevronDown, ChevronRight, X, Globe } from 'lucide-react';
 import { getProviders, createProvider, updateProvider, deleteProvider, testProviderWebSearch, Provider, ProviderModel } from '../api';
+import { useUIStore } from '../stores/useUIStore';
 
 // Auto-detect provider info from URL.
 // `webSearch: 'native'` means the bridge has a dedicated native search handler for this provider.
@@ -50,6 +51,12 @@ const KNOWN_PROVIDERS: Array<{
       webSearch: 'native',
       defaultModels: [{ id: 'claude-opus-4-6', name: 'Claude Opus 4.6' }, { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' }, { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' }]
     },
+    {
+      // TencentDB Agent Memory Proxy 默认本地端口 8420；URL 含 agentmemory / :8420 都识别
+      match: u => /(agentmemory|:8420)/i.test(u), name: 'TencentDB Agent Memory', format: 'anthropic', color: '#0052D9', letter: 'T',
+      webSearch: 'native',
+      defaultModels: [{ id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (via Memory)' }, { id: 'deepseek-v3.2', name: 'DeepSeek V3.2 (via Memory)' }],
+    },
   ];
 
 
@@ -71,6 +78,7 @@ const PROVIDER_LOGOS: Record<string, (size: number) => React.ReactNode> = {
   'Google Gemini': (s) => <svg width={s} height={s} viewBox="0 0 24 24"><path d="M12 24C12 24 24 17.5 24 12S12 0 12 0 0 6.5 0 12s12 12 12 12z" fill="url(#gem)" /><defs><linearGradient id="gem" x1="0" y1="0" x2="24" y2="24"><stop offset="0%" stopColor="#4285F4" /><stop offset="50%" stopColor="#9B72CB" /><stop offset="100%" stopColor="#D96570" /></linearGradient></defs></svg>,
   'Qwen (Aliyun)': (s) => <svg width={s} height={s} viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="#FF6A00" /><text x="12" y="16.5" textAnchor="middle" fill="white" fontSize="10" fontWeight="700" fontFamily="sans-serif">Qw</text></svg>,
   'Clawparrot': (s) => <svg width={s} height={s} viewBox="0 0 24 24"><circle cx="12" cy="12" r="11" fill="#C6613F" /><text x="12" y="16" textAnchor="middle" fill="white" fontSize="12" fontWeight="700" fontFamily="sans-serif">C</text></svg>,
+  'TencentDB Agent Memory': (s) => <svg width={s} height={s} viewBox="0 0 24 24"><defs><linearGradient id="tdaiG" x1="0" y1="0" x2="24" y2="24"><stop offset="0%" stopColor="#0052D9" /><stop offset="100%" stopColor="#00C6FF" /></linearGradient></defs><rect width="24" height="24" rx="6" fill="url(#tdaiG)" /><path d="M5 6h14v2H5zM5 11h10v2H5zM5 16h7v2H5z" fill="white" /><circle cx="18.5" cy="17" r="2" fill="white" /></svg>,
 };
 
 const ProviderIcon: React.FC<{ name: string; color: string; letter: string; size?: number }> = ({ name, color, letter, size = 32 }) => {
@@ -217,6 +225,7 @@ const ProviderSettings: React.FC = () => {
   const MODELS_PER_PAGE = 10;
   const [defaultModel, setDefaultModel] = useState(localStorage.getItem('default_model') || '');
   const [chatModels, setChatModels] = useState<ChatModel[]>(loadChatModels());
+  const bumpModelVersion = useUIStore((s) => s.bumpModelVersion);
   const [contextOverrides, setContextOverrides] = useState<Record<string, number>>(() => {
     try { return JSON.parse(localStorage.getItem('model_context_overrides') || '{}'); } catch { return {}; }
   });
@@ -248,6 +257,44 @@ const ProviderSettings: React.FC = () => {
   const [showAdd, setShowAdd] = useState(false);
   const [newUrl, setNewUrl] = useState('');
   const [newKey, setNewKey] = useState('');
+
+  // Quick import: TencentDB Agent Memory (本地 MemoryProxy :8420)
+  const [tdaiProxyUp, setTdaiProxyUp] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 1500);
+        const res = await fetch('http://localhost:8420/health', { signal: ctrl.signal });
+        clearTimeout(t);
+        if (!cancelled) setTdaiProxyUp(res.ok);
+      } catch { if (!cancelled) setTdaiProxyUp(false); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleQuickAddTdai = async () => {
+    const spaceId = (window.prompt('TencentDB MemoryProxy spaceId (在 Memory Hub 创建的 space 标识)：', 'default') || '').trim();
+    if (!spaceId) return;
+    const userKey = (window.prompt('x-tdai-user-key (Memory Hub → User → API Key)：', '') || '').trim();
+    if (!userKey) return;
+    const url = `http://localhost:8420/claude-code/${spaceId}`;
+    const p = await createProvider({
+      name: 'TencentDB Agent Memory',
+      baseUrl: url,
+      format: 'anthropic',
+      apiKey: userKey,
+      models: [
+        { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6 (via Memory)', enabled: true },
+        { id: 'deepseek-v3.2', name: 'DeepSeek V3.2 (via Memory)', enabled: true },
+      ],
+      enabled: true,
+      supportsWebSearch: true,
+    });
+    setProviderList(prev => [...prev, p]);
+    setSelectedId(p.id);
+  };
 
   useEffect(() => { loadProviders(); }, []);
 
@@ -421,11 +468,22 @@ const ProviderSettings: React.FC = () => {
     }
     setChatModels(updated);
     saveChatModels(updated);
-    // Auto-set default to first tier model
+    const oldTierModel = chatModels.find(cm => cm.tier === tier);
+    if (oldTierModel && uid) {
+      const newModel = allAvailableModels.find(m => modelUid(m) === uid);
+      if (newModel) {
+        const currentDefault = localStorage.getItem('default_model') || '';
+        if (currentDefault === oldTierModel.id || currentDefault.replace(/-thinking$/, '') === oldTierModel.id) {
+          setDefaultModel(newModel.id);
+          localStorage.setItem('default_model', newModel.id);
+        }
+      }
+    }
     if (!updated.some(cm => cm.id === defaultModel)) {
       const first = updated.find(cm => cm.tier === 'opus') || updated[0];
       if (first) { setDefaultModel(first.id); localStorage.setItem('default_model', first.id); }
     }
+    bumpModelVersion();
   };
 
 
@@ -434,6 +492,7 @@ const ProviderSettings: React.FC = () => {
     const updated = chatModels.filter(cm => modelUid(cm) !== uid);
     setChatModels(updated);
     saveChatModels(updated);
+    bumpModelVersion();
     if (removed && defaultModel === removed.id) {
       const newDefault = updated[0]?.id || '';
       setDefaultModel(newDefault);
@@ -444,6 +503,7 @@ const ProviderSettings: React.FC = () => {
   const handleSetDefault = (id: string) => {
     setDefaultModel(id);
     localStorage.setItem('default_model', id);
+    bumpModelVersion();
   };
 
   return (
@@ -517,6 +577,29 @@ const ProviderSettings: React.FC = () => {
 
       {/* ===== Provider Management ===== */}
       <h3 className="text-[16px] font-semibold text-claude-text mb-4">模型供应商</h3>
+
+      {/* TencentDB Agent Memory 状态条 + 快捷导入 */}
+      <div className="mb-4 flex items-center gap-3 px-3 py-2.5 rounded-lg border border-claude-border/40 bg-gradient-to-r from-[#0052D9]/[0.04] to-[#00C6FF]/[0.04]">
+        <div className="w-7 h-7 rounded-md flex items-center justify-center flex-shrink-0" style={{ background: 'linear-gradient(135deg,#0052D9,#00C6FF)' }}>
+          <span className="text-white text-[12px] font-bold">T</span>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-[13px] font-medium text-claude-text">TencentDB Agent Memory</div>
+          <div className="text-[11px] text-claude-textSecondary truncate">
+            {tdaiProxyUp === null && '正在检测本地 Proxy (http://localhost:8420)…'}
+            {tdaiProxyUp === true && '✅ 已检测到 Memory Proxy — 可点击右侧按钮一键接入（自动注入 L0–L3 分层记忆）'}
+            {tdaiProxyUp === false && '未检测到 Memory Proxy — 需先启动 Docker: docker pull agentmemory && docker compose up'}
+          </div>
+        </div>
+        <button
+          onClick={handleQuickAddTdai}
+          disabled={tdaiProxyUp === false}
+          className="px-3 py-1.5 text-[12px] font-medium text-white rounded-md transition-all disabled:opacity-40 disabled:cursor-not-allowed hover:brightness-110"
+          style={{ background: 'linear-gradient(135deg,#0052D9,#00C6FF)' }}
+        >
+          一键接入
+        </button>
+      </div>
       <div className="flex gap-6 min-h-[400px] animate-fade-in">
         {/* Left: Provider list */}
         <div className="w-[240px] flex-shrink-0 flex flex-col gap-2">

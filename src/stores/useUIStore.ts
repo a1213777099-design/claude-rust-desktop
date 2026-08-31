@@ -26,6 +26,8 @@ interface UIState {
   terminalPanelHeight: number;
   zoomLevel: number;
   language: string;
+  modelVersion: number;
+  pendingTierSwitch: Record<string, string> | null; // { tier: newModelId }
 
   toggleSidebar: () => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
@@ -52,6 +54,8 @@ interface UIState {
   setTerminalPanelHeight: (height: number) => void;
   setZoomLevel: (level: number) => void;
   setLanguage: (lang: string) => void;
+  bumpModelVersion: () => void;
+  setPendingTierSwitch: (changes: Record<string, string> | null) => void;
 }
 
 const getInitialLanguage = (): string => {
@@ -88,6 +92,8 @@ export const useUIStore = create<UIState>()(
     terminalPanelHeight: 300,
     zoomLevel: 1,
     language: getInitialLanguage(),
+    modelVersion: 0,
+    pendingTierSwitch: null as Record<string, string> | null,
 
     toggleSidebar: () => set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
     setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
@@ -127,5 +133,7 @@ export const useUIStore = create<UIState>()(
       localStorage.setItem('app_language', language);
       document.documentElement.lang = language;
     },
+    bumpModelVersion: () => set((state) => ({ modelVersion: state.modelVersion + 1 })),
+    setPendingTierSwitch: (changes: Record<string, string> | null) => set({ pendingTierSwitch: changes }),
   }))
 );

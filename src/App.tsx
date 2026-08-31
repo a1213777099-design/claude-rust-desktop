@@ -31,6 +31,7 @@ import CustomizePage from './components/CustomizePage';
 import ProjectsPage from './components/ProjectsPage';
 import ModelsPage from './components/ModelsPage';
 import DesignPage from './components/DesignPage';
+import SwarmCollaboration from './components/SwarmCollaboration';
 import DirectoryModal from './components/DirectoryModal';
 import { tauriAPI } from './utils/tauriAPI';
 
@@ -553,13 +554,13 @@ const Layout = () => {
         </div>
         <Sidebar isCollapsed={isSidebarCollapsed} toggleSidebar={() => setIsSidebarCollapsed(!isSidebarCollapsed)} refreshTrigger={refreshTrigger} onNewChatClick={handleNewChat} onOpenSettings={() => { setShowSettings(true); setShowUpgrade(false); }} onOpenUpgrade={() => { setShowUpgrade(true); setShowSettings(false); }} onOpenDirectory={() => setShowDirectoryModal(true)} onCloseOverlays={() => { setShowSettings(false); setShowUpgrade(false); }} tunerConfig={tunerConfig} setTunerConfig={setTunerConfig} titleBarHeight={titleBarHeight} activeConversationId={location.pathname.startsWith('/chat/') ? location.pathname.slice(6) : undefined} />
         <div className="flex-1 flex flex-col h-full min-w-0 overflow-hidden relative" style={{ paddingTop: `${titleBarHeight}px` }}>
-          {isChatMode && !showSettings && !showUpgrade && location.pathname !== '/chats' && location.pathname !== '/customize' && location.pathname !== '/projects' && location.pathname !== '/artifacts' && (
+          {isChatMode && !showSettings && !showUpgrade && location.pathname !== '/chats' && location.pathname !== '/customize' && location.pathname !== '/projects' && location.pathname !== '/artifacts' && location.pathname !== '/cowork' && (
             <ChatHeader title={currentChatTitle} showArtifacts={showArtifacts} documentPanelDoc={documentPanelDoc} onOpenArtifacts={handleOpenArtifacts} hasArtifacts={artifacts.length > 0} onTitleRename={handleTitleChange} />
           )}
           <div className="flex-1 flex overflow-hidden relative" ref={contentContainerRef}>
             <div className="flex-1 flex flex-col h-full min-w-0 relative">
               {/* MainContent always rendered to preserve state */}
-              <div className={`absolute inset-0 flex flex-col h-full min-w-0 transition-opacity duration-300 ${showSettings || showUpgrade || location.pathname === '/chats' || location.pathname === '/customize' || location.pathname === '/projects' || location.pathname === '/artifacts' || location.pathname === '/models' || location.pathname === '/design' ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
+              <div className={`absolute inset-0 flex flex-col h-full min-w-0 transition-opacity duration-300 ${showSettings || showUpgrade || location.pathname === '/chats' || location.pathname === '/customize' || location.pathname === '/projects' || location.pathname === '/artifacts' || location.pathname === '/models' || location.pathname === '/design' || location.pathname === '/cowork' ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
                 <MainContent onNewChat={refreshSidebar} resetKey={newChatKey} tunerConfig={tunerConfig} onOpenDocument={handleOpenDocument} onArtifactsUpdate={handleArtifactsUpdate} onOpenArtifacts={handleOpenArtifacts} onTitleChange={handleTitleChange} onChatModeChange={handleChatModeChange} />
               </div>
               
@@ -611,6 +612,11 @@ const Layout = () => {
               {location.pathname === '/design' && (
                 <div className="absolute inset-0 z-10 flex flex-col h-full min-w-0 bg-claude-bg">
                   <DesignPage />
+                </div>
+              )}
+              {location.pathname === '/cowork' && (
+                <div className="absolute inset-0 z-10 flex flex-col h-full min-w-0 bg-claude-bg">
+                  <SwarmCollaboration />
                 </div>
               )}
             </div>
@@ -692,6 +698,7 @@ const App = () => {
         <Route path="/artifacts" element={<Layout />} />
         <Route path="/models" element={<Layout />} />
         <Route path="/design" element={<Layout />} />
+        <Route path="/cowork" element={<Layout />} />
         <Route path="/chat/:id" element={<Layout />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

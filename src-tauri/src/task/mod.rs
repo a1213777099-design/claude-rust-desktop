@@ -236,7 +236,7 @@ Guidelines:
         });
 
         let response = self.anthropic_client
-            .send_message(resolved, messages, Some(system_prompt), vec![], max_tokens)
+            .send_message(resolved, messages, Some(system_prompt), vec![], max_tokens, None, false)
             .await?;
 
         let output = response.content.iter()
@@ -285,7 +285,7 @@ Guidelines:
         });
 
         let response = self.openai_client
-            .send_message(resolved, messages, Some(system_prompt), vec![], max_tokens)
+            .send_message(resolved, messages, Some(system_prompt), vec![], max_tokens, None, false)
             .await?;
 
         let output = response.choices.iter()
@@ -433,7 +433,7 @@ Guidelines:
         });
 
         let mut stream = self.anthropic_client
-            .send_message_stream(resolved, messages, Some(system_prompt), vec![], max_tokens)
+            .send_message_stream(resolved, messages, Some(system_prompt), vec![], max_tokens, None, false)
             .await?;
 
         let mut full_output = String::new();
@@ -463,7 +463,7 @@ Guidelines:
                     }
                 }
                 Err(e) => {
-                    eprintln!("[TaskExecutor] Stream error: {}", e);
+                    tracing::error!(target: "taskexecutor", "Stream error: {}", e);
                 }
             }
         }
@@ -503,7 +503,7 @@ Guidelines:
         });
 
         let mut stream = self.openai_client
-            .send_message_stream(resolved, messages, Some(system_prompt), vec![], max_tokens)
+            .send_message_stream(resolved, messages, Some(system_prompt), vec![], max_tokens, None, false)
             .await?;
 
         let mut full_output = String::new();
@@ -535,7 +535,7 @@ Guidelines:
                     }
                 }
                 Err(e) => {
-                    eprintln!("[TaskExecutor] Stream error: {}", e);
+                    tracing::error!(target: "taskexecutor", "Stream error: {}", e);
                 }
             }
         }

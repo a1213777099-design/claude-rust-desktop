@@ -28,6 +28,7 @@ pub struct ModelConfig {
     pub enabled: bool,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
+    pub context_size: Option<u32>,   // 模型上下文大小（token 数）
     pub supports_vision: bool,
     pub supports_web_search: bool,
 }
@@ -59,7 +60,7 @@ impl ProviderManager {
             config_path,
         };
         if let Err(e) = manager.save() {
-            eprintln!("[ProviderManager] Failed to save synced providers: {}", e);
+            tracing::error!(target: "providermanager", "Failed to save synced providers: {}", e);
         }
         manager
     }
@@ -73,7 +74,7 @@ impl ProviderManager {
             if let Ok(content) = std::fs::read_to_string(&self.config_path) {
                 if let Ok(providers) = serde_json::from_str::<Vec<Provider>>(&content) {
                     self.providers = providers;
-                    eprintln!("[ProviderManager] Loaded {} providers from {}", self.providers.len(), self.config_path.display());
+                    tracing::info!(target: "providermanager", "Loaded {} providers from {}", self.providers.len(), self.config_path.display());
                 }
             }
         }
@@ -90,6 +91,8 @@ impl ProviderManager {
 
     pub fn resolve_provider(&self, model_id: &str) -> Option<ResolvedProvider> {
         let mut first_match: Option<ResolvedProvider> = None;
+        // Strip -thinking suffix for model lookup (thinking is a parameter, not a separate model)
+        let base_model = model_id.strip_suffix("-thinking").unwrap_or(model_id);
         
         // Model alias mapping for common mismatches
         let aliases: std::collections::HashMap<&str, Vec<&str>> = [
@@ -98,13 +101,13 @@ impl ProviderManager {
         ].iter().cloned().collect();
         
         // Build list of IDs to try: original + aliases
-        let mut ids_to_try = vec![model_id];
-        if let Some(alias_list) = aliases.get(model_id) {
+        let mut ids_to_try = vec![base_model];
+        if let Some(alias_list) = aliases.get(base_model) {
             ids_to_try.extend(alias_list.iter().copied());
         }
         // Also check if model_id is an alias of another model
         for (canonical, alias_list) in &aliases {
-            if alias_list.contains(&model_id) {
+            if alias_list.contains(&base_model) {
                 ids_to_try.push(canonical);
             }
         }
@@ -123,10 +126,7 @@ impl ProviderManager {
                                 model: model.clone(),
                             });
                         } else {
-                            eprintln!(
-                                "[ProviderManager] WARNING: model \"{}\" exists in multiple providers. Using first match.",
-                                model_id
-                            );
+                            tracing::warn!(target: "provider_manager", "model \"{}\" exists in multiple providers. Using first match.", model_id);
                         }
                         break;
                     }
@@ -142,12 +142,9 @@ impl ProviderManager {
         }
 
         if let Some(resolved) = &first_match {
-            eprintln!(
-                "[ProviderManager] Resolved \"{}\" → \"{}\" ({})",
-                model_id, resolved.provider.name, resolved.provider.base_url
-            );
+            tracing::info!(target: "provider_manager", "Resolved \"{}\" -> \"{}\" ({})", model_id, resolved.provider.name, resolved.provider.base_url);
         } else {
-            eprintln!("[ProviderManager] No provider found for \"{}\"", model_id);
+            tracing::warn!(target: "provider_manager", "No provider found for \"{}\"", model_id);
         }
 
         first_match
@@ -171,25 +168,25 @@ impl ProviderManager {
     pub fn update_provider(&mut self, id: &str, provider: Provider) {
         if let Some(idx) = self.providers.iter().position(|p| p.id == id) {
             self.providers[idx] = provider;
-            eprintln!("[ProviderManager] Updated provider: {}", id);
+            tracing::info!(target: "providermanager", "Updated provider: {}", id);
         } else {
             self.providers.push(provider);
-            eprintln!("[ProviderManager] Added new provider: {}", id);
+            tracing::info!(target: "providermanager", "Added new provider: {}", id);
         }
         if let Err(e) = self.save() {
-            eprintln!("[ProviderManager] Failed to save providers: {}", e);
+            tracing::error!(target: "providermanager", "Failed to save providers: {}", e);
         } else {
-            eprintln!("[ProviderManager] Providers saved successfully to {}", self.config_path.display());
+            tracing::info!(target: "providermanager", "Providers saved successfully to {}", self.config_path.display());
         }
     }
 
     pub fn delete_provider(&mut self, id: &str) {
         self.providers.retain(|p| p.id != id);
-        eprintln!("[ProviderManager] Deleted provider: {}", id);
+        tracing::info!(target: "providermanager", "Deleted provider: {}", id);
         if let Err(e) = self.save() {
-            eprintln!("[ProviderManager] Failed to save providers after deletion: {}", e);
+            tracing::error!(target: "providermanager", "Failed to save providers after deletion: {}", e);
         } else {
-            eprintln!("[ProviderManager] Providers saved successfully after deletion");
+            tracing::info!(target: "providermanager", "Providers saved successfully after deletion");
         }
     }
 }

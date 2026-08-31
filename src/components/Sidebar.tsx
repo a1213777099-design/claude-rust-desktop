@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+﻿import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { createPortal } from 'react-dom';
 import { useStreamingStore } from '../stores/useStreamingStore';
@@ -21,13 +21,12 @@ import claudeImg from '../assets/icons/claude.png';
 import searchIconImg from '../assets/icons/search-icon.png';
 import customizeIconImg from '../assets/icons/customize-icon.png';
 import { NAV_ITEMS } from '../constants';
-import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Search, Globe, Users, MessageSquare } from 'lucide-react';
-import { getConversations, deleteConversation, updateConversation, getUser, getUserUsage, logout, getUserProfile, getCodeSSO } from '../api';
+import { ChevronUp, Settings, HelpCircle, LogOut, Shield, CreditCard, Search, Globe, Users, MessageSquare, Folder, FolderOpen, ChevronDown, ChevronRight, FolderPlus, Plus, MoreHorizontal } from 'lucide-react';
+import { getConversations, deleteConversation, updateConversation, getUser, getUserUsage, logout, getUserProfile, getCodeSSO, getProjects, createProjectConversation, deleteProject, openFolder } from '../api';
 
 import SearchModal from './SearchModal';
 import CostTracker from './CostTracker';
 import EmbeddedBrowser from './EmbeddedBrowser';
-import SwarmCollaboration from './SwarmCollaboration';
 
 interface SidebarProps {
   isCollapsed: boolean;
@@ -121,7 +120,9 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
   const location = useLocation();
   const codeJumpUrl = ((import.meta as any).env?.VITE_CODE_JUMP_URL || '/code/').trim();
   const [chats, setChats] = useState<any[]>([]);
-  const [activeMenuIndex, setActiveMenuIndex] = useState<number | null>(null);
+  const [projects, setProjects] = useState<any[]>([]);
+  const [activeMenuId, setActiveMenuId] = useState<string | null>(null);
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const [menuPosition, setMenuPosition] = useState<{ top: number, left: number } | null>(null);
   const [showRenameModal, setShowRenameModal] = useState(false);
   const [renameChatId, setRenameChatId] = useState<string | null>(null);
@@ -158,6 +159,15 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     window.addEventListener('streaming-change', handler);
     return () => window.removeEventListener('streaming-change', handler);
   }, []);
+
+  // Sync active tab with route
+  useEffect(() => {
+    if (location.pathname === '/cowork') {
+      setActiveTab('cowork');
+    } else if (activeTab === 'cowork') {
+      setActiveTab('chat');
+    }
+  }, [location.pathname]);
 
   // Listen for auto-update events (Tauri uses different update mechanism)
   useEffect(() => {
@@ -219,12 +229,12 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     }
   };
 
-  const fetchChats = useCallback(async () => {
+  const fetchChats = useCallback(async (): Promise<boolean> => {
     try {
       const data = await getConversations();
       console.log('[Sidebar] Fetched conversations:', data);
       if (Array.isArray(data)) {
-        // 去重：根据 id 去重，保留最新的
+        // 去重（可能存在 id 重复的旧数据）
         const seen = new Set<string>();
         const unique = data.filter((chat: any) => {
           if (seen.has(chat.id)) return false;
@@ -232,15 +242,46 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           return true;
         });
         setChats(unique);
+        return true;
       }
+      return false;
     } catch (e) {
       console.error("Failed to fetch chats", e);
+      return false;
     }
   }, []);
 
+  const fetchProjects = useCallback(async (): Promise<boolean> => {
+    try {
+      const data = await getProjects();
+      if (Array.isArray(data)) {
+        setProjects(data);
+        return true;
+      }
+      return false;
+    } catch (e) {
+      console.error("Failed to fetch projects", e);
+      return false;
+    }
+  }, []);
+
+  const refreshAll = useCallback(() => {
+    fetchChats();
+    fetchProjects();
+  }, [fetchChats, fetchProjects]);
+
   useEffect(() => {
     setUserUser(getUser());
-    fetchChats();
+    // 桥接服务可能比前端晚就绪（后端重启期间侧栏会拿到空数据），
+    // 首次加载失败时自动重试，避免侧栏一直空白
+    let cancelled = false;
+    (async () => {
+      for (let i = 0; i < 6 && !cancelled; i++) {
+        const [cOk, pOk] = await Promise.all([fetchChats(), fetchProjects()]);
+        if (cOk && pOk) break;
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    })();
     fetchPlan();
     getUserProfile().then((data: any) => {
       const p = data?.user || data;
@@ -250,13 +291,13 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       }
     }).catch(() => { });
 
-    // 监听标题更新事件
+    // 閻╂垵鎯夐弽鍥暯閺囧瓨鏌婃禍瀣╂
     const handleTitleUpdate = () => {
       console.log('[Sidebar] Title update event received, fetching conversations...');
-      fetchChats();
+      refreshAll();
     };
 
-    // 监听用户资料更新事件
+    // 閻╂垵鎯夐悽銊﹀煕鐠у嫭鏋￠弴瀛樻煀娴滃娆?
     const handleProfileUpdate = () => {
       setUserUser(getUser());
       getUserProfile().then((data: any) => {
@@ -271,13 +312,20 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
     window.addEventListener('conversationTitleUpdated', handleTitleUpdate);
     window.addEventListener('userProfileUpdated', handleProfileUpdate);
     window.addEventListener('conversationsUpdated', handleTitleUpdate);
+    // 定时 + 窗口聚焦时刷新：后端重启/网络恢复后侧栏自动恢复显示
+    const interval = setInterval(refreshAll, 30_000);
+    const handleFocus = () => refreshAll();
+    window.addEventListener('focus', handleFocus);
 
     return () => {
+      cancelled = true;
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
       window.removeEventListener('conversationTitleUpdated', handleTitleUpdate);
       window.removeEventListener('userProfileUpdated', handleProfileUpdate);
       window.removeEventListener('conversationsUpdated', handleTitleUpdate);
     };
-  }, [refreshTrigger, fetchChats]);
+  }, [refreshTrigger, refreshAll]);
 
   const fetchPlan = async () => {
     try {
@@ -298,25 +346,26 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
           '体验包': t('sidebar.trailPlan'),
           '基础月卡': t('sidebar.proPlan'),
           '专业月卡': t('sidebar.maxX5Plan'),
-          '尊享月卡': t('sidebar.maxX20Plan'),
+          '至尊月卡': t('sidebar.maxX20Plan'),
         };
         setPlanLabel(nameMap[data.plan.name] || data.plan.name);
       } else {
         setPlanLabel(t('sidebar.freePlan'));
       }
     } catch (e) {
-      // 获取失败保持默认
+      // 閼惧嘲褰囨径杈Е娣囨繃瀵旀妯款吇
     }
   };
 
-  const handleRenameClick = (e: React.MouseEvent, index: number) => {
+  const handleRenameClick = (e: React.MouseEvent, chatId: string) => {
     e.stopPropagation();
-    if (chats[index]) {
-      setRenameChatId(chats[index].id);
-      setRenameInitialTitle(chats[index].title || t('customize.untitledConversation'));
+    const chat = chats.find(c => c.id === chatId);
+    if (chat) {
+      setRenameChatId(chat.id);
+      setRenameInitialTitle(chat.title || t('customize.untitledConversation'));
       setShowRenameModal(true);
     }
-    setActiveMenuIndex(null);
+    setActiveMenuId(null);
   };
 
   const handleRenameSubmit = async (newTitle: string) => {
@@ -342,27 +391,28 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
   const handleDeleteChat = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    setActiveMenuId(null);
+    setChats(prev => prev.filter(c => c.id !== id));
     try {
       await deleteConversation(id);
-      setChats(chats.filter(c => c.id !== id));
-      setActiveMenuIndex(null);
       if (location.pathname === `/chat/${id}`) {
         navigate('/');
       }
     } catch (err) {
-      console.error(err);
+      console.error('[Sidebar] Delete failed:', err);
+      fetchChats();
     }
   };
 
   // Close menu when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
-      // 忽略用户按钮本身的点击（由按钮 onClick 处理）
+      // 韫囩晫鏆愰悽銊﹀煕閹稿鎸抽張顒冮煩閻ㄥ嫮鍋ｉ崙浼欑礄閻㈣鲸瀵滈柦?onClick 婢跺嫮鎮婇敍?
       if (userBtnRef.current && userBtnRef.current.contains(event.target as Node)) {
         return;
       }
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
-        setActiveMenuIndex(null);
+        setActiveMenuId(null);
       }
       if (userMenuRef.current && !userMenuRef.current.contains(event.target as Node)) {
         setShowUserMenu(false);
@@ -371,11 +421,11 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
     // Close on scroll
     const handleScroll = () => {
-      if (activeMenuIndex !== null) setActiveMenuIndex(null);
+      if (activeMenuId !== null) setActiveMenuId(null);
       if (showUserMenu) setShowUserMenu(false);
     };
 
-    if (activeMenuIndex !== null || showUserMenu) {
+    if (activeMenuId !== null || showUserMenu) {
       document.addEventListener('click', handleClickOutside);
       // Attach scroll listener to the sidebar scroll container
       const scrollEl = scrollRef.current;
@@ -389,14 +439,14 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       scrollEl?.removeEventListener('scroll', handleScroll);
       window.removeEventListener('resize', handleScroll);
     };
-  }, [activeMenuIndex, showUserMenu]);
+  }, [activeMenuId, showUserMenu]);
 
-  const handleMenuClick = (e: React.MouseEvent, index: number) => {
+  const handleMenuClick = (e: React.MouseEvent, chatId: string) => {
     e.stopPropagation();
     e.preventDefault();
 
-    if (activeMenuIndex === index) {
-      setActiveMenuIndex(null);
+    if (activeMenuId === `chat:${chatId}`) {
+      setActiveMenuId(null);
       return;
     }
 
@@ -425,7 +475,170 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
       top: topPos,
       left: leftPos,
     });
-    setActiveMenuIndex(index);
+    setActiveMenuId(`chat:${chatId}`);
+  };
+
+  const handleProjectMenuClick = (e: React.MouseEvent, projectId: string) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (activeMenuId === `project:${projectId}`) {
+      setActiveMenuId(null);
+      return;
+    }
+    const button = e.currentTarget as HTMLElement;
+    const buttonRect = button.getBoundingClientRect();
+    const parentElement = button.parentElement;
+    let leftPos = buttonRect.right - 200;
+    if (parentElement) {
+      const parentRect = parentElement.getBoundingClientRect();
+      leftPos = parentRect.right - 200;
+    }
+    const menuHeight = 140;
+    let topPos = buttonRect.bottom + 4;
+    if (topPos + menuHeight > window.innerHeight) {
+      topPos = buttonRect.top - menuHeight - 4;
+    }
+    setMenuPosition({ top: topPos, left: leftPos });
+    setActiveMenuId(`project:${projectId}`);
+  };
+
+  const handleOpenProjectFolder = async (project: any) => {
+    setActiveMenuId(null);
+    const wsPath = project.workspace_path || project.path;
+    if (!wsPath) {
+      console.warn('Project has no workspace_path');
+      return;
+    }
+    try {
+      const result = await openFolder(wsPath);
+      if (!result.ok) {
+        console.error('openFolder failed:', result.error);
+      }
+    } catch (err) {
+      console.error('openFolder threw:', err);
+    }
+  };
+
+  const handleDeleteProjectCard = async (project: any) => {
+    setActiveMenuId(null);
+    const confirmed = window.confirm(`确定要删除项目「${project.name || '未命名'}」吗？该项目下的所有会话也会被删除。`);
+    if (!confirmed) return;
+    try {
+      // If currently inside a conversation belonging to this project, leave first
+      const match = location.pathname.match(/^\/chat\/([^/]+)/);
+      const currentChatId = match ? match[1] : null;
+      const insideProject = currentChatId
+        ? chats.some((c: any) => c.id === currentChatId && c.project_id === project.id)
+        : false;
+      if (insideProject) {
+        navigate('/');
+      }
+      await deleteProject(project.id);
+      await refreshAll();
+    } catch (err) {
+      console.error('deleteProject failed:', err);
+    }
+  };
+
+  // Build the display list: project cards (with their conversations) and regular chats, ordered by recency
+  const displayList = React.useMemo(() => {
+    const projectMap = new Map<string, { project: any; conversations: any[]; lastActive: string }>();
+    const regular: any[] = [];
+
+    for (const chat of chats) {
+      if (chat.project_id) {
+        if (!projectMap.has(chat.project_id)) {
+          const project = projects.find((p: any) => p.id === chat.project_id);
+          if (!project) {
+            regular.push(chat);
+            continue;
+          }
+          projectMap.set(chat.project_id, { project, conversations: [], lastActive: chat.updated_at || chat.created_at || '' });
+        }
+        const entry = projectMap.get(chat.project_id)!;
+        entry.conversations.push(chat);
+        const t = chat.updated_at || chat.created_at || '';
+        if (t > entry.lastActive) entry.lastActive = t;
+      } else {
+        regular.push(chat);
+      }
+    }
+
+    const projectItems = Array.from(projectMap.values()).sort((a, b) => (b.lastActive > a.lastActive ? 1 : -1));
+    const regSorted = [...regular].sort((a: any, b: any) => ((b.updated_at || '') > (a.updated_at || '') ? 1 : -1));
+
+    const merged: any[] = [];
+    let i = 0;
+    let j = 0;
+    while (i < projectItems.length || j < regSorted.length) {
+      if (i < projectItems.length && (j >= regSorted.length || projectItems[i].lastActive >= (regSorted[j].updated_at || ''))) {
+        merged.push({ type: 'project', ...projectItems[i] });
+        i++;
+      } else if (j < regSorted.length) {
+        merged.push({ type: 'chat', chat: regSorted[j] });
+        j++;
+      } else {
+        break;
+      }
+    }
+    return merged;
+  }, [chats, projects]);
+
+  const toggleProject = (projectId: string) => {
+    setExpandedProjects(prev => {
+      const next = new Set(prev);
+      if (next.has(projectId)) {
+        next.delete(projectId);
+      } else {
+        next.add(projectId);
+      }
+      return next;
+    });
+  };
+
+  const openProjectConversation = (convId: string) => {
+    onCloseOverlays?.();
+    navigate(`/chat/${convId}`);
+  };
+
+  const [creatingProjectConvs, setCreatingProjectConvs] = useState<Set<string>>(new Set());
+
+  const handleAddProjectConversation = async (e: React.MouseEvent, project: any) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const projectId = project.id;
+    if (creatingProjectConvs.has(projectId)) return;
+    setCreatingProjectConvs(prev => new Set(prev).add(projectId));
+    try {
+      const workspacePath = project.workspace_path || project.path || undefined;
+      const result = await createProjectConversation(projectId, undefined, undefined, workspacePath);
+      const newConvId = result?.id;
+      await refreshAll();
+      // Auto-expand the project so the new conversation is visible
+      setExpandedProjects(prev => {
+        const next = new Set(prev);
+        next.add(projectId);
+        return next;
+      });
+      if (newConvId) {
+        onCloseOverlays?.();
+        navigate(`/chat/${newConvId}`);
+      } else {
+        setExpandedProjects(prev => {
+          const next = new Set(prev);
+          next.add(projectId);
+          return next;
+        });
+      }
+    } catch (err) {
+      console.error('Failed to create project conversation:', err);
+    } finally {
+      setCreatingProjectConvs(prev => {
+        const next = new Set(prev);
+        next.delete(projectId);
+        return next;
+      });
+    }
   };
 
   return (
@@ -458,9 +671,16 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
               ].map(tab => (
                 <button
                   key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => {
+                    if (tab.id === 'cowork') {
+                      navigate('/cowork');
+                    } else {
+                      setActiveTab(tab.id);
+                      if (location.pathname === '/cowork') navigate('/');
+                    }
+                  }}
                   className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-md text-xs font-medium transition-all ${
-                    activeTab === tab.id
+                    (tab.id === 'cowork' && location.pathname === '/cowork') || (tab.id === activeTab && tab.id !== 'cowork')
                       ? 'bg-claude-hover text-claude-text'
                       : 'text-claude-textSecondary hover:bg-claude-hover hover:text-claude-text'
                   }`}
@@ -586,16 +806,8 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
         <div
           ref={scrollRef}
           className="flex-1 overflow-y-auto sidebar-scroll min-h-0 pb-6"
-          style={{
-            paddingLeft: activeTab === 'cowork' ? '0px' : '9px',
-            paddingRight: activeTab === 'cowork' ? '0px' : '9px',
-            paddingTop: '0px'
-          }}
+          style={{ paddingLeft: '9px', paddingRight: '9px', paddingTop: '0px' }}
         >
-          {activeTab === 'cowork' ? (
-            <SwarmCollaboration />
-          ) : (
-            <>
 
           {/* Navigation Links */}
           <nav className="space-y-0.5 mb-6">
@@ -648,7 +860,122 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
           {/* Recents List */}
           <div className={`space-y-0.5 pb-2 transition-all duration-200 ${isCollapsed || isRecentsCollapsed ? 'opacity-0 hidden h-0 overflow-hidden' : 'opacity-100'}`}>
-            {chats.slice(0, 30).map((chat, index) => {
+            {displayList.slice(0, 30).map((item) => {
+              if (item.type === 'project') {
+                const isExpanded = expandedProjects.has(item.project.id);
+                const projectChats = item.conversations || [];
+                return (
+                  <div key={`project-${item.project.id}`} className="mb-1">
+                    {/* Project Card - Folder Icon Card */}
+                    <div
+                      onClick={() => toggleProject(item.project.id)}
+                      className="relative group flex items-center w-full rounded-lg transition-colors cursor-pointer min-h-[32px] hover:bg-claude-hover"
+                      style={{
+                        paddingTop: `${tunerConfig?.recentsItemPy || 6}px`,
+                        paddingBottom: `${tunerConfig?.recentsItemPy || 6}px`,
+                        paddingLeft: `${tunerConfig?.recentsPl || 12}px`,
+                        paddingRight: `${tunerConfig?.recentsPl || 12}px`,
+                      }}
+                    >
+                      {/* Left: collapse/expand chevron */}
+                      <div className="flex-shrink-0 mr-1.5 text-claude-textSecondary">
+                        {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </div>
+                      {/* Left: folder icon */}
+                      <div className="flex-shrink-0 mr-2 text-claude-textSecondary">
+                        {isExpanded ? <FolderOpen size={18} /> : <Folder size={18} />}
+                      </div>
+                      <div className="flex-1 min-w-0 pr-14">
+                        <div
+                          className="text-claude-text truncate leading-snug font-medium"
+                          style={{ fontSize: `${tunerConfig?.recentsFontSize || 13}px` }}
+                        >
+                          {item.project.name || 'Project'}
+                        </div>
+                      </div>
+                      {/* Right: ... menu button (left of +) */}
+                      <button
+                        onClick={(e) => handleProjectMenuClick(e, item.project.id)}
+                        title="更多操作"
+                        className={`
+                          absolute right-8 top-1/2 -translate-y-1/2 p-0.5 rounded text-claude-textSecondary hover:text-claude-text hover:bg-claude-border transition-all
+                          ${activeMenuId === `project:${item.project.id}` ? 'opacity-100 block' : 'opacity-0 group-hover:opacity-100 hidden group-hover:block'}
+                        `}
+                      >
+                        <MoreHorizontal size={16} />
+                      </button>
+                      {/* Right: add new conversation (+) button */}
+                      <button
+                        onClick={(e) => handleAddProjectConversation(e, item.project)}
+                        disabled={creatingProjectConvs.has(item.project.id)}
+                        title="新建会话"
+                        className={`
+                          absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded text-claude-textSecondary hover:text-claude-text hover:bg-claude-border transition-all
+                          ${creatingProjectConvs.has(item.project.id) ? 'opacity-60 cursor-wait' : 'opacity-0 group-hover:opacity-100 hidden group-hover:block'}
+                        `}
+                      >
+                        {creatingProjectConvs.has(item.project.id) ? (
+                          <svg width="14" height="14" viewBox="0 0 24 24" className="animate-spin" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                          </svg>
+                        ) : (
+                          <Plus size={16} />
+                        )}
+                      </button>
+                    </div>
+                    {/* Project Conversations (collapsible) */}
+                    {isExpanded && projectChats.map((chat: any) => {
+                      const isActive = location.pathname === `/chat/${chat.id}`;
+                      return (
+                        <div
+                          key={chat.id}
+                          onClick={() => openProjectConversation(chat.id)}
+                          className={`
+                            relative group flex items-center w-full rounded-lg transition-colors cursor-pointer min-h-[28px] ml-3
+                            ${isActive || activeMenuId === `chat:${chat.id}` ? 'bg-claude-hover' : 'hover:bg-claude-hover'}
+                          `}
+                          style={{
+                            width: `calc(100% - 12px)`,
+                            paddingTop: `${tunerConfig?.recentsItemPy || 6}px`,
+                            paddingBottom: `${tunerConfig?.recentsItemPy || 6}px`,
+                            paddingLeft: `${tunerConfig?.recentsPl || 12}px`,
+                            paddingRight: `${tunerConfig?.recentsPl || 12}px`,
+                          }}
+                        >
+                          {/* Streaming indicator */}
+                          {streamingIds.has(chat.id) && (
+                            <span
+                              className="flex-shrink-0 mr-2 w-[7px] h-[7px] rounded-full bg-neutral-700 dark:bg-neutral-300 animate-pulse"
+                              style={{ animationDuration: '1.6s' }}
+                            />
+                          )}
+                          {/* Chat Title */}
+                          <div className="flex-1 min-w-0 pr-6">
+                            <div
+                              className="text-claude-text truncate leading-snug"
+                              style={{ fontSize: `${tunerConfig?.recentsFontSize || 13}px` }}
+                            >
+                              {chat.title || t('customize.untitledConversation')}
+                            </div>
+                          </div>
+                          {/* Three Dots Button */}
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleMenuClick(e, chat.id); }}
+                            className={`
+                              absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded text-claude-textSecondary hover:text-claude-text transition-all
+                              ${activeMenuId === `chat:${chat.id}` ? 'opacity-100 block' : 'opacity-0 group-hover:opacity-100 hidden group-hover:block'}
+                            `}
+                          >
+                            <IconDotsHorizontal size={16} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              }
+              // Regular chat item
+              const chat = item.chat;
               const isActive = location.pathname === `/chat/${chat.id}`;
               return (
                 <div
@@ -656,7 +983,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                   onClick={() => { onCloseOverlays?.(); navigate(`/chat/${chat.id}`); }}
                   className={`
                     relative group flex items-center w-full rounded-lg transition-colors cursor-pointer min-h-[32px]
-                    ${isActive || activeMenuIndex === index ? 'bg-claude-hover' : 'hover:bg-claude-hover'}
+                    ${isActive || activeMenuId === `chat:${chat.id}` ? 'bg-claude-hover' : 'hover:bg-claude-hover'}
                   `}
                   style={{
                     paddingTop: `${tunerConfig?.recentsItemPy || 6}px`,
@@ -665,7 +992,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
                     paddingRight: `${tunerConfig?.recentsPl || 12}px`
                   }}
                 >
-                  {/* Streaming indicator — single breathing dot */}
+                  {/* Streaming indicator */}
                   {streamingIds.has(chat.id) && (
                     <span
                       className="flex-shrink-0 mr-2 w-[7px] h-[7px] rounded-full bg-neutral-700 dark:bg-neutral-300 animate-pulse"
@@ -689,10 +1016,10 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
                   {/* Three Dots Button */}
                   <button
-                    onClick={(e) => handleMenuClick(e, index)}
+                    onClick={(e) => handleMenuClick(e, chat.id)}
                     className={`
                       absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded text-claude-textSecondary hover:text-claude-text transition-all
-                      ${activeMenuIndex === index ? 'opacity-100 block' : 'opacity-0 group-hover:opacity-100 hidden group-hover:block'}
+                      ${activeMenuId === `chat:${chat.id}` ? 'opacity-100 block' : 'opacity-0 group-hover:opacity-100 hidden group-hover:block'}
                     `}
                   >
                     <IconDotsHorizontal size={16} />
@@ -715,9 +1042,6 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
               </button>
             )}
           </div>
-
-            </>
-          )}
 
         </div>
 
@@ -941,7 +1265,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
 
       {/* Fixed Context Menu Portal */}
       {
-        activeMenuIndex !== null && menuPosition && chats[activeMenuIndex] && (
+        activeMenuId !== null && menuPosition && activeMenuId.startsWith('chat:') && chats.find(c => c.id === activeMenuId.slice(5)) && (
           <div
             ref={menuRef}
             className="fixed z-50 bg-claude-input border border-claude-border rounded-xl shadow-[0_4px_12px_rgba(0,0,0,0.08)] py-1.5 flex flex-col w-[200px]"
@@ -955,7 +1279,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
               <span className="text-[13px] text-claude-text">{t('sidebar.star')}</span>
             </button>
             <button
-              onClick={(e) => handleRenameClick(e, activeMenuIndex as number)}
+              onClick={(e) => handleRenameClick(e, activeMenuId.slice(5))}
               className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
             >
               <IconPencil size={16} className="text-claude-textSecondary group-hover:text-claude-text" />
@@ -963,7 +1287,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             </button>
             <div className="h-[1px] bg-claude-border my-1 mx-3" />
             <button
-              onClick={(e) => handleDeleteChat(chats[activeMenuIndex].id, e)}
+              onClick={(e) => handleDeleteChat(activeMenuId.slice(5), e)}
               className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
             >
               <IconTrash size={16} className="text-[#B9382C]" />
@@ -971,6 +1295,41 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             </button>
           </div>
         )
+      }
+
+      {/* Project Card Context Menu Portal */}
+      {
+        activeMenuId !== null && menuPosition && activeMenuId.startsWith('project:') && (() => {
+          const projectId = activeMenuId.slice(8);
+          const project = projects.find((p: any) => p.id === projectId);
+          if (!project) return null;
+          return (
+            <div
+              ref={menuRef}
+              className="fixed z-50 bg-claude-input border border-claude-border rounded-xl shadow-[0_4px_12px_rgba(0,0,0,0.08)] py-1.5 flex flex-col w-[220px]"
+              style={{
+                top: `${menuPosition.top}px`,
+                left: `${menuPosition.left}px`
+              }}
+            >
+              <button
+                onClick={() => handleOpenProjectFolder(project)}
+                className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
+              >
+                <IconDirectory size={16} className="text-claude-textSecondary group-hover:text-claude-text" />
+                <span className="text-[13px] text-claude-text">在资源管理器打开</span>
+              </button>
+              <div className="h-[1px] bg-claude-border my-1 mx-3" />
+              <button
+                onClick={() => handleDeleteProjectCard(project)}
+                className="flex items-center gap-3 px-3 py-2 hover:bg-claude-hover text-left w-full transition-colors group"
+              >
+                <IconTrash size={16} className="text-[#B9382C]" />
+                <span className="text-[13px] text-[#B9382C]">删除项目</span>
+              </button>
+            </div>
+          );
+        })()
       }
 
       {/* Fixed Layout Tuner (Removed) */}

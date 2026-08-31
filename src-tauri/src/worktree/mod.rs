@@ -295,4 +295,109 @@ impl WorktreeManager {
 
         Ok(parsed)
     }
+
+    /// Spawn an agent in an isolated worktree with a task from the TaskStore.
+    ///
+    /// This is the primary integration point for multi-agent workflows:
+    /// 1. Creates a new git worktree for isolation
+    /// 2. Registers the agent with its assigned task
+    /// 3. Returns (worktree_path, agent_id) for the orchestrator to use
+    pub async fn spawn_isolated_agent(
+        &self,
+        agent_name: &str,
+        task_title: &str,
+        task_description: &str,
+        model: &str,
+        branch_prefix: Option<&str>,
+    ) -> Result<(String, String, String)> {
+        let req = CreateWorktreeRequest {
+            branch_prefix: branch_prefix.map(|s| s.to_string()),
+            agent_name: Some(agent_name.to_string()),
+            task: Some(task_description.to_string()),
+            model: Some(model.to_string()),
+        };
+
+        let worktree = self.create_worktree(req).await?;
+        let agent_id = worktree.agent_id.clone().unwrap_or_default();
+
+        tracing::info!(target: "worktree",
+            "Spawned isolated agent '{}' (id: {}) in worktree '{}' (branch: {})",
+            agent_name, agent_id, worktree.id, worktree.branch);
+
+        Ok((worktree.path.clone(), agent_id, worktree.id))
+    }
+
+    /// Complete an agent's work: update status, store result, and optionally
+    /// clean up the worktree.
+    pub async fn complete_agent_work(
+        &self,
+        agent_id: &str,
+        result: &str,
+        auto_cleanup: bool,
+    ) -> Result<()> {
+        self.set_agent_result(agent_id, result.to_string()).await?;
+
+        if auto_cleanup {
+            // Find and remove the agent's worktree
+            let agents = self.agents.lock().await;
+            if let Some(agent) = agents.get(agent_id) {
+                let worktree_id = agent.worktree_id.clone();
+                drop(agents);
+                let _ = self.remove_worktree(&worktree_id).await;
+                tracing::info!(target: "worktree",
+                    "Cleaned up worktree for agent '{}'", agent_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the worktree path for a specific agent.
+    pub async fn get_agent_worktree_path(&self, agent_id: &str) -> Option<String> {
+        let agents = self.agents.lock().await;
+        if let Some(agent) = agents.get(agent_id) {
+            let worktrees = self.worktrees.lock().await;
+            worktrees.get(&agent.worktree_id).map(|wt| wt.path.clone())
+        } else {
+            None
+        }
+    }
+
+    /// List all active worktrees with their associated agents.
+    pub async fn list_active_workspaces(&self) -> Vec<(WorktreeInfo, Option<AgentInfo>)> {
+        let worktrees = self.worktrees.lock().await;
+        let agents = self.agents.lock().await;
+
+        worktrees.values()
+            .filter(|wt| wt.status == WorktreeStatus::Active)
+            .map(|wt| {
+                let agent = wt.agent_id.as_ref()
+                    .and_then(|aid| agents.get(aid).cloned());
+                (wt.clone(), agent)
+            })
+            .collect()
+    }
+
+    /// Clean up all idle/removed worktrees.
+    pub async fn cleanup_idle_worktrees(&self) -> Result<usize> {
+        let idle_ids: Vec<String> = {
+            let worktrees = self.worktrees.lock().await;
+            worktrees.values()
+                .filter(|wt| wt.status == WorktreeStatus::Idle || wt.status == WorktreeStatus::Removed)
+                .map(|wt| wt.id.clone())
+                .collect()
+        };
+
+        let mut cleaned = 0;
+        for id in idle_ids {
+            if self.remove_worktree(&id).await.is_ok() {
+                cleaned += 1;
+            }
+        }
+
+        if cleaned > 0 {
+            tracing::info!(target: "worktree", "Cleaned up {} idle worktrees", cleaned);
+        }
+        Ok(cleaned)
+    }
 }

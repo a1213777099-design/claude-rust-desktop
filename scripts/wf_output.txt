@@ -1,0 +1,8 @@
+Status: 200
+[workflow_start] : MetaGPT workflow started
+[task_started] ProductManager: Product Manager: started
+[task_completed] ProductManager: Product Manager: completed
+[workflow_completed] : MetaGPT workflow completed in 227195ms
+DATA: {"duration_ms": 227195, "roles_completed": 1, "rounds": 2}
+
+Total events: 4

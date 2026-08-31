@@ -240,7 +240,7 @@ impl MultiAgentOrchestrator {
                     content: AnthropicContent::Text(user_message.to_string()),
                 }];
                 let response = client
-                    .send_message(provider, messages, Some(system_prompt), vec![], 4096)
+                    .send_message(provider, messages, Some(system_prompt), vec![], 4096, None, false)
                     .await?;
                 let text = response
                     .content
@@ -265,7 +265,7 @@ impl MultiAgentOrchestrator {
                     reasoning_content: None,
                 }];
                 let response = client
-                    .send_message(provider, messages, Some(system_prompt), vec![], 4096)
+                    .send_message(provider, messages, Some(system_prompt), vec![], 4096, None, false)
                     .await?;
                 let text = response
                     .choices
@@ -321,13 +321,13 @@ Guidelines:
                         Ok(plan)
                     }
                     Err(e) => {
-                        eprintln!("[MultiAgent] Failed to parse LLM plan response: {}, raw: {}", e, json_str);
+                        tracing::error!(target: "multiagent", "Failed to parse LLM plan response: {}, raw: {}", e, json_str);
                         Ok(fallback_plan(query))
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[MultiAgent] LLM call for research plan failed: {}", e);
+                tracing::info!(target: "multiagent", "LLM call for research plan failed: {}", e);
                 Ok(fallback_plan(query))
             }
         }
@@ -390,7 +390,7 @@ Guidelines:
                             role: "user".to_string(),
                             content: crate::native_engine::anthropic_client::AnthropicContent::Text(user_message),
                         }];
-                        match client.send_message(&provider, messages, Some(system_prompt), vec![], max_tokens).await {
+                        match client.send_message(&provider, messages, Some(system_prompt), vec![], max_tokens, None, false).await {
                             Ok(response) => {
                                 let text = response.content.iter().filter_map(|block| match block {
                                     crate::native_engine::anthropic_client::ContentBlock::Text { text } => Some(text.clone()),
@@ -410,7 +410,7 @@ Guidelines:
                             tool_call_id: None,
                             reasoning_content: None,
                         }];
-                        match client.send_message(&provider, messages, Some(system_prompt), vec![], max_tokens).await {
+                        match client.send_message(&provider, messages, Some(system_prompt), vec![], max_tokens, None, false).await {
                             Ok(response) => {
                                 let text = response.choices.first().map(|c| match &c.message.content {
                                     crate::native_engine::openai_client::OpenAIContent::Text(t) => t.clone(),
@@ -534,7 +534,7 @@ Write in professional, clear markdown format."#;
                 }];
                 let max_tokens = provider.model.max_tokens.unwrap_or(8192);
                 let mut stream = client
-                    .send_message_stream(provider, messages, Some(system_prompt), vec![], max_tokens)
+                    .send_message_stream(provider, messages, Some(system_prompt), vec![], max_tokens, None, false)
                     .await?;
 
                 let mut report = String::new();
@@ -544,7 +544,7 @@ Write in professional, clear markdown format."#;
                     let chunk = match chunk_result {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("[MultiAgent] Stream error in synthesize: {}", e);
+                            tracing::error!(target: "multiagent", "Stream error in synthesize: {}", e);
                             break;
                         }
                     };
@@ -594,7 +594,7 @@ Write in professional, clear markdown format."#;
                 }];
                 let max_tokens = provider.model.max_tokens.unwrap_or(8192);
                 let mut stream = client
-                    .send_message_stream(provider, messages, Some(system_prompt), vec![], max_tokens)
+                    .send_message_stream(provider, messages, Some(system_prompt), vec![], max_tokens, None, false)
                     .await?;
 
                 let mut report = String::new();
@@ -604,7 +604,7 @@ Write in professional, clear markdown format."#;
                     let chunk = match chunk_result {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("[MultiAgent] Stream error in synthesize: {}", e);
+                            tracing::error!(target: "multiagent", "Stream error in synthesize: {}", e);
                             break;
                         }
                     };

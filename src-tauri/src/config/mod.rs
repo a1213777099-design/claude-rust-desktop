@@ -55,6 +55,8 @@ pub struct ProviderConfig {
     pub web_search_tested_at: Option<u64>,
     #[serde(default)]
     pub web_search_test_reason: Option<String>,
+    #[serde(default)]
+    pub api_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +252,7 @@ impl AppConfig {
                 web_search_strategy: None,
                 web_search_tested_at: None,
                 web_search_test_reason: None,
+                api_format: None,
             },
             ProviderConfig {
                 id: "deepseek".to_string(),
@@ -290,6 +293,7 @@ impl AppConfig {
                 web_search_strategy: None,
                 web_search_tested_at: None,
                 web_search_test_reason: None,
+                api_format: None,
             },
             ProviderConfig {
                 id: "openai".to_string(),
@@ -330,6 +334,7 @@ impl AppConfig {
                 web_search_strategy: None,
                 web_search_tested_at: None,
                 web_search_test_reason: None,
+                api_format: None,
             },
         ]
     }
@@ -348,7 +353,7 @@ impl ConfigManager {
             config: AppConfig::default(),
         };
         if let Err(e) = mgr.load() {
-            eprintln!("[ConfigManager] Failed to load config: {}", e);
+            tracing::error!(target: "configmanager", "Failed to load config: {}", e);
         }
         mgr
     }
@@ -393,6 +398,17 @@ impl ConfigManager {
 
     pub fn get_default_provider(&self) -> Option<&ProviderConfig> {
         self.config.providers.iter().find(|p| p.is_default)
+    }
+
+    pub fn get_first_enabled_provider_with_models(&self) -> Option<&ProviderConfig> {
+        self.config.providers.iter().find(|p| {
+            p.enabled
+                && !p.models.is_empty()
+                && p.api_key.as_ref().map_or(false, |k| {
+                    let trimmed = k.trim();
+                    !trimmed.is_empty() && trimmed != "none"
+                })
+        })
     }
 
     pub fn get_provider_mut(&mut self, id: &str) -> Option<&mut ProviderConfig> {

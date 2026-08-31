@@ -212,7 +212,7 @@ impl ResearchOrchestrator {
                         })
                     }
                     Err(e) => {
-                        eprintln!("[Research] Sub-agent {} failed: {}", sub_agent_id, e);
+                        tracing::info!(target: "research", "Sub-agent {} failed: {}", sub_agent_id, e);
                         let _ = event_tx_clone.send(ResearchEvent::ResearchSubagentDone {
                             sub_agent_id: sub_agent_id.clone(),
                             sources_count: 0,

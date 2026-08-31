@@ -89,6 +89,7 @@ export interface ConversationInfo {
   title: string | null;
   model: string;
   workspace_path: string;
+  project_id: string | null;
   created_at: string;
   updated_at: string;
 }

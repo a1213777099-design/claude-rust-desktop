@@ -49,7 +49,7 @@ interface PermissionModeSelectorProps {
 
 export default function PermissionModeSelector({ className = '' }: PermissionModeSelectorProps) {
   const { t, language } = useI18n();
-  const permissionMode = useChatStore((s) => s.permissionMode);
+  const permissionMode = useChatStore((s) => s.permissionMode) as PermissionMode;
   const setPermissionMode = useChatStore((s) => s.setPermissionMode);
   const [isOpen, setIsOpen] = useState(false);
   const [showBypassWarning, setShowBypassWarning] = useState(false);

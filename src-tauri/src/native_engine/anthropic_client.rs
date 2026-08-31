@@ -64,11 +64,15 @@ pub struct ImageSource {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AnthropicResponse {
+    #[serde(default)]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub response_type: String,
+    #[serde(default)]
     pub role: String,
+    #[serde(default)]
     pub content: Vec<ContentBlock>,
+    #[serde(default)]
     pub model: String,
     pub stop_reason: Option<String>,
     pub stop_sequence: Option<String>,
@@ -123,9 +127,10 @@ impl AnthropicClient {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
+                .timeout(std::time::Duration::from_secs(90))
+                .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
-                .unwrap_or_else(|e| { eprintln!("[HTTP] Client build failed: {}, using default", e); Client::new() }),
+                .unwrap_or_else(|e| { tracing::warn!(target: "http", "Client build failed: {}, using default", e); Client::new() }),
         }
     }
 
@@ -136,6 +141,8 @@ impl AnthropicClient {
         system_prompt: Option<&str>,
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
+        reasoning_effort: Option<&str>,
+        extended_thinking: bool,
     ) -> Result<AnthropicResponse> {
         let base_url = provider.provider.base_url.trim_end_matches('/');
         let url = if base_url.contains("/v1") {
@@ -152,6 +159,15 @@ impl AnthropicClient {
 
         if let Some(system) = system_prompt {
             body["system"] = json!(system);
+        }
+        if let Some(effort) = reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+        if extended_thinking {
+            // Thinking budget = model's full context window
+            let budget = provider.model.context_window.unwrap_or(200000);
+
+            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
 
         if !tools.is_empty() {
@@ -174,13 +190,17 @@ impl AnthropicClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Anthropic API error {}: {}", status, text);
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let head: String = text.chars().take(300).collect();
+            anyhow::bail!("Anthropic API error {}: {}", status, head);
         }
 
-        let data: AnthropicResponse = response.json().await?;
+        let data: AnthropicResponse = serde_json::from_str(&text).map_err(|e| {
+            let head: String = text.chars().take(300).collect();
+            anyhow::anyhow!("Anthropic response parse error ({}): body head: {}", e, head)
+        })?;
         Ok(data)
     }
 
@@ -191,6 +211,8 @@ impl AnthropicClient {
         system_prompt: Option<&str>,
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
+        reasoning_effort: Option<&str>,
+        extended_thinking: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
         let base_url = provider.provider.base_url.trim_end_matches('/');
         let url = if base_url.contains("/v1") {
@@ -208,6 +230,15 @@ impl AnthropicClient {
 
         if let Some(system) = system_prompt {
             body["system"] = json!(system);
+        }
+        if let Some(effort) = reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+        if extended_thinking {
+            // Thinking budget = model's full context window
+            let budget = provider.model.context_window.unwrap_or(200000);
+
+            body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
         }
 
         if !tools.is_empty() {

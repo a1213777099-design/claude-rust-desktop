@@ -133,6 +133,13 @@ pub fn update_project(
 }
 
 pub fn delete_project(conn: &Connection, id: &str) -> Result<()> {
+    // 1) Cascade delete: remove all messages in conversations belonging to this project
+    //    (the messages table has ON DELETE CASCADE on conversation_id, so we just need
+    //    to delete the conversations themselves, and the DB will handle messages/tool_calls/attachments)
+    let mut conv_stmt = conn.prepare_cached("DELETE FROM conversations WHERE project_id = ?1")?;
+    conv_stmt.execute(params![id])?;
+
+    // 2) Delete the project itself
     let mut stmt = conn.prepare_cached("DELETE FROM projects WHERE id = ?1")?;
     stmt.execute(params![id])?;
     Ok(())

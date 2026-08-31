@@ -358,21 +358,11 @@ pub fn try_parse_tool_input(tool_name: &str, raw_args: &str) -> Value {
     }
 
     if let Some(recovered) = recover_malformed_tool_input(tool_name, raw_args) {
-        eprintln!(
-            "[SSE] Recovered malformed tool input for '{}' ({} bytes → {} fields)",
-            tool_name,
-            raw_args.len(),
-            recovered.as_object().map(|m| m.len()).unwrap_or(0)
-        );
+        tracing::warn!(target: "sse", "Recovered malformed tool input for '{}' ({} bytes -> {} fields)", tool_name, raw_args.len(), recovered.as_object().map(|m| m.len()).unwrap_or(0));
         return recovered;
     }
 
-    eprintln!(
-        "[SSE] Failed to parse tool input for '{}' ({} bytes), preview: {}",
-        tool_name,
-        raw_args.len(),
-        &raw_args[..raw_args.len().min(200)]
-    );
+    tracing::error!(target: "sse", "Failed to parse tool input for '{}' ({} bytes), preview: {}", tool_name, raw_args.len(), &raw_args[..raw_args.len().min(200)]);
     serde_json::json!({})
 }
 

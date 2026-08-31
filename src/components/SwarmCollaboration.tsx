@@ -1,780 +1,846 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  Brain,
-  Users,
-  Zap,
-  Loader2,
-  CheckCircle2,
-  XCircle,
-  Clock,
-  ArrowRight,
-  Split,
-  GitBranch,
-  Activity,
-  Target,
-  Sparkles,
-  ChevronDown,
-  ChevronUp,
-  Play,
-  Pause,
-  StopCircle
+  Brain, Users, Zap, Loader2, CheckCircle2, XCircle, Clock,
+  ArrowRight, GitBranch, Activity, Target, Sparkles, Send, FolderOpen,
+  Bot, Square, RotateCcw, ChevronRight, Plus, Trash2, MessageSquare, Pencil, Terminal, AlertTriangle,
 } from 'lucide-react';
+import { workflowEventStream, WorkflowEvent, swarmCreateSession, swarmListSessions, swarmGetMessages, swarmAddMessage, swarmUpdateStatus, swarmDeleteSession, swarmRenameSession, getUserModels, getProviderModels, type SwarmSession, type SwarmMessage } from '../api';
 
-export interface SwarmAgent {
+// ─── 类型定义 ────────────────────────────────────────────────────────────────
+interface AgentInfo {
   id: string;
   name: string;
   role: string;
-  state: 'idle' | 'planning' | 'executing' | 'synthesizing' | 'completed' | 'failed';
-  progress: number;
-  assignedTask?: string;
-  color: string;
   icon: string;
-  durationMs: number;
-  tokensUsed: number;
-}
-
-export interface SubTask {
-  id: string;
-  description: string;
-  agentId?: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'failed';
-  progress: number;
-  dependencies: string[];
+  color: string;
+  status: 'idle' | 'working' | 'completed' | 'failed';
   output?: string;
 }
 
-export interface SwarmSession {
+interface ChatMessage {
   id: string;
-  task: string;
-  complexity: number;
-  agents: SwarmAgent[];
-  subTasks: SubTask[];
-  status: 'analyzing' | 'planning' | 'running' | 'paused' | 'completed' | 'failed';
-  startTime: number;
-  endTime?: number;
-  totalDuration: number;
+  role: 'system' | 'agent';
+  content: string;
+  agentName?: string;
+  agentIcon?: string;
+  agentColor?: string;
+  type?: string;
+  meta?: {
+    phase?: string;
+    tool?: string;
+    status?: 'running' | 'done';
+    iteration?: number;
+    elapsed_s?: number;
+    chars?: number;
+    agentRole?: string;
+  };
+  timestamp: number;
 }
 
-const AGENT_ROLES = [
-  { role: '规划师', icon: '🎯', color: '#3B82F6' },
-  { role: '研究员', icon: '🔍', color: '#8B5CF6' },
-  { role: '开发者', icon: '💻', color: '#10B981' },
-  { role: '审核员', icon: '🔎', color: '#F59E0B' },
-  { role: '写作员', icon: '✍️', color: '#EC4899' },
-  { role: '架构师', icon: '🏗️', color: '#06B6D4' },
-  { role: '分析师', icon: '📊', color: '#F97316' },
-  { role: '设计师', icon: '🎨', color: '#A855F7' },
+const META_AGENTS: AgentInfo[] = [
+  { id: 'pm', name: '产品经理', role: 'ProductManager', icon: '\u{1F4CB}', color: '#3B82F6', status: 'idle' },
+  { id: 'architect', name: '架构师', role: 'Architect', icon: '\u{1F3D7}', color: '#8B5CF6', status: 'idle' },
+  { id: 'engineer', name: '工程师', role: 'Engineer', icon: '\u{1F4BB}', color: '#10B981', status: 'idle' },
+  { id: 'reviewer', name: '审查员', role: 'Reviewer', icon: '\u{1F50D}', color: '#F59E0B', status: 'idle' },
+  { id: 'qa', name: '测试工程师', role: 'QaEngineer', icon: '\u{1F9EA}', color: '#EF4444', status: 'idle' },
+  { id: 'devops', name: '运维工程师', role: 'DevOps', icon: '\u{1F680}', color: '#06B6D4', status: 'idle' },
+  { id: 'projmgr', name: '项目经理', role: 'ProjectManager', icon: '\u{1F4CA}', color: '#EC4899', status: 'idle' },
 ];
 
-const COMPLEXITY_THRESHOLD = 7;
-
-function generateAgentId(role: string, index: number): string {
-  return `${role.toLowerCase()}_${index}`;
-}
-
-function analyzeComplexity(task: string): number {
-  let score = 0;
-  const length = task.length;
-  if (length > 100) score += 2;
-  else if (length > 50) score += 1;
-
-  const complexKeywords = ['implement', 'build', 'create', 'design', 'architecture', 'refactor', 'optimize', 'integrate', 'deploy', 'migrate', 'system', 'pipeline', 'workflow', 'automation'];
-  const lowerTask = task.toLowerCase();
-  for (const keyword of complexKeywords) {
-    if (lowerTask.includes(keyword)) score += 1;
-  }
-
-  const questionMarks = (task.match(/\?/g) || []).length;
-  score += Math.min(questionMarks, 3);
-
-  const andCount = (task.match(/\band\b/gi) || []).length;
-  const plusCount = (task.match(/\+/g) || []).length;
-  score += Math.min(andCount + plusCount, 4);
-
-  return Math.min(score, 10);
-}
-
-function splitTask(task: string, complexity: number): SubTask[] {
-  const subTasks: SubTask[] = [];
-  const baseId = `task_${Date.now()}`;
-
-  subTasks.push({
-    id: `${baseId}_plan`,
-    description: '分析需求并制定执行计划',
-    status: 'pending' as const,
-    progress: 0,
-    dependencies: [],
-  });
-
-  if (complexity >= 5) {
-    subTasks.push({
-      id: `${baseId}_research`,
-      description: '研究并收集任务相关信息',
-      status: 'pending' as const,
-      progress: 0,
-      dependencies: [`${baseId}_plan`],
-    });
-  }
-
-  subTasks.push({
-    id: `${baseId}_implement`,
-    description: '根据计划实施核心解决方案',
-    status: 'pending' as const,
-    progress: 0,
-    dependencies: complexity >= 5 ? [`${baseId}_plan`, `${baseId}_research`] : [`${baseId}_plan`],
-  });
-
-  if (complexity >= 6) {
-    subTasks.push({
-      id: `${baseId}_test`,
-      description: '测试和验证实施结果',
-      status: 'pending' as const,
-      progress: 0,
-      dependencies: [`${baseId}_implement`],
-    });
-  }
-
-  subTasks.push({
-    id: `${baseId}_review`,
-    description: '审查并完善最终输出',
-    status: 'pending' as const,
-    progress: 0,
-    dependencies: complexity >= 6 ? [`${baseId}_test`] : [`${baseId}_implement`],
-  });
-
-  if (complexity >= 8) {
-    subTasks.push({
-      id: `${baseId}_optimize`,
-      description: '优化性能和边界情况',
-      status: 'pending' as const,
-      progress: 0,
-      dependencies: [`${baseId}_review`],
-    });
-  }
-
-  return subTasks;
-}
-
-function assignAgents(subTasks: SubTask[], complexity: number): SwarmAgent[] {
-  const agentCount = Math.min(Math.max(complexity, 3), AGENT_ROLES.length);
-  const agents: SwarmAgent[] = [];
-
-  for (let i = 0; i < agentCount; i++) {
-    const roleConfig = AGENT_ROLES[i % AGENT_ROLES.length];
-    agents.push({
-      id: generateAgentId(roleConfig.role, i),
-      name: `${roleConfig.role} #${i + 1}`,
-      role: roleConfig.role,
-      state: 'idle' as const,
-      progress: 0,
-      color: roleConfig.color,
-      icon: roleConfig.icon,
-      durationMs: 0,
-      tokensUsed: 0,
-    });
-  }
-
-  for (let i = 0; i < subTasks.length; i++) {
-    const agentIndex = i % agentCount;
-    subTasks[i].agentId = agents[agentIndex].id;
-  }
-
-  return agents;
-}
-
-const AgentNode: React.FC<{ agent: SwarmAgent; isExpanded: boolean }> = ({ agent, isExpanded }) => {
-  const stateColors: Record<string, string> = {
-    idle: 'bg-gray-500',
-    planning: 'bg-blue-500',
-    executing: 'bg-green-500',
-    synthesizing: 'bg-purple-500',
-    completed: 'bg-emerald-500',
-    failed: 'bg-red-500',
-  };
-
-  const stateLabels: Record<string, string> = {
-    idle: '空闲',
-    planning: '规划中',
-    executing: '执行中',
-    synthesizing: '整合中',
-    completed: '已完成',
-    failed: '失败',
-  };
-
-  return (
-    <div
-      className="relative rounded-xl border transition-all duration-300 overflow-hidden"
-      style={{
-        borderColor: `${agent.color}40`,
-        backgroundColor: `${agent.color}08`,
-      }}
-    >
-      <div className="p-3">
-        <div className="flex items-center gap-2">
-          <span className="text-lg">{agent.icon}</span>
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-[13px] font-medium text-claude-text truncate">
-                {agent.name}
-              </span>
-              <span className={`w-2 h-2 rounded-full ${stateColors[agent.state]} ${agent.state === 'executing' ? 'animate-pulse' : ''}`} />
-            </div>
-            <div className="text-[11px] text-claude-textSecondary mt-0.5">
-              {stateLabels[agent.state]}
-            </div>
-          </div>
-        </div>
-
-        {agent.assignedTask && (
-          <div className="mt-2 px-2 py-1 rounded bg-black/10 dark:bg-white/5">
-            <div className="text-[11px] text-claude-textSecondary truncate">
-              {agent.assignedTask}
-            </div>
-          </div>
-        )}
-
-        {agent.state !== 'idle' && agent.state !== 'completed' && agent.state !== 'failed' && (
-          <div className="mt-2">
-            <div className="h-1 rounded-full bg-claude-border overflow-hidden">
-              <div
-                className="h-full rounded-full transition-all duration-500"
-                style={{ width: `${agent.progress}%`, backgroundColor: agent.color }}
-              />
-            </div>
-            <div className="text-[10px] text-claude-textSecondary mt-1 text-right">
-              {Math.round(agent.progress)}%
-            </div>
-          </div>
-        )}
-
-        {isExpanded && (
-          <div className="mt-2 pt-2 border-t border-claude-border/50">
-            <div className="grid grid-cols-2 gap-2 text-[11px]">
-              <div className="text-claude-textSecondary">
-                <span className="text-claude-text">耗时</span>
-                <div>{agent.durationMs > 0 ? `${(agent.durationMs / 1000).toFixed(1)}秒` : '-'}</div>
-              </div>
-              <div className="text-claude-textSecondary">
-                <span className="text-claude-text">令牌</span>
-                <div>{agent.tokensUsed > 0 ? agent.tokensUsed.toLocaleString() : '-'}</div>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
-
-const TaskNode: React.FC<{ task: SubTask; agents: SwarmAgent[] }> = ({ task, agents }) => {
-  const statusIcons: Record<string, React.ReactNode> = {
-    pending: <Clock size={12} className="text-gray-400" />,
-    in_progress: <Loader2 size={12} className="text-blue-400 animate-spin" />,
-    completed: <CheckCircle2 size={12} className="text-emerald-400" />,
-    failed: <XCircle size={12} className="text-red-400" />,
-  };
-
-  const assignedAgent = task.agentId ? agents.find(a => a.id === task.agentId) : null;
-
-  return (
-    <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-claude-hover/50">
-      {statusIcons[task.status]}
-      <div className="flex-1 min-w-0">
-        <div className="text-[12px] text-claude-text truncate">{task.description}</div>
-        {assignedAgent && (
-          <div className="text-[10px] text-claude-textSecondary mt-0.5 flex items-center gap-1">
-            <span>{assignedAgent.icon}</span>
-            <span>{assignedAgent.name}</span>
-          </div>
-        )}
-      </div>
-      {task.dependencies.length > 0 && (
-        <div className="flex items-center gap-1">
-          <GitBranch size={10} className="text-claude-textSecondary" />
-          <span className="text-[10px] text-claude-textSecondary">{task.dependencies.length}</span>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const SwarmVisualization: React.FC<{ agents: SwarmAgent[] }> = ({ agents }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const animationRef = useRef<number | undefined>(undefined);
-  const particlesRef = useRef<Array<{ x: number; y: number; vx: number; vy: number; targetX: number; targetY: number; color: string; life: number }>>([]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const resize = () => {
-      const rect = canvas.parentElement?.getBoundingClientRect();
-      if (rect) {
-        canvas.width = rect.width;
-        canvas.height = rect.height;
-      }
-    };
-    resize();
-    window.addEventListener('resize', resize);
-
-    const activeAgents = agents.filter(a => a.state === 'executing' || a.state === 'planning' || a.state === 'synthesizing');
-
-    particlesRef.current = activeAgents.map(agent => {
-      const angle = Math.random() * Math.PI * 2;
-      const radius = 30 + Math.random() * 50;
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
-      return {
-        x: cx + Math.cos(angle) * radius,
-        y: cy + Math.sin(angle) * radius,
-        vx: (Math.random() - 0.5) * 0.5,
-        vy: (Math.random() - 0.5) * 0.5,
-        targetX: cx + Math.cos(angle) * radius,
-        targetY: cy + Math.sin(angle) * radius,
-        color: agent.color,
-        life: 1,
-      };
-    });
-
-    const animate = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
-
-      for (const p of particlesRef.current) {
-        p.x += p.vx + (p.targetX - p.x) * 0.02;
-        p.y += p.vy + (p.targetY - p.y) * 0.02;
-        p.vx += (Math.random() - 0.5) * 0.1;
-        p.vy += (Math.random() - 0.5) * 0.1;
-        p.vx *= 0.95;
-        p.vy *= 0.95;
-
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
-        ctx.fillStyle = p.color + '80';
-        ctx.fill();
-
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y);
-        ctx.lineTo(cx, cy);
-        ctx.strokeStyle = p.color + '20';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-
-      ctx.beginPath();
-      ctx.arc(cx, cy, 8, 0, Math.PI * 2);
-      ctx.fillStyle = '#3B82F6';
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(cx, cy, 12, 0, Math.PI * 2);
-      ctx.strokeStyle = '#3B82F640';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      animationRef.current = requestAnimationFrame(animate);
-    };
-
-    animate();
-
-    return () => {
-      window.removeEventListener('resize', resize);
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    };
-  }, [agents]);
-
-  return (
-    <canvas
-      ref={canvasRef}
-      className="w-full h-32 rounded-lg"
-      style={{ backgroundColor: 'transparent' }}
-    />
-  );
-};
-
+// ─── 主组件 ──────────────────────────────────────────────────────────────────
 const SwarmCollaboration: React.FC = () => {
   const [inputTask, setInputTask] = useState('');
-  const [session, setSession] = useState<SwarmSession | null>(null);
+  const [agents, setAgents] = useState<AgentInfo[]>(META_AGENTS.map(a => ({ ...a })));
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [isRunning, setIsRunning] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set());
-  const [showVisualization, setShowVisualization] = useState(true);
-  const [isPaused, setIsPaused] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-
-  const handleAnalyzeTask = useCallback(async () => {
-    if (!inputTask.trim()) return;
-
-    console.log('[Swarm] ========== Task Analysis Start ==========');
-    console.log('[Swarm] Input task:', inputTask);
-    setIsAnalyzing(true);
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    const complexity = analyzeComplexity(inputTask);
-    console.log('[Swarm] Complexity analysis result:', complexity);
-    console.log('[Swarm] COMPLEXITY_THRESHOLD:', COMPLEXITY_THRESHOLD);
-    console.log('[Swarm] Will use swarm mode:', complexity >= COMPLEXITY_THRESHOLD);
-    const isComplex = complexity >= COMPLEXITY_THRESHOLD;
-
-    const subTasks: SubTask[] = isComplex ? splitTask(inputTask, complexity) : [{
-      id: `task_${Date.now()}`,
-      description: inputTask,
-      status: 'pending' as const,
-      progress: 0,
-      dependencies: [],
-    }];
-
-    console.log('[Swarm] Sub-tasks generated:', subTasks.length);
-    subTasks.forEach((st, i) => {
-      console.log(`[Swarm]   Sub-task [${i}]: ${st.description} (deps: ${st.dependencies.join(', ') || 'none'})`);
-    });
-
-    const agents: SwarmAgent[] = isComplex ? assignAgents(subTasks, complexity) : [{
-      id: 'single_agent',
-      name: '单一智能体',
-      role: '通用',
-      state: 'idle' as const,
-      progress: 0,
-      color: '#3B82F6',
-      icon: '🤖',
-      durationMs: 0,
-      tokensUsed: 0,
-    }];
-
-    console.log('[Swarm] Agents assigned:', agents.length);
-    agents.forEach((agent, i) => {
-      console.log(`[Swarm]   Agent [${i}]: ${agent.name} (${agent.role}) - color: ${agent.color}`);
-    });
-
-    const newSession: SwarmSession = {
-      id: `session_${Date.now()}`,
-      task: inputTask,
-      complexity,
-      agents,
-      subTasks,
-      status: 'planning',
-      startTime: Date.now(),
-      totalDuration: 0,
-    };
-
-    console.log('[Swarm] Session created:', newSession.id);
-    console.log('[Swarm] ========== Task Analysis Complete ==========');
-    setSession(newSession);
-    setIsAnalyzing(false);
-  }, [inputTask]);
-
-  const handleStartSwarm = useCallback(async () => {
-    if (!session) return;
-
-    setSession(prev => prev ? { ...prev, status: 'running' } : null);
-
-    const updatedAgents = session.agents.map((agent, i) => {
-      const assignedTask = session.subTasks[i]?.description;
-      return { ...agent, state: 'planning' as const, assignedTask };
-    });
-
-    setSession(prev => prev ? { ...prev, agents: updatedAgents } : null);
-
-    intervalRef.current = setInterval(() => {
-      setSession(prev => {
-        if (!prev || prev.status !== 'running') return prev;
-
-        let newSubTasks = [...prev.subTasks];
-        const newAgents = prev.agents.map((agent) => {
-          if (agent.state === 'completed' || agent.state === 'failed') return agent;
-
-          let newState: SwarmAgent['state'] = agent.state;
-          let newProgress = agent.progress + Math.random() * 15;
-
-          if (agent.state === 'planning' && newProgress >= 100) {
-            newState = 'executing';
-            newProgress = 0;
-          } else if (agent.state === 'executing' && newProgress >= 100) {
-            newState = 'completed';
-            newProgress = 100;
-          }
-
-          const subTaskIndex = newSubTasks.findIndex(st => st.agentId === agent.id);
-          if (subTaskIndex >= 0) {
-            const depsMet = newSubTasks[subTaskIndex].dependencies.every(depId =>
-              newSubTasks.find(st => st.id === depId)?.status === 'completed'
-            );
-
-            if (depsMet || subTaskIndex === 0) {
-              if (newState === 'planning' || newState === 'executing') {
-                newSubTasks = newSubTasks.map((st, idx) =>
-                  idx === subTaskIndex ? { ...st, status: 'in_progress' as const, progress: newProgress } : st
-                );
-              } else if (newState === 'completed') {
-                newSubTasks = newSubTasks.map((st, idx) =>
-                  idx === subTaskIndex ? { ...st, status: 'completed' as const, progress: 100 } : st
-                );
-              }
-            }
-          }
-
-          return {
-            ...agent,
-            state: newState,
-            progress: Math.min(newProgress, 100),
-            durationMs: agent.durationMs + 100,
-            tokensUsed: agent.tokensUsed + Math.floor(Math.random() * 50),
-          };
-        });
-
-        const allCompleted = newAgents.every(a => a.state === 'completed' || a.state === 'failed');
-        const newStatus: SwarmSession['status'] = allCompleted ? 'completed' : prev.status;
-
-        return {
-          ...prev,
-          agents: newAgents,
-          subTasks: newSubTasks,
-          status: newStatus,
-          endTime: allCompleted ? Date.now() : undefined,
-          totalDuration: allCompleted ? Date.now() - prev.startTime : prev.totalDuration,
-        };
-      });
-    }, 200);
-  }, [session]);
-
-  const handlePauseSwarm = useCallback(() => {
-    setIsPaused(prev => !prev);
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = undefined;
-    }
-    if (!isPaused) {
-      handleStartSwarm();
-    }
-  }, [isPaused, handleStartSwarm]);
-
-  const handleStopSwarm = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = undefined;
-    }
-    setSession(prev => prev ? { ...prev, status: 'completed' as const } : null);
-    setIsPaused(false);
-  }, []);
+  const abortRef = useRef(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<string>(() => localStorage.getItem('metagpt_workspace') || '');
+  // 协作工作流使用的模型
+  const [modelOptions, setModelOptions] = useState<{ id: string; name: string }[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>(() => localStorage.getItem('swarm_model') || '');
 
   useEffect(() => {
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
+    (async () => {
+      try {
+        const data = await getUserModels();
+        const list = [...(data?.common || []), ...(data?.all || [])];
+        const seen = new Set<string>();
+        const opts = list
+          .filter((m: any) => m?.id && !seen.has(m.id) && (seen.add(m.id), true))
+          .map((m: any) => ({ id: m.id, name: m.name || m.id }));
+        if (opts.length > 0) { setModelOptions(opts); return; }
+        // 兜底：本地 provider 模型
+        try {
+          const pModels = await getProviderModels();
+          if (Array.isArray(pModels)) {
+            setModelOptions(pModels.filter((m: any) => m?.id).map((m: any) => ({ id: m.id, name: m.name || m.id })));
+          }
+        } catch {}
+      } catch (e) {
+        console.warn('[Swarm] Failed to load models:', e);
+      }
+    })();
   }, []);
 
-  const toggleAgentExpand = useCallback((agentId: string) => {
-    setExpandedAgents(prev => {
-      const next = new Set(prev);
-      if (next.has(agentId)) next.delete(agentId);
-      else next.add(agentId);
-      return next;
-    });
+  // 工作流暂停（429 等可重试错误）与续跑
+  const [paused, setPaused] = useState<{ failedRole: string; error: string } | null>(null);
+  const completedOutputsRef = useRef<Array<{ name: string; cause_by: string; output: string }>>([]);
+  const lastGoalRef = useRef('');
+
+  // Session persistence state
+  const [sessions, setSessions] = useState<SwarmSession[]>([]);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [loadingSessions, setLoadingSessions] = useState(false);
+  const sessionIdRef = useRef<string | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState('');
+
+  const handleSelectWorkspace = useCallback(async () => {
+    try {
+      const { tauriAPI } = await import('../utils/tauriAPI');
+      const dir = await tauriAPI.selectDirectory();
+      if (dir) {
+        setWorkspace(dir);
+        localStorage.setItem('metagpt_workspace', dir);
+      }
+    } catch (e) {
+      console.warn('[Swarm] Failed to select directory:', e);
+    }
   }, []);
 
-  const completedAgents = session?.agents.filter(a => a.state === 'completed').length || 0;
-  const totalAgents = session?.agents.length || 0;
-  const progressPercent = totalAgents > 0 ? (completedAgents / totalAgents) * 100 : 0;
+  // Load sessions on mount
+
+  const handleSelectSession = useCallback(async (sessionId: string, sessionData?: SwarmSession) => {
+    try {
+      const session = sessionData || sessions.find(s => s.id === sessionId);
+      if (session && session.workspace) {
+        setWorkspace(session.workspace);
+        localStorage.setItem('metagpt_workspace', session.workspace);
+      }
+      const msgs = await swarmGetMessages(sessionId);
+      console.log('[Swarm] Loaded messages:', msgs.length, 'for session', sessionId);
+      setMessages(msgs.map((m: SwarmMessage) => ({
+        id: m.id,
+        role: m.role as 'system' | 'agent',
+        content: m.content,
+        agentName: m.agent_name || undefined,
+        agentIcon: m.agent_icon || undefined,
+        agentColor: m.agent_color || undefined,
+        type: m.type || undefined,
+        timestamp: m.created_at * 1000,
+      })));
+      setCurrentSessionId(sessionId); localStorage.setItem("swarm_current_session", sessionId);
+      sessionIdRef.current = sessionId;
+
+      if (session && session.agent_status) {
+        try {
+          const statusMap = JSON.parse(session.agent_status);
+          setAgents(META_AGENTS.map(a => ({
+            ...a,
+            status: statusMap[a.id] || 'idle',
+          })));
+        } catch(e){console.warn("[Swarm] save failed:",e);}
+      }
+      setIsRunning(false);
+      setInputTask('');
+    } catch (e) {
+      console.warn('[Swarm] Failed to load session:', e);
+    }
+  }, [sessions]);
+
+  const loadSessions = useCallback(async () => {
+    setLoadingSessions(true);
+    try {
+      const list = await swarmListSessions();
+      setSessions(list);
+      if (list.length > 0) {
+        const lastId = localStorage.getItem('swarm_current_session');
+        const toLoad = lastId && list.find(s => s.id === lastId) ? lastId : list[0].id;
+        const sessionObj = list.find(s => s.id === toLoad);
+        handleSelectSession(toLoad, sessionObj);
+      }
+    } catch (e) {
+      console.warn('[Swarm] Failed to load sessions:', e);
+    }
+    setLoadingSessions(false);
+  }, [handleSelectSession]);
+
+  useEffect(() => {
+    loadSessions();
+  }, []);
+
+  // Delete a session
+  const handleDeleteSession = useCallback(async (sessionId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await swarmDeleteSession(sessionId);
+      setSessions(prev => prev.filter(s => s.id !== sessionId));
+      if (currentSessionId === sessionId) {
+        setCurrentSessionId(null);
+        sessionIdRef.current = null;
+        setMessages([]);
+      }
+    } catch (e) {
+      console.warn('[Swarm] Failed to delete session:', e);
+    }
+  }, [currentSessionId]);
+
+  // Auto scroll
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const addMessage = useCallback((msg: Omit<ChatMessage, 'id' | 'timestamp'>) => {
+    setMessages(prev => [...prev, { ...msg, id: 'msg_' + Date.now() + '_' + Math.random(), timestamp: Date.now() }]);
+  }, []);
+
+  const roleToAgent = useCallback((role: string): AgentInfo | undefined => {
+    // 返工轮次（EngineerRework）复用工程师卡片展示
+    const normalized = role === 'EngineerRework' ? 'Engineer' : role;
+    return META_AGENTS.find(a => a.role === normalized || a.name === normalized);
+  }, []);
+
+  // 工作流执行核心：首次启动与暂停后重试续跑共用
+  const runWorkflow = useCallback(async (goal: string, resumeRoles: Array<{ name: string; cause_by: string; output: string }>) => {
+    if (!goal || isRunning) return;
+    setIsRunning(true);
+    setIsAnalyzing(true);
+    abortRef.current = false;
+    setMessages([]);
+    setPaused(null);
+    completedOutputsRef.current = [...resumeRoles];
+    lastGoalRef.current = goal;
+    setAgents(META_AGENTS.map(a => {
+      const resumed = resumeRoles.find(r => r.name === a.role || (a.role === 'Engineer' && r.name === 'EngineerRework'));
+      return resumed
+        ? { ...a, status: 'completed' as const, output: resumed.output }
+        : { ...a, status: 'idle' as const, output: undefined };
+    }));
+
+    // 复用当前会话：已选中会话时直接往里写，不再每次发送都新建会话卡片；
+    // 仅在没有任何选中会话时才自动创建
+    let sessionId: string | null = sessionIdRef.current;
+    if (!sessionId) {
+      try {
+        const sessionResp = await swarmCreateSession(goal.trim().slice(0, 100), workspace || undefined);
+        sessionId = typeof sessionResp === 'object' ? sessionResp.id : sessionResp;
+        console.log('[Swarm] Created session:', sessionId, 'type:', typeof sessionId);
+        setCurrentSessionId(sessionId);
+        localStorage.setItem('swarm_current_session', sessionId);
+        sessionIdRef.current = sessionId;
+      } catch (e) {
+        console.warn('[Swarm] Failed to create session:', e);
+      }
+    }
+
+    // 回放已完成角色的产出卡片，保留上下文
+    for (const r of resumeRoles) {
+      const ag = roleToAgent(r.name);
+      if (ag && r.output) {
+        addMessage({ role: 'agent', agentName: ag.name, agentIcon: ag.icon, agentColor: ag.color, content: r.output, type: 'report' });
+      }
+    }
+
+    addMessage({ role: 'system', content: (resumeRoles.length > 0 ? '\u{1F501} 重试续跑：已完成 ' + resumeRoles.length + ' 个角色，从断点继续...' : '\u{1F680} 正在启动 MetaGPT 智能体团队...'), type: 'start' });
+    if (sessionId) {
+      try {
+        await swarmAddMessage(sessionId, 'system', '\u{1F680} 正在启动 MetaGPT 智能体团队...', undefined, undefined, undefined, 'start');
+      } catch(e){console.warn("[Swarm] save failed:",e);}
+    }
+
+    const agentStatusMap: Record<string, string> = {};
+    for (const r of resumeRoles) {
+      const ag = roleToAgent(r.name);
+      if (ag) agentStatusMap[ag.id] = 'completed';
+    }
+    let wasPaused = false;
+
+    try {
+      for await (const event of workflowEventStream(goal, undefined, selectedModel || undefined, workspace || undefined, resumeRoles.length > 0 ? resumeRoles : undefined)) {
+        if (abortRef.current) break;
+        const et = event.event_type;
+        const role = event.data?.agent_role || '';
+        const agent = roleToAgent(role);
+
+        if (et === 'workflow_start') {
+          setIsAnalyzing(false);
+          const infoMsg = '\u{1F9E0} 主脑已调度 ' + (event.data?.roles || 7) + ' 个智能体开始协作';
+          addMessage({ role: 'system', content: infoMsg, type: 'info' });
+          if (sessionId) {
+            try { await swarmAddMessage(sessionId, 'system', infoMsg, undefined, undefined, undefined, 'info'); } catch(e){console.warn("[Swarm] save failed:",e);}
+          }
+        } else if (et === 'task_started') {
+          if (agent) {
+            setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'working' } : a));
+            agentStatusMap[agent.id] = 'working';
+            const startMsg = agent.icon + ' ' + agent.name + ' 开始工作...';
+            addMessage({ role: 'system', content: startMsg, type: 'progress' });
+            if (sessionId) {
+              try { await swarmAddMessage(sessionId, 'system', startMsg, agent.name, agent.icon, agent.color, 'progress'); } catch(e){console.warn("[Swarm] save failed:",e);}
+            }
+          }
+        } else if (et === 'task_progress') {
+          const phase = event.data?.phase as string | undefined;
+
+          if (phase === 'tool') {
+            // ZCode 风格工具卡：新工具事件把之前的 running 卡标记为完成
+            const toolName = String(event.data?.tool || event.message || 'tool');
+            const activityRole = event.task_id || role || 'workflow';
+            setMessages(prev => [
+              ...prev.map(m => m.meta?.status === 'running' ? { ...m, meta: { ...m.meta, status: 'done' as const } } : m),
+              { id: 'msg_' + Date.now() + '_' + Math.random(), timestamp: Date.now(), role: 'system' as const, content: toolName, type: 'tool', meta: { phase: 'tool', tool: toolName, status: 'running' as const, agentRole: activityRole } },
+            ]);
+            if (sessionId) {
+              try { await swarmAddMessage(sessionId, 'system', toolName, activityRole, agent?.icon, agent?.color, 'tool'); } catch(e){console.warn('[Swarm] save failed:',e);}
+            }
+          } else if (phase === 'thinking' || phase === 'waiting' || phase === 'output' || phase === 'output_done') {
+            // 活动卡：按角色 upsert（心跳 10s 一条，追加会刷屏）
+            const activityRole = event.task_id || role || 'workflow';
+            setMessages(prev => {
+              const marked = prev.map(m => m.meta?.status === 'running' ? { ...m, meta: { ...m.meta, status: 'done' as const } } : m);
+              const filtered = marked.filter(m => !(m.type === 'activity' && m.meta?.agentRole === activityRole));
+              return [...filtered, { id: 'act_' + activityRole, timestamp: Date.now(), role: 'system' as const, content: '', type: 'activity', meta: { phase, agentRole: activityRole, iteration: event.data?.iteration, elapsed_s: event.data?.elapsed_s, chars: event.data?.chars } }];
+            });
+          } else {
+            // 兜底：无结构化 data 的历史/未知事件走原文本样式
+            const progMsg = agent
+              ? '\u2022 ' + agent.icon + ' ' + event.message
+              : '\u2022 ' + event.message;
+            addMessage({ role: 'system', content: progMsg, type: 'progress' });
+            if (sessionId) {
+              try { await swarmAddMessage(sessionId, 'system', progMsg, agent?.name, agent?.icon, agent?.color, 'progress'); } catch(e){console.warn("[Swarm] save failed:",e);}
+            }
+          }
+        } else if (et === 'task_completed') {
+          setMessages(prev => prev.map(m => m.meta?.status === 'running' ? { ...m, meta: { ...m.meta, status: 'done' as const } } : m));
+          let output = '';
+          if (event.data?.output) {
+            output = typeof event.data.output === 'object' ? (event.data.output.output || JSON.stringify(event.data.output, null, 2)) : String(event.data.output);
+          }
+          if (!output) output = event.message || '任务完成';
+          if (event.data?.agent_role && output) {
+            completedOutputsRef.current.push({ name: event.data.agent_role, cause_by: event.data?.cause_by || 'General', output });
+          }
+          if (agent) {
+            setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'completed', output } : a));
+            agentStatusMap[agent.id] = 'completed';
+            addMessage({ role: 'agent', agentName: agent.name, agentIcon: agent.icon, agentColor: agent.color, content: output, type: 'report' });
+            if (sessionId) {
+              try { await swarmAddMessage(sessionId, 'agent', output, agent.name, agent.icon, agent.color, 'report'); } catch(e){console.warn("[Swarm] save failed:",e);}
+            }
+          }
+        } else if (et === 'task_failed') {
+          if (agent) {
+            setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'failed' } : a));
+            agentStatusMap[agent.id] = 'failed';
+            const failMsg = '\u274C 失败: ' + (event.message || '未知错误');
+            addMessage({ role: 'agent', agentName: agent.name, agentIcon: agent.icon, agentColor: '#EF4444', content: failMsg, type: 'error' });
+            if (sessionId) {
+              try { await swarmAddMessage(sessionId, 'agent', failMsg, agent.name, agent.icon, '#EF4444', 'error'); } catch(e){console.warn("[Swarm] save failed:",e);}
+            }
+          }
+        } else if (et === 'workflow_resumed') {
+          addMessage({ role: 'system', content: '\u{1F501} 已回放 ' + (event.data?.replayed || 0) + ' 个已完成角色，从断点继续', type: 'info' });
+        } else if (et === 'workflow_paused') {
+          // 可重试错误（429/限流/过载等）：暂停工作流，等待用户点击重试续跑
+          wasPaused = true;
+          const failedRole = String(event.data?.failed_role || event.task_id || '');
+          const ag = roleToAgent(failedRole);
+          if (ag) {
+            setAgents(prev => prev.map(a => a.id === ag.id ? { ...a, status: 'failed' } : a));
+            agentStatusMap[ag.id] = 'failed';
+          }
+          const pauseMsg = '\u23F8\uFE0F 工作流已暂停：' + (event.data?.error || event.message || 'API 繁忙');
+          addMessage({ role: 'system', content: pauseMsg, type: 'error' });
+          if (sessionId) {
+            try { await swarmAddMessage(sessionId, 'system', pauseMsg, undefined, undefined, undefined, 'error'); } catch(e){console.warn('[Swarm] save failed:',e);}
+          }
+          setPaused({ failedRole, error: String(event.data?.error || event.message || 'API 繁忙') });
+        } else if (et === 'workflow_completed') {
+          const dur = event.data?.duration_ms ? (event.data.duration_ms / 1000).toFixed(1) + '秒' : '';
+          const doneMsg = '\u{1F389} 工作流已完成！' + (dur ? ' 耗时: ' + dur : '');
+          addMessage({ role: 'system', content: doneMsg, type: 'done' });
+          if (sessionId) {
+            try {
+              await swarmAddMessage(sessionId, 'system', doneMsg, undefined, undefined, undefined, 'done');
+              await swarmUpdateStatus(sessionId, 'completed', agentStatusMap);
+            } catch(e){console.warn("[Swarm] save failed:",e);}
+          }
+        } else if (et === 'workflow_failed') {
+          const errMsg = '\u274C 工作流失败: ' + (event.message || '');
+          addMessage({ role: 'system', content: errMsg, type: 'error' });
+          if (sessionId) {
+            try {
+              await swarmAddMessage(sessionId, 'system', errMsg, undefined, undefined, undefined, 'error');
+              await swarmUpdateStatus(sessionId, 'failed', agentStatusMap);
+            } catch(e){console.warn("[Swarm] save failed:",e);}
+          }
+        }
+      }
+    } catch (err) {
+      const errMsg = '\u274C 出错: ' + String(err);
+      addMessage({ role: 'system', content: errMsg, type: 'error' });
+      if (sessionId) {
+        try { await swarmAddMessage(sessionId, 'system', errMsg, undefined, undefined, undefined, 'error'); } catch(e){console.warn("[Swarm] save failed:",e);}
+      }
+    }
+
+    // 暂停→paused；正常/失败→completed
+    if (sessionId) {
+      try { await swarmUpdateStatus(sessionId, wasPaused ? 'paused' : 'completed', agentStatusMap); } catch(e){console.warn("[Swarm] save failed:",e);}
+    }
+
+    setIsRunning(false);
+    setIsAnalyzing(false);
+    loadSessions();
+  }, [isRunning, addMessage, roleToAgent, workspace, loadSessions, selectedModel]);
+
+  const handleStart = useCallback(async () => {
+    if (!inputTask.trim() || isRunning) return;
+    await runWorkflow(inputTask.trim(), []);
+  }, [inputTask, isRunning, runWorkflow]);
+
+  // 429 暂停后的重试：带已完成角色产出续跑
+  const handleRetry = useCallback(async () => {
+    if (isRunning || !paused) return;
+    await runWorkflow(lastGoalRef.current, completedOutputsRef.current);
+  }, [isRunning, paused, runWorkflow]);
+
+  const handleStop = useCallback(() => { abortRef.current = true; setIsRunning(false); }, []);
+  const handleReset = useCallback(() => {
+    setPaused(null);
+    setMessages([]);
+    setAgents(META_AGENTS.map(a => ({ ...a, status: 'idle' as const, output: undefined })));
+    setInputTask('');
+    setIsRunning(false);
+    setCurrentSessionId(null);
+    sessionIdRef.current = null;
+  }, []);
+
+
+  // Rename a session
+  const handleRenameSession = useCallback(async (sessionId: string, newTitle: string) => {
+    if (!newTitle.trim()) return;
+    try {
+      await swarmRenameSession(sessionId, newTitle.trim());
+      setSessions(prev => prev.map(s => s.id === sessionId ? { ...s, title: newTitle.trim() } : s));
+    } catch (e) {
+      console.warn('[Swarm] Failed to rename session:', e);
+    }
+    setEditingSessionId(null);
+    setEditingTitle('');
+  }, []);
+
+  const handleNewTask = useCallback(async () => {
+    let selectedDir = '';
+    try {
+      const { tauriAPI } = await import('../utils/tauriAPI');
+      selectedDir = await tauriAPI.selectDirectory() || '';
+    } catch (e) {
+      console.warn('[Swarm] select dir failed:', e);
+    }
+    try {
+      const title = '\u65B0\u4EFB\u52A1 ' + new Date().toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      const sessionResp2 = await swarmCreateSession(title, selectedDir || undefined);
+      const sessionId = typeof sessionResp2 === 'object' ? sessionResp2.id : sessionResp2;
+      await loadSessions();
+      setCurrentSessionId(sessionId);
+      sessionIdRef.current = sessionId;
+      setWorkspace(selectedDir);
+      if (selectedDir) localStorage.setItem('metagpt_workspace', selectedDir);
+      setMessages([]);
+      setAgents(META_AGENTS.map(a => ({ ...a, status: 'idle' as const, output: undefined })));
+      setInputTask('');
+      setIsRunning(false);
+      setTimeout(() => inputRef.current?.focus(), 100);
+    } catch (e) {
+      console.warn('[Swarm] create session failed:', e);
+    }
+  }, [loadSessions]);
+
+  const completedCount = agents.filter(a => a.status === 'completed').length;
+  const failedCount = agents.filter(a => a.status === 'failed').length;
+  const workingCount = agents.filter(a => a.status === 'working').length;
+
+  const formatTime = (ts: number) => {
+    const d = new Date(ts * 1000);
+    return d.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  };
+
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'completed': return '\u2705';
+      case 'failed': return '\u274C';
+      case 'running': return '\u23F3';
+      case 'paused': return '\u23F8\uFE0F';
+      default: return '\u{1F4CB}';
+    }
+  };
 
   return (
-    <div className="flex flex-col h-full bg-claude-bg">
-      <div className="flex-shrink-0 p-4 border-b border-claude-border">
-        <div className="flex items-center gap-2 mb-3">
-          <Users size={18} className="text-[#3B82F6]" />
-          <h2 className="text-[15px] font-semibold text-claude-text">智能协作</h2>
-          <Sparkles size={14} className="text-[#A855F7] ml-auto" />
-        </div>
-
-        <div className="relative">
-          <textarea
-            value={inputTask}
-            onChange={(e) => setInputTask(e.target.value)}
-            placeholder="输入一个复杂任务，多个AI智能体将协作完成..."
-            className="w-full px-3 py-2 text-[13px] bg-claude-input border border-claude-border rounded-lg text-claude-text placeholder:text-claude-textSecondary/50 focus:outline-none focus:border-[#3B82F6] resize-none"
-            rows={3}
-            disabled={!!session && session.status === 'running'}
-          />
-          <div className="flex items-center justify-between mt-2">
-            <div className="flex items-center gap-2">
-              <Brain size={14} className="text-claude-textSecondary" />
-              <span className="text-[11px] text-claude-textSecondary">
-                {isAnalyzing ? '分析中...' : inputTask ? `复杂度: ${analyzeComplexity(inputTask)}/10` : '输入任务进行分析'}
-              </span>
-            </div>
-            {!session || session.status === 'completed' || session.status === 'failed' ? (
-              <button
-                onClick={handleAnalyzeTask}
-                disabled={!inputTask.trim() || isAnalyzing}
-                className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#3B82F6] hover:bg-[#2563EB] rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
-              >
-                {isAnalyzing ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
-                {isAnalyzing ? '分析中' : '分析规划'}
-              </button>
-            ) : (
-              <div className="flex items-center gap-1.5">
-                {session.status === 'running' && (
-                  <>
-                    <button
-                      onClick={handlePauseSwarm}
-                      className="p-1.5 text-claude-textSecondary hover:text-claude-text hover:bg-claude-hover rounded-md transition-colors"
-                      title={isPaused ? '继续' : '暂停'}
-                    >
-                      {isPaused ? <Play size={14} /> : <Pause size={14} />}
-                    </button>
-                    <button
-                      onClick={handleStopSwarm}
-                      className="p-1.5 text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-md transition-colors"
-                      title="停止"
-                    >
-                      <StopCircle size={14} />
-                    </button>
-                  </>
-                )}
-                {session.status === 'planning' && (
-                  <button
-                    onClick={handleStartSwarm}
-                    className="px-3 py-1.5 text-[12px] font-medium text-white bg-[#10B981] hover:bg-[#059669] rounded-lg transition-colors flex items-center gap-1.5"
-                  >
-                    <Play size={14} />
-                    开始协作
-                  </button>
-                )}
+    <div className="flex h-full bg-claude-bg">
+      {/* ─── 左侧 Agent 列表 ─── */}
+      <div className="w-56 flex-shrink-0 border-r border-claude-border flex flex-col bg-claude-bg/50">
+        <div className="p-3 border-b border-claude-border">
+          <div className="flex items-center gap-2 mb-2">
+            <Users size={16} className="text-[#3B82F6]" />
+            <span className="text-[13px] font-semibold text-claude-text">智能体团队</span>
+          </div>
+          <div className="flex items-center gap-3 text-[11px] text-claude-textSecondary">
+            <span>✅ {completedCount}</span>
+            <span>⚡ {workingCount}</span>
+            <span>❌ {failedCount}</span>
+            <span>⏳ {agents.length - completedCount - workingCount - failedCount}</span>
+          </div>
+          {/* 任务进度 */}
+          {isRunning && (
+            <div className="mt-2">
+              <div className="flex items-center justify-between text-[10px] text-claude-textSecondary mb-1">
+                <span>任务进度</span>
+                <span>{completedCount + failedCount}/{agents.length}</span>
               </div>
+              <div className="w-full h-1.5 bg-claude-border/30 rounded-full overflow-hidden">
+                <div
+                  className={"h-full rounded-full transition-all duration-500" + (workingCount > 0 ? " animate-pulse " : " ") + (completedCount + failedCount > 0 ? "bg-emerald-500" : "bg-claude-border/20")}
+                  style={{ width: Math.round((completedCount + failedCount) / Math.max(1, agents.length) * 100) + "%" }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          {/* 工作区选择 */}
+          <div className="mb-2 px-2">
+            <div className="text-[10px] text-claude-textSecondary mb-1">工作区</div>
+            <div
+              className="w-full flex items-center gap-1.5 px-2 py-1.5 text-[11px] rounded-md border border-claude-border text-claude-textSecondary truncate"
+              title={workspace || '未设置'}
+            >
+              <FolderOpen size={12} className="flex-shrink-0" />
+              <span className="truncate">{workspace ? workspace.split(/[\\/]/).pop() || workspace : '未设置'}</span>
+            </div>
+            {workspace && (
+              <div className="text-[9px] text-claude-textSecondary/60 mt-0.5 truncate" title={workspace}>{workspace}</div>
+            )}
+          </div>
+          {agents.map(agent => (
+            <div
+              key={agent.id}
+              onClick={() => setSelectedAgent(selectedAgent === agent.id ? null : agent.id)}
+              className={`flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer transition-all text-[12px]${
+                agent.status === 'working' ? ' bg-blue-500/10 border border-blue-500/20' :
+                agent.status === 'completed' ? ' bg-emerald-500/10 border border-emerald-500/20' :
+                agent.status === 'failed' ? ' bg-red-500/10 border border-red-500/20' :
+                ' hover:bg-claude-hover border border-transparent'
+              }`}
+            >
+              <span className="text-[16px]">{agent.icon}</span>
+              <div className="flex-1 min-w-0">
+                <div className="font-medium text-claude-text truncate">{agent.name}</div>
+                <div className="text-[10px] text-claude-textSecondary truncate">{agent.role}</div>
+              </div>
+              <div className="flex-shrink-0">
+                {agent.status === 'idle' && <Clock size={12} className="text-gray-400" />}
+                {agent.status === 'working' && <Loader2 size={12} className="text-blue-400 animate-spin" />}
+                {agent.status === 'completed' && <CheckCircle2 size={12} className="text-emerald-400" />}
+                {agent.status === 'failed' && <XCircle size={12} className="text-red-400" />}
+              </div>
+            </div>
+          ))}
+        </div>
+        {/* 选中 Agent 的输出 */}
+        {selectedAgent && (() => {
+          const ag = agents.find(a => a.id === selectedAgent);
+          if (!ag?.output) return null;
+          return (
+            <div className="border-t border-claude-border p-3 max-h-[200px] overflow-y-auto">
+              <div className="text-[11px] font-medium text-claude-textSecondary mb-1">{ag.icon} {ag.name} 输出</div>
+              <div className="text-[11px] text-claude-text whitespace-pre-wrap leading-relaxed">{ag.output.slice(0, 1000)}{ag.output.length > 1000 ? '...' : ''}</div>
+            </div>
+          );
+        })()}
+      </div>
+
+      {/* ─── 中间聊天室 ─── */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* 顶部标题栏 */}
+        <div className="flex-shrink-0 px-4 py-3 border-b border-claude-border flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Brain size={16} className="text-[#8B5CF6]" />
+            <span className="text-[14px] font-semibold text-claude-text">MetaGPT 智能协作</span>
+            {isRunning && (
+              <span className="ml-2 px-2 py-0.5 text-[10px] rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
+                {workingCount > 0 ? workingCount + ' 个智能体工作中' : '运行中'}
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {isRunning && (
+              <button onClick={handleStop} className="flex items-center gap-1 px-2 py-1 text-[11px] text-red-400 hover:bg-red-500/10 rounded-md transition-colors">
+                <Square size={12} /> 停止
+              </button>
+            )}
+            {!isRunning && messages.length > 0 && (
+              <button onClick={handleReset} className="flex items-center gap-1 px-2 py-1 text-[11px] text-claude-textSecondary hover:bg-claude-hover rounded-md transition-colors">
+                <RotateCcw size={12} /> 重置
+              </button>
             )}
           </div>
         </div>
-      </div>
 
-      {session && (
-        <div className="flex-1 overflow-y-auto">
-          <div className="p-4 space-y-4">
-            <div className="flex items-center justify-between px-1">
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-1.5">
-                  <Target size={14} className="text-[#3B82F6]" />
-                  <span className="text-[12px] text-claude-text">复杂度</span>
-                </div>
-                <div className="flex items-center gap-1">
-                  {Array.from({ length: 10 }).map((_, i) => (
-                    <div
-                      key={i}
-                      className="w-2 h-2 rounded-full transition-colors"
-                      style={{
-                        backgroundColor: i < session.complexity ? '#3B82F6' : 'rgba(107, 114, 128, 0.2)',
-                      }}
-                    />
-                  ))}
-                </div>
-                <span className="text-[12px] font-medium text-[#3B82F6]">{session.complexity}/10</span>
+        {/* 消息区域 */}
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+          {messages.length === 0 && !isRunning && (
+            <div className="flex flex-col items-center justify-center h-full text-center">
+              <div className="w-16 h-16 rounded-full bg-claude-hover flex items-center justify-center mb-4">
+                <Bot size={28} className="text-[#8B5CF6]" />
               </div>
-              <div className="flex items-center gap-1.5">
-                <Activity size={14} className="text-claude-textSecondary" />
-                <span className="text-[12px] text-claude-textSecondary">
-                  {completedAgents}/{totalAgents} 智能体已完成
-                </span>
+              <h3 className="text-[15px] font-medium text-claude-text mb-2">MetaGPT 智能体协作</h3>
+              <p className="text-[12px] text-claude-textSecondary max-w-sm leading-relaxed">
+                输入任务，7个专业智能体将按照 MetaGPT 原生架构自动协作：产品经理→架构师→工程师→审查员→测试→运维→项目经理
+              </p>
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                {META_AGENTS.map(a => (
+                  <span key={a.id} className="px-2 py-1 text-[10px] rounded-full border border-claude-border text-claude-textSecondary">
+                    {a.icon} {a.name}
+                  </span>
+                ))}
               </div>
             </div>
+          )}
 
-            <div className="h-1 rounded-full bg-claude-border overflow-hidden">
-              <div
-                className="h-full rounded-full bg-gradient-to-r from-[#3B82F6] to-[#10B981] transition-all duration-500"
-                style={{ width: `${progressPercent}%` }}
-              />
-            </div>
-
-            {showVisualization && session.status === 'running' && (
-              <div className="rounded-lg border border-claude-border overflow-hidden">
-                <SwarmVisualization agents={session.agents} />
-              </div>
-            )}
-
-            <div>
-              <button
-                onClick={() => setShowVisualization(prev => !prev)}
-                className="flex items-center gap-1.5 text-[12px] text-claude-textSecondary hover:text-claude-text transition-colors mb-2"
-              >
-                {showVisualization ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
-                {showVisualization ? '隐藏' : '显示'} 智能体 ({totalAgents})
-              </button>
-              {showVisualization && (
-                <div className="grid grid-cols-2 gap-2">
-                  {session.agents.map(agent => (
-                    <div
-                      key={agent.id}
-                      onClick={() => toggleAgentExpand(agent.id)}
-                      className="cursor-pointer"
-                    >
-                      <AgentNode agent={agent} isExpanded={expandedAgents.has(agent.id)} />
+          {messages.map(msg => (
+            <div key={msg.id}>
+              {msg.role === 'system' ? (
+                msg.type === 'tool' ? (
+                  // ZCode 风格工具调用卡
+                  <div className="flex justify-start">
+                    <div className="w-full max-w-[560px] rounded-lg border border-black/[0.06] dark:border-white/[0.07] bg-white/60 dark:bg-white/[0.02] px-2.5 py-1.5 flex items-center gap-2">
+                      {msg.meta?.status === 'running' ? (
+                        <span className="flex-shrink-0 inline-block w-2.5 h-2.5 border-[1.5px] border-blue-400 border-t-transparent rounded-full animate-spin" />
+                      ) : (
+                        <CheckCircle2 size={13} className="flex-shrink-0 text-green-500" />
+                      )}
+                      <Terminal size={13} className="flex-shrink-0 text-purple-500" />
+                      <span className="flex-shrink-0 text-[12px] font-medium text-claude-textSecondary">调用工具</span>
+                      <span className="flex-1 min-w-0 text-[11.5px] font-mono text-claude-text truncate opacity-90">{msg.content}</span>
                     </div>
-                  ))}
+                  </div>
+                ) : msg.type === 'activity' ? (
+                  // 智能体活动卡（思考/等待/输出完成），心跳更新不刷屏
+                  <div className="flex justify-start">
+                    <div className="w-full max-w-[560px] rounded-lg border border-amber-500/20 bg-amber-500/5 dark:bg-amber-500/5 px-2.5 py-1.5 flex items-center gap-2">
+                      <Brain size={13} className="flex-shrink-0 text-amber-500 animate-pulse" />
+                      <span className="flex-shrink-0 text-[12px] font-medium text-claude-textSecondary">
+                        {msg.meta?.phase === 'waiting'
+                          ? `等待LLM响应 · ${msg.meta?.elapsed_s || 0}s`
+                          : msg.meta?.phase === 'output_done'
+                            ? `思考完成 · ${msg.meta?.chars ?? 0} 字符`
+                            : `思考中 · 迭代 ${msg.meta?.iteration ?? '-'}`
+                        }
+                      </span>
+                      <span className="flex-1 min-w-0 text-[11px] font-mono text-claude-textSecondary/60 truncate text-right">{msg.meta?.agentRole}</span>
+                    </div>
+                  </div>
+                ) : msg.type === 'progress' ? (
+                  // Progress messages: left-aligned, detailed style
+                  <div className="flex gap-2 items-start">
+                    <div className="flex-shrink-0 w-6 h-6 rounded-full bg-claude-hover flex items-center justify-center text-[10px] mt-0.5">
+                      🤖
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[11px] text-claude-textSecondary mb-0.5">🔧 工作流进度</div>
+                      <div className="text-[12px] text-claude-text bg-claude-hover/50 border border-claude-border/50 rounded px-2 py-1.5 whitespace-pre-wrap leading-relaxed">
+                        {msg.content}
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  // Other system messages: centered pill style
+                  <div className="flex justify-center">
+                    <div className={`px-3 py-1.5 rounded-full text-[11px]${
+                      msg.type === 'error' ? ' bg-red-500/10 text-red-400 border border-red-500/20' :
+                      msg.type === 'done' ? ' bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
+                      ' bg-claude-hover text-claude-textSecondary border border-claude-border'
+                    }`}>{msg.content}</div>
+                  </div>
+                )
+              ) : (
+                <div className="flex gap-3">
+                  <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center text-[14px]" style={{ backgroundColor: (msg.agentColor || '#3B82F6') + '20' }}>
+                    {msg.agentIcon || '\u{1F916}'}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[11px] font-medium mb-1" style={{ color: msg.agentColor || '#3B82F6' }}>
+                      {msg.agentName || '智能体'}
+                    </div>
+                    <div className="bg-claude-hover border border-claude-border rounded-lg px-3 py-2 text-[12px] text-claude-text whitespace-pre-wrap leading-relaxed max-h-[400px] overflow-y-auto">
+                      {msg.content}
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
-
-            {session.subTasks.length > 1 && (
-              <div>
-                <div className="flex items-center gap-1.5 mb-2">
-                  <Split size={14} className="text-[#A855F7]" />
-                  <span className="text-[12px] font-medium text-claude-text">任务分解 ({session.subTasks.length})</span>
+          ))}
+          {paused && !isRunning && (
+            <div className="flex justify-center">
+              <div className="flex items-center gap-3 px-4 py-2.5 rounded-xl border border-amber-500/30 bg-amber-500/10">
+                <AlertTriangle size={16} className="flex-shrink-0 text-amber-400" />
+                <div className="text-left min-w-0">
+                  <div className="text-[12px] font-medium text-claude-text">
+                    工作流已暂停：{paused.failedRole || '智能体'} 因 API 繁忙中断
+                  </div>
+                  <div className="text-[10.5px] text-claude-textSecondary max-w-[420px] truncate" title={paused.error}>
+                    {paused.error}
+                  </div>
                 </div>
-                <div className="space-y-1">
-                  {session.subTasks.map((task, index) => (
-                    <div key={task.id} className="relative">
-                      {index > 0 && (
-                        <div className="absolute left-4 -top-1 w-px h-1 bg-claude-border" />
-                      )}
-                      <TaskNode task={task} agents={session.agents} />
-                    </div>
-                  ))}
-                </div>
+                <button
+                  onClick={handleRetry}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] font-medium text-white bg-amber-500 hover:bg-amber-600 rounded-lg flex-shrink-0 transition-colors"
+                >
+                  <RotateCcw size={12} /> 重试续跑
+                </button>
               </div>
-            )}
+            </div>
+          )}
+          <div ref={chatEndRef} />
+        </div>
 
-            {session.status === 'completed' && (
-              <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 size={16} className="text-emerald-400" />
-                  <span className="text-[13px] font-medium text-emerald-400">协作完成</span>
-                </div>
-                <div className="mt-2 text-[12px] text-claude-textSecondary">
-                  耗时: {((session.endTime || Date.now()) - session.startTime) / 1000}秒 ·
-                  智能体: {totalAgents} ·
-                  令牌: {session.agents.reduce((sum, a) => sum + a.tokensUsed, 0).toLocaleString()}
-                </div>
-              </div>
-            )}
+        {/* 底部输入栏 */}
+        <div className="flex-shrink-0 border-t border-claude-border p-3">
+          <div className="flex gap-2">
+            <textarea
+              ref={inputRef}
+              value={inputTask}
+              onChange={e => setInputTask(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleStart(); } }}
+              placeholder="输入任务，让智能体团队协作完成... (Shift+Enter 换行)"
+              disabled={isRunning}
+              rows={2}
+              className="flex-1 px-3 py-2 text-[13px] bg-claude-input border border-claude-border rounded-lg text-claude-text placeholder:text-claude-textSecondary/50 focus:outline-none focus:border-[#8B5CF6] disabled:opacity-50 resize-none"
+            />
+            <button
+              onClick={isRunning ? handleStop : handleStart}
+              disabled={!isRunning && !inputTask.trim()}
+              className={`px-4 py-2 rounded-lg text-[12px] font-medium flex items-center gap-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed${
+                isRunning
+                  ? ' bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20'
+                  : ' bg-[#8B5CF6] text-white hover:bg-[#7C3AED]'
+              }`}
+            >
+              {isRunning ? <><Square size={14} /> 停止</> : <><Send size={14} /> 发送</>}
+            </button>
+          </div>
+          <div className="flex items-center gap-4 mt-2 text-[10px] text-claude-textSecondary">
+            <span>🏗️ MetaGPT 原生架构</span>
+            <span>📡 消息驱动</span>
+            <span>🤖 7个专业智能体</span>
+            <label className="flex items-center gap-1" title="协作工作流使用的模型">
+              <Brain size={10} className="text-[#8B5CF6]" />
+              <select
+                value={selectedModel}
+                onChange={e => {
+                  setSelectedModel(e.target.value);
+                  try { localStorage.setItem('swarm_model', e.target.value); } catch {}
+                }}
+                disabled={isRunning}
+                className="max-w-[150px] truncate bg-claude-input border border-claude-border rounded px-1 py-0.5 text-[10px] text-claude-textSecondary hover:text-claude-text focus:outline-none focus:border-[#8B5CF6] disabled:opacity-50 cursor-pointer"
+              >
+                <option value="">默认模型</option>
+                {modelOptions.map(m => (
+                  <option key={m.id} value={m.id}>{m.name}</option>
+                ))}
+              </select>
+            </label>
+            {isAnalyzing && <span className="text-blue-400 animate-pulse">⏳ 正在分析...</span>}
           </div>
         </div>
-      )}
+      </div>
 
-      {!session && !isAnalyzing && (
-        <div className="flex-1 flex items-center justify-center p-6">
-          <div className="text-center max-w-xs">
-            <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-claude-hover flex items-center justify-center">
-              <Users size={28} className="text-[#3B82F6]" />
-            </div>
-            <h3 className="text-[14px] font-medium text-claude-text mb-2">智能协作</h3>
-            <p className="text-[12px] text-claude-textSecondary leading-relaxed">
-              输入复杂任务，多个AI智能体将并行协作高效完成。
-            </p>
-            <div className="mt-4 space-y-2 text-left">
-              {[
-                '自动复杂度分析',
-                '智能任务分解',
-                '并行智能体执行',
-                '实时进度跟踪',
-              ].map((feature, i) => (
-                <div key={i} className="flex items-center gap-2 text-[11px] text-claude-textSecondary">
-                  <ArrowRight size={12} className="text-[#3B82F6]" />
-                  <span>{feature}</span>
-                </div>
-              ))}
-            </div>
+      {/* ─── 右侧会话列表面板 ─── */}
+      <div className="w-64 flex-shrink-0 border-l border-claude-border flex flex-col bg-claude-bg/50">
+        <div className="p-3 border-b border-claude-border flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <MessageSquare size={14} className="text-[#8B5CF6]" />
+            <span className="text-[12px] font-semibold text-claude-text">会话记录</span>
           </div>
+          <button
+            onClick={handleNewTask}
+            className="p-1.5 rounded-md hover:bg-claude-hover transition-colors"
+            title="新建任务"
+          >
+            <Plus size={16} className="text-claude-textSecondary" />
+          </button>
         </div>
-      )}
+        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+          {loadingSessions && (
+            <div className="flex items-center justify-center py-4">
+              <Loader2 size={16} className="animate-spin text-claude-textSecondary" />
+            </div>
+          )}
+          {!loadingSessions && sessions.length === 0 && (
+            <div className="text-center py-8">
+              <MessageSquare size={24} className="mx-auto text-claude-textSecondary/30 mb-2" />
+              <p className="text-[11px] text-claude-textSecondary/50">暂无会话记录</p>
+            </div>
+          )}
+           {sessions.map(session => (
+            <div
+              key={session.id}
+              onClick={() => editingSessionId !== session.id && handleSelectSession(session.id)}
+              className={`group flex items-start gap-2 px-2.5 py-2.5 rounded-lg cursor-pointer transition-all text-[11px] border${
+                currentSessionId === session.id
+                  ? ' bg-[#8B5CF6]/10 border-[#8B5CF6]/30'
+                  : ' hover:bg-claude-hover border-transparent'
+              }`}
+            >
+              <span className="flex-shrink-0 mt-0.5">{getStatusIcon(session.status)}</span>
+              <div className="flex-1 min-w-0">
+                {editingSessionId === session.id ? (
+                  <input
+                    autoFocus
+                    value={editingTitle}
+                    onChange={e => setEditingTitle(e.target.value)}
+                    onBlur={() => handleRenameSession(session.id, editingTitle)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleRenameSession(session.id, editingTitle); if (e.key === 'Escape') { setEditingSessionId(null); setEditingTitle(''); } }}
+                    className="w-full bg-transparent border-b border-[#8B5CF6] text-claude-text text-[11px] font-medium leading-tight focus:outline-none"
+                    onClick={e => e.stopPropagation()}
+                  />
+                ) : (
+                  <div className="font-medium text-claude-text truncate leading-tight">{session.title || '\u65B0\u4EFB\u52A1'}</div>
+                )}
+                {session.workspace && (
+                  <div className="text-[9px] text-claude-textSecondary/70 truncate mt-0.5 flex items-center gap-1">
+                    <FolderOpen size={9} className="flex-shrink-0" />
+                    {session.workspace.split(/[\\/]/).pop() || session.workspace}
+                  </div>
+                )}
+                <div className="text-[10px] text-claude-textSecondary mt-0.5">{formatTime(session.created_at)}</div>
+              </div>
+              <div className="flex-shrink-0 flex items-center gap-0.5">
+                <button
+                  onClick={(e) => { e.stopPropagation(); setEditingSessionId(session.id); setEditingTitle(session.title || ''); }}
+                  className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-claude-hover transition-all"
+                  title="\u91CD\u547D\u540D"
+                >
+                  <Pencil size={11} className="text-claude-textSecondary" />
+                </button>
+                <button
+                  onClick={(e) => handleDeleteSession(session.id, e)}
+                  className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-red-500/10 transition-all"
+                  title="\u5220\u9664\u4F1A\u8BDD"
+                >
+                  <Trash2 size={11} className="text-red-400" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 };

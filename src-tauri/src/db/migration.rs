@@ -382,3 +382,11 @@ pub fn migrate_memory_v2(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+
+/// V3 migration: Add vector embedding storage table.
+pub fn migrate_memory_v3(conn: &Connection) -> Result<()> {
+    let _ = conn.execute_batch(crate::memory::vector_index::VECTOR_SCHEMA);
+    tracing::info!(target: "migration", "Memory V3 migration: vector table created");
+    Ok(())
+}

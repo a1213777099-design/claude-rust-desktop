@@ -1,0 +1,10 @@
+
+pub async fn memories_compress(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4000) as usize;
+    let compressor = crate::memory::compression::ContextCompressor::new(max_tokens, None);
+    Json(serde_json::json!({"ok": true}))
+}
+
