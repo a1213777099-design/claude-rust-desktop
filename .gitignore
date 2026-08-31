@@ -34,3 +34,53 @@ src-tauri/gen/
 
 # OS
 Thumbs.db
+
+# ---------------------------------------------------------------
+# 多轮 AI 辅助调试遗留的临时产物（非项目资产）
+# 新增于 2026-08-31，清理前请确认无需回溯
+# ---------------------------------------------------------------
+# 一次性修复脚本
+/_*.cjs
+/fix_*.cjs
+/revert_*.cjs
+/patch_*.py
+/fix_*.py
+/check_*.py
+/start_dev.cjs
+/test_workflow.cjs
+/test_workflow2.cjs
+
+# 编译 / 运行调试输出
+/*_err.txt
+/*_err[0-9].txt
+/*_out.txt
+/*_out[0-9].txt
+/*-err.txt
+/*-err[0-9].txt
+/*-out.txt
+/*-out[0-9].txt
+/cargo-check-*.txt
+/cargo-run-*.txt
+/build-err.txt
+/build_check.txt
+/bridge_check.txt
+/npm_*.txt
+
+# 缓存、索引模型与构建工具残留
+.fastembed_cache/
+outputs/
+.vs_buildtools/
+
+# Tauri 侧运行时产物
+src-tauri/data/
+src-tauri/outputs/
+src-tauri/debug_openai_*.json
+src-tauri/*.log
+src-tauri/nul
+src-tauri/test_mcp.txt
+
+# 编译产物目录（原配置只写了 target/，遗漏了 target2/，约 863MB）
+src-tauri/target2/
+
+# 工具工作状态（非项目源码）
+.workbuddy/
