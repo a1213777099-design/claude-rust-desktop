@@ -147,6 +147,12 @@ impl EnginePool {
             .stdin(std::process::Stdio::piped())
             .kill_on_drop(true);
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
         let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to spawn Claude engine: {}", e))?;
         let pid = child.id();
 
@@ -389,7 +395,7 @@ impl EnginePool {
         if let Some(stdin_tx) = self.stdin_senders.get(conv_id) {
             let message = serde_json::json!({
                 "type": "user_message",
-                "messages": req.get_messages(),
+                "messages": req.single_message().map(|m| vec![m]).unwrap_or_default(),
                 "model": model_str,
             });
             let mut payload = message.to_string();
@@ -419,7 +425,7 @@ impl EnginePool {
         if let Some(stdin_tx) = self.stdin_senders.get(conv_id) {
             let message = serde_json::json!({
                 "type": "user_message",
-                "messages": req.get_messages(),
+                "messages": req.single_message().map(|m| vec![m]).unwrap_or_default(),
                 "model": model_str,
             });
             let mut payload = message.to_string();

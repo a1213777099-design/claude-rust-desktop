@@ -33,7 +33,7 @@ function detectBridgePort(): Promise<number> {
 // before detection finished.
 let _resolvedApiBase: string | null = null;
 
-async function apiBase(): Promise<string> {
+export async function apiBase(): Promise<string> {
   const port = await detectBridgePort();
   const base = `http://127.0.0.1:${port}/api`;
   _resolvedApiBase = base;
@@ -44,7 +44,7 @@ async function apiBase(): Promise<string> {
 // (e.g. image src attributes). Returns the default port until the first port
 // scan resolves — by the time such UI renders, detection has already completed
 // via the initial request().
-function apiBaseSync(): string {
+export function apiBaseSync(): string {
   return _resolvedApiBase ?? `http://127.0.0.1:${DEFAULT_BRIDGE_PORT}/api`;
 }
 
@@ -1565,7 +1565,6 @@ async function parseProxyStream(stream: ReadableStream, handlers: {
 // 流式对话（核�?- Tauri 版本，直接使�?bridge-server HTTP API�?
 export async function sendMessageNative(
   conversationId: string,
-  messages: any[],
   model: string,
   onDelta: (delta: string, full: string) => void,
   onDone: (full: string) => void,
@@ -1579,7 +1578,7 @@ export async function sendMessageNative(
   let thinkingText = '';
   let deltaCount = 0;
 
-  console.log(`[API] Sending message (native): model=${model}, messages=${messages.length}, stream=true`);
+  console.log(`[API] Sending message (native): model=${model}, stream=true`);
   console.log(`[API] Request URL: ${await apiBase()}/chat`);
   console.log(`[API] Establishing SSE connection to ${await apiBase()}/chat`);
 
@@ -1609,7 +1608,6 @@ export async function sendMessageNative(
       },
       body: JSON.stringify({
         conversation_id: conversationId,
-        messages,
         model,
         ...resolveEnvCreds(getUserModeForConversation(conversationId)),
         user_mode: getUserModeForConversation(conversationId),
@@ -1617,12 +1615,13 @@ export async function sendMessageNative(
         web_search_enabled: webSearchEnabled,
         research_mode: researchModeFlag || undefined,
         reasoning_effort: (() => { try { return localStorage.getItem("reasoning_effort") || undefined; } catch { return undefined; } })(),
+        enable_streaming: (() => { try { return localStorage.getItem('non_streaming') !== '1'; } catch { return true; } })(),
       }),
     });
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: '请求失败' }));
-      onError(err.error || '请求失败');
+      const err = await res.json().catch(() => ({ error: `请求失败 (HTTP ${res.status})` }));
+      onError(err.error || `请求失败 (HTTP ${res.status})`);
       return () => {};
     }
 
@@ -1794,12 +1793,11 @@ export async function sendMessage(
   onToolUse?: (event: { type: 'start' | 'input' | 'done'; tool_use_id: string; tool_name?: string; tool_input?: any; content?: string; is_error?: boolean; textBefore?: string }) => void,
   signal?: AbortSignal,
   model?: string,
-  messages?: any[],
 ) {
   const token = getToken();
   let fullText = '';
   let deltaCount = 0;
-  console.log(`[API] Sending message: model=${model}, messages=${messages?.length || 0}, stream=true`);
+  console.log(`[API] Sending message: model=${model}, stream=true`);
   console.log(`[API] Request URL: ${await apiBase()}/chat`);
   console.log(`[API] Establishing SSE connection to ${await apiBase()}/chat`);
   try {
@@ -1833,7 +1831,6 @@ export async function sendMessage(
         conversation_id: conversationId,
         message,
         model: model || undefined,
-        messages: messages && messages.length > 0 ? messages : undefined,
         attachments: attachments || undefined,
         ...resolveEnvCreds(getUserModeForConversation(conversationId)),
         user_mode: getUserModeForConversation(conversationId),
@@ -1854,8 +1851,8 @@ export async function sendMessage(
     });
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: '请求失败' }));
-      onError(err.error || '请求失败');
+      const err = await res.json().catch(() => ({ error: `请求失败 (HTTP ${res.status})` }));
+      onError(err.error || `请求失败 (HTTP ${res.status})`);
       return;
     }
 
@@ -2013,6 +2010,80 @@ export async function sendMessage(
       }
     };
 
+    // ===== 跨 chunk 流式剥离思考标签（dsh：思考永不外泄到正文区） =====
+    // 兼容两种标签：<thinking>…</thinking> 与 <think>…</think>（DeepSeek/Qwen 中转 API 常用）。
+    // 旧实现用 regex 只能剥离"单 chunk 内完整标签对"；跨 chunk 时思考文本原样漏进正文，
+    // 之后 thinking_delta 事件一到，正文区被清空 → 用户看到"思考在外面输出然后突然消失"。
+    const THINK_TAG_PAIRS: ReadonlyArray<readonly [string, string]> = [['<thinking>', '</thinking>'], ['<think>', '</think>']];
+    let inThinkClose: string | null = null;
+    let thinkTagTail = '';
+
+    const emitThinkChunk = (text: string) => {
+      if (!text) return;
+      thinkingText += text;
+      if (onThinking) {
+        pendingThinkingDelta += text;
+        scheduleFlush();
+      }
+    };
+
+    // 返回 buf 尾部可能与 tag 前缀重叠的最大长度（防标签被 chunk 边界截断）
+    const keepPossibleTagPrefix = (buf: string, tag: string): number => {
+      const maxKeep = Math.min(buf.length, tag.length - 1);
+      for (let k = maxKeep; k > 0; k--) {
+        if (buf.endsWith(tag.slice(0, k))) return k;
+      }
+      return 0;
+    };
+
+    const processTextWithThinkTags = (chunk: string, flushAll = false) => {
+      let buf = thinkTagTail + chunk;
+      thinkTagTail = '';
+      while (buf) {
+        if (!inThinkClose) {
+          // 找最早出现的开标签（<thinking> / <think>）
+          let openIdx = -1;
+          let openTag = '';
+          for (const [ot, ct] of THINK_TAG_PAIRS) {
+            const i = buf.indexOf(ot);
+            if (i !== -1 && (openIdx === -1 || i < openIdx)) { openIdx = i; openTag = ot; inThinkClose = ct; }
+          }
+          if (openIdx === -1) {
+            inThinkClose = null;
+            if (flushAll) {
+              processInlineArtifactText(buf, true);
+            } else {
+              let keep = 0;
+              for (const [ot] of THINK_TAG_PAIRS) keep = Math.max(keep, keepPossibleTagPrefix(buf, ot));
+              const emit = buf.slice(0, buf.length - keep);
+              if (emit) processInlineArtifactText(emit);
+              thinkTagTail = buf.slice(buf.length - keep);
+            }
+            break;
+          }
+          if (openIdx > 0) processInlineArtifactText(buf.slice(0, openIdx));
+          buf = buf.slice(openIdx + openTag.length);
+        } else {
+          const closeIdx = buf.indexOf(inThinkClose);
+          if (closeIdx === -1) {
+            if (flushAll) {
+              emitThinkChunk(buf);
+              inThinkClose = null;
+            } else {
+              const keep = keepPossibleTagPrefix(buf, inThinkClose);
+              const emit = buf.slice(0, buf.length - keep);
+              if (emit) emitThinkChunk(emit);
+              thinkTagTail = buf.slice(buf.length - keep);
+            }
+            break;
+          }
+          if (closeIdx > 0) emitThinkChunk(buf.slice(0, closeIdx));
+          buf = buf.slice(closeIdx + inThinkClose.length);
+          inThinkClose = null;
+        }
+      }
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -2025,6 +2096,7 @@ export async function sendMessage(
         if (!line.startsWith('data:')) continue;
         const data = line.startsWith('data: ') ? line.slice(6) : line.slice(5);
         if (data.trim() === '[DONE]') {
+          processTextWithThinkTags('', true);
           processInlineArtifactText('', true);
           flushPending();
           console.log(`[API] Stream complete: ${deltaCount} deltas, ${fullText.length} chars total`);
@@ -2114,30 +2186,21 @@ export async function sendMessage(
                 console.log(`[API] Stream progress: ${deltaCount} deltas received, ${fullText.length} chars`);
               }
               const textChunk = parsed.delta.text;
-              // 处理中转 API �?<thinking> 标签嵌入 text 的情�?
-              if (textChunk.includes('<thinking>') || textChunk.includes('</thinking>')) {
-                const thinkRegex = /<thinking>([\s\S]*?)<\/thinking>/g;
-                let match;
-                let cleaned = textChunk;
-                while ((match = thinkRegex.exec(textChunk)) !== null) {
-                  if (onThinking) {
-                    thinkingText += match[1];
-                    pendingThinkingDelta += match[1];
-                    scheduleFlush();
-                  }
-                }
-                cleaned = textChunk.replace(/<thinking>[\s\S]*?<\/thinking>\s*/g, '');
-                if (cleaned) {
-                  processInlineArtifactText(cleaned);
-                }
-              } else {
-                processInlineArtifactText(textChunk);
-              }
+              // 跨 chunk 流式剥离 <thinking>/<think> 标签（中转 API 把思考嵌在 text 里的情况）
+              processTextWithThinkTags(textChunk);
             }
             if (parsed.delta.type === 'thinking_delta' && parsed.delta.thinking) {
               thinkingText += parsed.delta.thinking;
               if (onThinking) {
                 pendingThinkingDelta += parsed.delta.thinking;
+                scheduleFlush();
+              }
+            }
+            // OpenAI 风格思考流：部分供应商在 delta 里带 reasoning_content 字段
+            if (parsed.delta.reasoning_content && typeof parsed.delta.reasoning_content === 'string') {
+              thinkingText += parsed.delta.reasoning_content;
+              if (onThinking) {
+                pendingThinkingDelta += parsed.delta.reasoning_content;
                 scheduleFlush();
               }
             }

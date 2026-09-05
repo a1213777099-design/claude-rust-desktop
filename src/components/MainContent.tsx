@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import { ChevronDown, ChevronRight, FileText, ArrowUp, ArrowDown, RotateCcw, Pencil, Copy, Check, Paperclip, ListCollapse, Globe, Clock, Info, Github, Plus, X, Loader2, Brain } from 'lucide-react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { IconPlus, IconVoice, IconPencil, IconProjects, IconResearch, IconWebSearch } from './Icons';
@@ -7,6 +7,7 @@ import { getConversation, sendMessage, createConversation, getUser, updateConver
 import { useChatStore } from '../stores/useChatStore';
 import { useStreamingStore } from '../stores/useStreamingStore';
 import { ToolCallList, FileChangesSummary, computeChangedFiles } from './ToolCallCard';
+import { ToolRowList, ReasoningRow } from './FlowRow';
 import { useUIStore } from '../stores/useUIStore';
 import { useAuthStore } from '../stores/useAuthStore';
 import { useProjectStore } from '../stores/useProjectStore';
@@ -230,22 +231,33 @@ function isSearchStatusMessage(message: string) {
 // Extract display text from content that may be a plain string or a JSON-stringified content array
 function extractTextContent(content: any): string {
   if (!content) return '';
-  if (typeof content !== 'string') return String(content);
-  // Try to parse as JSON array (Anthropic API content format)
-  if (content.startsWith('[')) {
+  let text: string;
+  if (typeof content !== 'string') {
+    text = String(content);
+  } else if (content.startsWith('[')) {
+    // Try to parse as JSON array (Anthropic API content format)
     try {
       const parsed = JSON.parse(content);
       if (Array.isArray(parsed)) {
-        return parsed
+        text = parsed
           .filter((block: any) => block && block.type === 'text' && block.text)
           .map((block: any) => block.text)
           .join('\n');
+      } else {
+        text = content;
       }
     } catch {
       // Not valid JSON, treat as plain text
+      text = content;
     }
+  } else {
+    text = content;
   }
-  return content;
+  // 兜底：剥离混入正文的思考标签（<thinking>…</thinking> 与 <think>…</think>，未闭合时剥到末尾）
+  return text
+    .replace(/<thinking>[\s\S]*?(<\/thinking>|$)/g, '')
+    .replace(/<think>[\s\S]*?(<\/think>|$)/g, '')
+    .trim();
 }
 
 function withAuthToken(url: string) {
@@ -795,7 +807,7 @@ const MessageList = React.memo<MessageListProps>(({
                 const visibleToolCalls = (msg.toolCalls || []).filter((tc: any) => !['WebSearch', 'WebFetch'].includes(tc.name));
                 // 思考只在"正在思考"或已有已保存块时计入过程，
                 // 纯"思考→正文"（无工具）的消息在正文阶段要恢复正常流式渲染
-                const thinkingCount = (msg.thinkingBlocks?.length || 0) + ((msg.isThinking && (msg.thinking || '').trim()) ? 1 : 0);
+                const thinkingCount = (msg.thinkingBlocks?.length || 0) + (msg.isThinking ? 1 : 0);
                 (msg as any)._visibleToolCalls = visibleToolCalls;
                 (msg as any)._thinkingCount = thinkingCount;
                 const hasProcess = visibleToolCalls.length > 0 || thinkingCount > 0;
@@ -808,13 +820,19 @@ const MessageList = React.memo<MessageListProps>(({
                 if ((!finalOffset || finalOffset <= 0) && (msg.toolCalls?.length || 0) > 0) {
                   const lastTc = msg.toolCalls[msg.toolCalls.length - 1];
                   const tbLen = (lastTc?.textBefore || '').length;
-                  if (tbLen > 0 && tbLen < fullText.length) finalOffset = tbLen;
+                  if (tbLen > 0 && tbLen <= fullText.length) finalOffset = tbLen;
                 }
-                const hasOffset = finalOffset && finalOffset > 0 && finalOffset < fullText.length;
-                // 仅"有过程内容 + 流式中"才隐藏正文；无过程的消息全程正常流式渲染
-                (msg as any)._finalText = (isCurrentlyStreaming && hasProcess)
-                  ? ''
-                  : (hasOffset ? fullText.slice(finalOffset).trim() : null);
+                // 流式时不隐藏文本——只显示最后一个工具之后的"实时文本段"
+                // （工具刚调用、新文本还没出来时自然为空，只显示运行中的工具卡）
+                if (hasProcess) {
+                  const answerStart = (finalOffset && finalOffset > 0) ? finalOffset
+                    : visibleToolCalls.length > 0 ? (visibleToolCalls[visibleToolCalls.length - 1]?.textBefore || '').length
+                    : 0;
+                  const answerText = fullText.slice(answerStart).trim();
+                  (msg as any)._finalText = answerText || '';
+                } else {
+                  (msg as any)._finalText = null;
+                }
                 (msg as any)._isCollapsed = hasProcess && !isCurrentlyStreaming
                   ? ((msg as any).processCollapsed !== undefined ? (msg as any).processCollapsed : true)
                   : false;
@@ -838,7 +856,22 @@ const MessageList = React.memo<MessageListProps>(({
                       title={(msg as any)._isCollapsed ? '展开全部工具调用与思考过程' : '折叠全部工具调用与思考过程'}
                     >
                       {(msg as any)._isCollapsed
-                        ? <><ListCollapse size={13} />展开过程 ({(msg as any)._visibleToolCalls.length + (msg as any)._thinkingCount} 项)</>
+                        ? (() => {
+                            const parts: string[] = [];
+                            if ((msg as any)._thinkingCount > 0) parts.push('已思考');
+                            if ((msg as any)._visibleToolCalls.length > 0) parts.push(`${(msg as any)._visibleToolCalls.length} 次工具调用`);
+                            if (parts.length === 0) parts.push('已工作');
+                            return (
+                              <span className="flex items-center gap-2">
+                                {parts.map((p, pi) => (
+                                  <React.Fragment key={pi}>
+                                    {pi > 0 && <span className="w-[2px] h-[2px] rounded-full bg-claude-textSecondary/60 inline-block" aria-hidden />}
+                                    <span>{p}</span>
+                                  </React.Fragment>
+                                ))}
+                              </span>
+                            );
+                          })()
                         : <><ChevronDown size={13} />折叠过程</>}
                     </button>
                   )}
@@ -848,81 +881,33 @@ const MessageList = React.memo<MessageListProps>(({
               {/* 折叠体：思考卡 + 工具卡（工作中始终展开；完成后默认全部折叠） */}
               {(msg as any)._hasProcess && !(msg as any)._isCollapsed && (
               <div className="pl-2.5 border-l-2 border-black/[0.06] dark:border-white/[0.07]">
-              {/* Thinking blocks: previous (collapsed) + current (active) */}
+              {/* 思考行（DSH 风格 ReasoningRow：流式摘要跟随最新行，结束定格第一行） */}
               {(() => {
                 const blocks = msg.thinkingBlocks || [];
                 const currentThinking = (msg.thinking || '').trim();
                 const hasBlocks = blocks.length > 0;
                 const hasCurrent = !!currentThinking;
-                if (!hasBlocks && !hasCurrent) return null;
-
-                // 思考时长展示：毫秒 → "持续了X秒"
-                const fmtSeconds = (ms?: number) => {
-                  if (!ms || ms <= 0) return '';
-                  return t('chat.lastedSeconds', { s: Math.max(1, Math.round(ms / 1000)) });
-                };
-
-                const renderBlock = (text: string, blockIdx: number, isActive: boolean) => {
-                  const key = `think-${idx}-${blockIdx}`;
-                  // 默认折叠：仅当用户显式展开时展示内容
-                  const expanded = isActive ? msg.isThinkingExpanded === true : !!msg[`thinkBlockExpanded_${blockIdx}`];
-                  const isLive = isActive && msg.isThinking;
-                  // 完成态时长：历史块自带 durationMs；当前块（最后一轮 thinking，不经工具周期保存）退回消息级记录
-                  const durationMs: number | undefined = isActive
-                    ? (isLive ? undefined : (msg as any).thinkingDurationMs)
-                    : ((msg.thinkingBlocks?.[blockIdx] as any)?.durationMs);
-                  return (
-                    <div key={key} className="mb-1.5 rounded-lg border border-black/[0.06] dark:border-white/[0.07] bg-white/60 dark:bg-white/[0.02] overflow-hidden">
-                      <div
-                        className="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer select-none hover:bg-black/[0.03] dark:hover:bg-white/[0.04] transition-colors"
-                        onClick={() => {
-                          if (isActive) {
-                            onSetMessages(prev => prev.map((m, i) =>
-                              i === idx ? { ...m, isThinkingExpanded: m.isThinkingExpanded === false ? true : !m.isThinkingExpanded } : m
-                            ));
-                          } else {
-                            onSetMessages(prev => prev.map((m, i) => {
-                              if (i !== idx) return m;
-                              const key = `thinkBlockExpanded_${blockIdx}`;
-                              return { ...m, [key]: !m[key] };
-                            }));
-                          }
-                        }}
-                      >
-                        <Brain size={13} className={`flex-shrink-0 ${isLive ? 'text-amber-500 animate-pulse' : 'text-claude-textSecondary/70'}`} />
-                        {isLive ? (
-                          <>
-                            <span className="text-[12.5px] font-medium animate-shimmer-text flex-shrink-0">{t('chat.thinkingLabel')}</span>
-                            <span className="flex-1 min-w-0" />
-                            <span className="text-[11px] text-claude-textSecondary/60 flex-shrink-0">{formatElapsed(elapsedTime)}</span>
-                          </>
-                        ) : (
-                          <>
-                            <span className="text-[12.5px] font-medium text-claude-textSecondary flex-shrink-0">{t('chat.thinkingLabel')}</span>
-                            <span className="flex-1 min-w-0" />
-                            {durationMs ? (
-                              <span className="flex-shrink-0 text-[11.5px] text-claude-textSecondary/60">{fmtSeconds(durationMs)}</span>
-                            ) : null}
-                          </>
-                        )}
-                        <ChevronDown size={13} className={`flex-shrink-0 text-claude-textSecondary transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`} />
-                      </div>
-                      {expanded && (
-                        <div
-                          className="border-t border-black/[0.05] dark:border-white/[0.06] px-3 py-2.5 text-claude-textSecondary text-[12.5px] leading-normal whitespace-pre-wrap overflow-y-auto"
-                          style={{ maxHeight: '240px' }}
-                        >
-                          {text}
-                        </div>
-                      )}
-                    </div>
-                  );
-                };
+                // isThinking=true 时强制显示卡片，哪怕文本还未到达（占位运行中卡片）
+                if (!hasBlocks && !hasCurrent && !msg.isThinking) return null;
 
                 return (
-                  <div className="mb-2">
-                    {blocks.map((b: any, bi: number) => renderBlock(b.text, bi, false))}
-                    {hasCurrent && renderBlock(currentThinking, blocks.length, true)}
+                  <div className="mb-2 space-y-0.5">
+                    {blocks.map((b: any, bi: number) => (
+                      <ReasoningRow
+                        key={`think-${idx}-${bi}`}
+                        text={b.text || ''}
+                        running={false}
+                        durationMs={(b as any)?.durationMs}
+                      />
+                    ))}
+                    {(hasCurrent || msg.isThinking) && (
+                      <ReasoningRow
+                        key={`think-${idx}-live`}
+                        text={currentThinking || '正在深度思考…'}
+                        running={!!msg.isThinking}
+                        durationMs={!msg.isThinking ? (msg as any).thinkingDurationMs : undefined}
+                      />
+                    )}
                   </div>
                 );
               })()}
@@ -951,12 +936,11 @@ const MessageList = React.memo<MessageListProps>(({
                   </div>
                 </button>
               )}
-              {/* 工具卡（ZCode 风格：编辑/读取/搜索/查阅/终端等独立折叠卡） */}
+              {/* 工具行（DSH 风格：24px 单行折叠条，运行扫光 + 状态点；工具间交错叙述文本） */}
               {(msg as any)._visibleToolCalls.length > 0 && (
-                <ToolCallList
+                <ToolRowList
                   toolCalls={(msg as any)._visibleToolCalls}
-                  isStreaming={(msg as any)._isStreaming}
-                  hideSummary
+                  fullText={extractTextContent(msg.content)}
                 />
               )}
               </div>
@@ -1366,11 +1350,14 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const pendingInitialMessageRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const activeRequestCountRef = useRef(0);
+  // 按会话登记进行中的流会话：convId -> requestId / controller。
+  // 允许多个会话并行流式（后台会话的事件不被新会话顶掉）。
+  const streamSessionsRef = useRef<Map<string, number>>(new Map());
+  const streamControllersRef = useRef<Map<string, AbortController>>(new Map());
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastResetKeyRef = useRef(0);
   const streamStartTimeRef = useRef<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState<number>(0);
-  const streamConversationIdRef = useRef<string | null>(null);
   const streamRequestIdRef = useRef(0);
 
   // Per-conversation message buffer for multi-conversation streaming isolation
@@ -1590,6 +1577,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     }
   }, [id]);
 
+  // inputText 程序化变化（选技能 / 语音输入 / 粘贴外部文本 / 清空）时同步 textarea 高度，
+  // 仅靠 onChange 调 adjustTextareaHeight 会漏掉这些路径，导致镜像层 / textarea 不同步
+  useEffect(() => {
+    adjustTextareaHeight();
+  }, [inputText]);
+
   // 检测滚动条宽度
   useEffect(() => {
     const el = scrollContainerRef.current;
@@ -1687,12 +1680,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         sessionStorage.removeItem('prefill_input');
         setTimeout(() => {
           setInputText(prefillInput);
-          // Auto-resize textarea
-          const ta = document.querySelector('textarea');
-          if (ta) {
-            ta.style.height = 'auto';
-            ta.style.height = Math.min(ta.scrollHeight, 316) + 'px';
-          }
+          // 高度校正由上方 useLayoutEffect([inputText]) 统一处理
         }, 200);
       }
 
@@ -1868,6 +1856,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     };
   }, [draftKey]);
 
+  // 统一的输入框自适应高度：任何路径导致的 inputText 变化（键入/粘贴/语音/草稿恢复/预填）
+  // 都在渲染提交后、绘制前校正一次高度，React 重渲染不会回退命令式设置的高度。
+  useLayoutEffect(() => {
+    adjustTextareaHeight();
+  }, [inputText, adjustTextareaHeight]);
+
   // 路由变化时也触发入场动画
   useEffect(() => {
     if (location.pathname === '/' || location.pathname === '') {
@@ -1911,10 +1905,11 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     isCreatingRef.current = false;
     viewingIdRef.current = activeId || null;
 
-    // Clear stale buffers for OTHER conversations to prevent cross-contamination
+    // Clear stale buffers for OTHER conversations to prevent cross-contamination.
+    // 但保留仍在后台流式输出的会话的缓冲 —— 删掉会丢失进行中的工具卡片和已收文本。
     if (activeId) {
       for (const [bufId] of messagesBufferRef.current) {
-        if (bufId !== activeId) {
+        if (bufId !== activeId && !isStreaming(bufId)) {
           messagesBufferRef.current.delete(bufId);
         }
       }
@@ -1960,28 +1955,41 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           if (status.active && viewingIdRef.current === convId) {
             setLoading(true);
             addStreaming(convId);
-            setTokenUsage(null);
-            // Seed buffer from current messages + placeholder
-            setMessages(prev => {
-              const msgs = prev.length > 0 ? prev : [];
-              // Add assistant placeholder if last message isn't one
-              if (msgs.length === 0 || msgs[msgs.length - 1].role !== 'assistant') {
-                const withPlaceholder = [...msgs, { role: 'assistant', content: '' }];
-                messagesBufferRef.current.set(convId, withPlaceholder);
-                return withPlaceholder;
-              }
-              messagesBufferRef.current.set(convId, msgs);
-              return msgs;
-            });
+            // 注意：不清空 tokenUsage —— 该会话累计的用量仍在累计窗口内，
+            // 重连后新事件会继续累加，清零会导致统计"跳回"。
             const reconnectController = new AbortController();
-            abortControllerRef.current = reconnectController;
+            if (abortControllerRef.current === null) {
+              abortControllerRef.current = reconnectController;
+            }
+            streamControllersRef.current.set(convId, reconnectController);
             reconnectStream(
               convId,
               (delta, full) => {
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];
-                  if (lastMsg && lastMsg.role === 'assistant') { if (lastMsg.isThinking && (lastMsg as any).thinkingStartedAt) (lastMsg as any).thinkingDurationMs = Date.now() - (lastMsg as any).thinkingStartedAt; lastMsg.content = full; lastMsg.isThinking = false; }
+                  if (lastMsg && lastMsg.role === 'assistant') {
+                    const updated: any = { ...lastMsg };
+                    // 思考结束进入正文：未保存的思考定格为已完成块（dsh：思考条保留在过程区）
+                    if (updated.thinking && updated.thinking.trim()) {
+                      if (!updated.thinkingBlocks) updated.thinkingBlocks = [];
+                      const lastBlk = updated.thinkingBlocks[updated.thinkingBlocks.length - 1];
+                      if (!lastBlk || lastBlk.text !== updated.thinking) {
+                        updated.thinkingBlocks = [...updated.thinkingBlocks, {
+                          text: updated.thinking,
+                          done: true,
+                          durationMs: updated.thinkingStartedAt ? Date.now() - updated.thinkingStartedAt : undefined,
+                        }];
+                      }
+                      updated.thinking = '';
+                    }
+                    if (lastMsg.isThinking && updated.thinkingStartedAt) {
+                      updated.thinkingDurationMs = Date.now() - updated.thinkingStartedAt;
+                    }
+                    updated.content = full;
+                    updated.isThinking = false;
+                    newMsgs[newMsgs.length - 1] = updated;
+                  }
                   return newMsgs;
                 });
               },
@@ -1989,7 +1997,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 removeStreaming(convId);
                 messagesBufferRef.current.delete(convId);
                 if (viewingIdRef.current === convId) setLoading(false);
-                abortControllerRef.current = null;
+                streamControllersRef.current.delete(convId);
+                if (abortControllerRef.current === reconnectController) abortControllerRef.current = null;
                 setMessagesFor(convId, prev => {
                   const newMsgs = [...prev];
                   const lastMsg = newMsgs[newMsgs.length - 1];
@@ -2001,7 +2010,8 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                 removeStreaming(convId);
                 messagesBufferRef.current.delete(convId);
                 if (viewingIdRef.current === convId) setLoading(false);
-                abortControllerRef.current = null;
+                streamControllersRef.current.delete(convId);
+                if (abortControllerRef.current === reconnectController) abortControllerRef.current = null;
               },
               (thinkingDelta, thinkingFull) => {
                 setMessagesFor(convId, prev => {
@@ -2111,42 +2121,50 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
   const beginStreamSession = useCallback((conversationId: string) => {
     const nextId = streamRequestIdRef.current + 1;
     streamRequestIdRef.current = nextId;
-    streamConversationIdRef.current = conversationId;
+    // 登记到按会话的会话表：切换会话不影响该会话的守卫。
+    streamSessionsRef.current.set(conversationId, nextId);
     return nextId;
   }, []);
 
   const isStreamSessionActive = useCallback((conversationId: string, requestId: number) => {
-    return streamConversationIdRef.current === conversationId && streamRequestIdRef.current === requestId;
+    // 双条件：该会话已登记且代次匹配（代次用于 stop/rewind 后作废旧回调）。
+    return streamSessionsRef.current.get(conversationId) === requestId;
   }, []);
 
   const clearStreamSession = useCallback((conversationId: string, requestId: number) => {
     if (!isStreamSessionActive(conversationId, requestId)) return false;
-    streamConversationIdRef.current = null;
+    streamSessionsRef.current.delete(conversationId);
+    const ctrl = streamControllersRef.current.get(conversationId);
+    if (ctrl === abortControllerRef.current) abortControllerRef.current = null;
+    streamControllersRef.current.delete(conversationId);
     return true;
   }, [isStreamSessionActive]);
 
   const abortStreamSession = useCallback((targetConversationId?: string) => {
-    const trackedConversationId = streamConversationIdRef.current;
-    if (!trackedConversationId) return false;
-    if (targetConversationId && trackedConversationId !== targetConversationId) return false;
+    // 不指定目标时中止所有进行中的流会话。
+    const targets = targetConversationId
+      ? (streamSessionsRef.current.has(targetConversationId) ? [targetConversationId] : [])
+      : [...streamSessionsRef.current.keys()];
+    if (targets.length === 0) return false;
 
+    for (const convId of targets) {
+      streamSessionsRef.current.delete(convId);
+      const ctrl = streamControllersRef.current.get(convId);
+      if (ctrl) {
+        ctrl.abort();
+        streamControllersRef.current.delete(convId);
+      }
+      removeStreaming(convId);
+    }
     streamRequestIdRef.current += 1;
-    streamConversationIdRef.current = null;
-
     if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
       abortControllerRef.current = null;
       activeRequestCountRef.current = Math.max(0, activeRequestCountRef.current - 1);
-    } else if (pollingRef.current) {
-      stopPolling();
-      stopGeneration(trackedConversationId).catch(e => console.error('[Stop] error:', e));
     }
-
-    removeStreaming(trackedConversationId);
     setLoading(false);
     isCreatingRef.current = false;
     return true;
-  }, [stopPolling]);
+  }, []);
 
   // 组件卸载或对话切换时停止轮询
   useEffect(() => {
@@ -3004,6 +3022,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const controller = new AbortController();
     const streamRequestId = beginStreamSession(conversationId!);
     abortControllerRef.current = controller;
+    streamControllersRef.current.set(conversationId!, controller);
     setLoading(true);
     addStreaming(conversationId!);
     activeRequestCountRef.current += 1;
@@ -3022,9 +3041,22 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
             // 始终创建新对象引用：onDelta 与 onToolUse 同 tick 触发的
             // 多次 setMessages 调用 React 会批处理，浅比较看到同一引用
             // 就会跳过重渲 → 第二轮的 delta 看似"丢"。这里用 spread 强制新引用。
-            const updated = { ...lastMsg };
-            if (lastMsg.isThinking && (lastMsg as any).thinkingStartedAt) {
-              (updated as any).thinkingDurationMs = Date.now() - (lastMsg as any).thinkingStartedAt;
+            const updated: any = { ...lastMsg };
+            // 思考结束进入正文：未保存的思考定格为已完成块（dsh：思考条保留在过程区）
+            if (updated.thinking && updated.thinking.trim()) {
+              if (!updated.thinkingBlocks) updated.thinkingBlocks = [];
+              const lastBlk = updated.thinkingBlocks[updated.thinkingBlocks.length - 1];
+              if (!lastBlk || lastBlk.text !== updated.thinking) {
+                updated.thinkingBlocks = [...updated.thinkingBlocks, {
+                  text: updated.thinking,
+                  done: true,
+                  durationMs: updated.thinkingStartedAt ? Date.now() - updated.thinkingStartedAt : undefined,
+                }];
+              }
+              updated.thinking = '';
+            }
+            if (lastMsg.isThinking && updated.thinkingStartedAt) {
+              updated.thinkingDurationMs = Date.now() - updated.thinkingStartedAt;
             }
             updated.content = full;
             updated.isThinking = false;
@@ -3050,7 +3082,18 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           const lastIdx = newMsgs.length - 1;
           const lastMsg = newMsgs[lastIdx];
           if (lastMsg && lastMsg.role === 'assistant') {
-            const updated = { ...lastMsg, content: full, isThinking: false };
+            const updated: any = { ...lastMsg };
+            // onDone 兜底：未定格的思考存为已完成块（dsh：思考条保留在过程区）
+            if (updated.thinking && updated.thinking.trim()) {
+              if (!updated.thinkingBlocks) updated.thinkingBlocks = [];
+              const lastBlk = updated.thinkingBlocks[updated.thinkingBlocks.length - 1];
+              if (!lastBlk || lastBlk.text !== updated.thinking) {
+                updated.thinkingBlocks = [...updated.thinkingBlocks, { text: updated.thinking, done: true, durationMs: updated.thinkingStartedAt ? Date.now() - updated.thinkingStartedAt : undefined }];
+              }
+              updated.thinking = '';
+            }
+            updated.content = full;
+            updated.isThinking = false;
             newMsgs[lastIdx] = updated;
           }
           return newMsgs;
@@ -3449,7 +3492,6 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
       },
       controller.signal,
       currentModelString,
-      [...messages, tempUserMsg]
     );
     // Save token usage to localStorage
     try { const tu = tokenUsageRef.current;
@@ -3606,8 +3648,26 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.content = full;
-            lastMsg.isThinking = false;
+            const updated: any = { ...lastMsg };
+            // 思考结束进入正文：未保存的思考定格为已完成块（dsh：思考条保留在过程区）
+            if (updated.thinking && updated.thinking.trim()) {
+              if (!updated.thinkingBlocks) updated.thinkingBlocks = [];
+              const lastBlk = updated.thinkingBlocks[updated.thinkingBlocks.length - 1];
+              if (!lastBlk || lastBlk.text !== updated.thinking) {
+                updated.thinkingBlocks = [...updated.thinkingBlocks, {
+                  text: updated.thinking,
+                  done: true,
+                  durationMs: updated.thinkingStartedAt ? Date.now() - updated.thinkingStartedAt : undefined,
+                }];
+              }
+              updated.thinking = '';
+            }
+            if (lastMsg.isThinking && updated.thinkingStartedAt) {
+              updated.thinkingDurationMs = Date.now() - updated.thinkingStartedAt;
+            }
+            updated.content = full;
+            updated.isThinking = false;
+            newMsgs[newMsgs.length - 1] = updated;
           }
           return newMsgs;
         });
@@ -3627,8 +3687,19 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.content = full;
-            lastMsg.isThinking = false;
+            const updated: any = { ...lastMsg };
+            // onDone 兜底：未定格的思考存为已完成块（dsh：思考条保留在过程区）
+            if (updated.thinking && updated.thinking.trim()) {
+              if (!updated.thinkingBlocks) updated.thinkingBlocks = [];
+              const lastBlk = updated.thinkingBlocks[updated.thinkingBlocks.length - 1];
+              if (!lastBlk || lastBlk.text !== updated.thinking) {
+                updated.thinkingBlocks = [...updated.thinkingBlocks, { text: updated.thinking, done: true, durationMs: updated.thinkingStartedAt ? Date.now() - updated.thinkingStartedAt : undefined }];
+              }
+              updated.thinking = '';
+            }
+            updated.content = full;
+            updated.isThinking = false;
+            newMsgs[newMsgs.length - 1] = updated;
           }
           return newMsgs;
         });
@@ -3726,10 +3797,73 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       undefined,
-      undefined,
+      // 工具调用事件 — 重发通道同样渲染过程卡片（与 handleSend 一致）
+      (toolEvent) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+
+        if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
+        if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+
+        const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
+        if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
+
+        setMessagesFor(conversationId, prev => {
+          const newMsgs = [...prev];
+          const lastMsg = newMsgs[newMsgs.length - 1];
+          if (!lastMsg || lastMsg.role !== 'assistant') return prev;
+
+          const toolCalls = lastMsg.toolCalls || [];
+
+          if (toolEvent.type === 'start') {
+            // 保存当前思考块（工具周期开始前定格）
+            const currentThinking = lastMsg.thinking;
+            if (currentThinking && currentThinking.trim()) {
+              if (!lastMsg.thinkingBlocks) lastMsg.thinkingBlocks = [];
+              const last = lastMsg.thinkingBlocks[lastMsg.thinkingBlocks.length - 1];
+              if (!last || last.text !== currentThinking) {
+                lastMsg.thinkingBlocks.push({
+                  text: currentThinking,
+                  done: true,
+                  durationMs: (lastMsg as any).thinkingStartedAt ? Date.now() - (lastMsg as any).thinkingStartedAt : undefined,
+                });
+              }
+              lastMsg.thinking = '';
+            }
+
+            let existing = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (existing) {
+              existing.name = toolEvent.tool_name || existing.name;
+              if (toolEvent.tool_input && Object.keys(toolEvent.tool_input).length > 0) existing.input = toolEvent.tool_input;
+              if (toolEvent.textBefore) existing.textBefore = toolEvent.textBefore;
+            } else {
+              toolCalls.push({
+                id: toolEvent.tool_use_id,
+                name: toolEvent.tool_name || 'unknown',
+                input: toolEvent.tool_input || {},
+                status: 'running' as const,
+                textBefore: toolEvent.textBefore || '',
+              });
+            }
+          } else if (toolEvent.type === 'input') {
+            const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (tc) tc.input = toolEvent.tool_input || {};
+          } else if (toolEvent.type === 'done') {
+            let tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (!tc) {
+              tc = { id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: {}, status: 'done' as const, result: toolEvent.content };
+              toolCalls.push(tc);
+            } else {
+              tc.status = toolEvent.is_error ? 'error' as const : 'done' as const;
+              tc.result = toolEvent.content;
+            }
+          }
+
+          lastMsg.toolCalls = toolCalls;
+          return newMsgs;
+        });
+      },
       controller.signal,
       currentModelString,
-      [...messages.slice(0, idx), tempUserMsg]
     );
   };
 
@@ -3812,6 +3946,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
     const controller = new AbortController();
     const streamRequestId = beginStreamSession(conversationId);
     abortControllerRef.current = controller;
+    streamControllersRef.current.set(conversationId, controller);
     setLoading(true);
     addStreaming(conversationId);
     activeRequestCountRef.current += 1;
@@ -3825,8 +3960,26 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.content = full;
-            lastMsg.isThinking = false;
+            const updated: any = { ...lastMsg };
+            // 思考结束进入正文：未保存的思考定格为已完成块（dsh：思考条保留在过程区）
+            if (updated.thinking && updated.thinking.trim()) {
+              if (!updated.thinkingBlocks) updated.thinkingBlocks = [];
+              const lastBlk = updated.thinkingBlocks[updated.thinkingBlocks.length - 1];
+              if (!lastBlk || lastBlk.text !== updated.thinking) {
+                updated.thinkingBlocks = [...updated.thinkingBlocks, {
+                  text: updated.thinking,
+                  done: true,
+                  durationMs: updated.thinkingStartedAt ? Date.now() - updated.thinkingStartedAt : undefined,
+                }];
+              }
+              updated.thinking = '';
+            }
+            if (lastMsg.isThinking && updated.thinkingStartedAt) {
+              updated.thinkingDurationMs = Date.now() - updated.thinkingStartedAt;
+            }
+            updated.content = full;
+            updated.isThinking = false;
+            newMsgs[newMsgs.length - 1] = updated;
           }
           return newMsgs;
         });
@@ -3846,8 +3999,19 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
           const newMsgs = [...prev];
           const lastMsg = newMsgs[newMsgs.length - 1];
           if (lastMsg && lastMsg.role === 'assistant') {
-            lastMsg.content = full;
-            lastMsg.isThinking = false;
+            const updated: any = { ...lastMsg };
+            // onDone 兜底：未定格的思考存为已完成块（dsh：思考条保留在过程区）
+            if (updated.thinking && updated.thinking.trim()) {
+              if (!updated.thinkingBlocks) updated.thinkingBlocks = [];
+              const lastBlk = updated.thinkingBlocks[updated.thinkingBlocks.length - 1];
+              if (!lastBlk || lastBlk.text !== updated.thinking) {
+                updated.thinkingBlocks = [...updated.thinkingBlocks, { text: updated.thinking, done: true, durationMs: updated.thinkingStartedAt ? Date.now() - updated.thinkingStartedAt : undefined }];
+              }
+              updated.thinking = '';
+            }
+            updated.content = full;
+            updated.isThinking = false;
+            newMsgs[newMsgs.length - 1] = updated;
           }
           return newMsgs;
         });
@@ -3945,10 +4109,73 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         });
       },
       undefined,
-      undefined,
+      // 工具调用事件 — 编辑重发通道同样渲染过程卡片（与 handleSend 一致）
+      (toolEvent) => {
+        if (!isStreamSessionActive(conversationId, streamRequestId)) return;
+
+        if (toolEvent.type === 'done' && toolEvent.tool_name === 'EnterPlanMode') setPlanMode(true);
+        if (toolEvent.type === 'done' && toolEvent.tool_name === 'ExitPlanMode') setPlanMode(false);
+
+        const INTERNAL_TOOLS = new Set(['EnterPlanMode', 'ExitPlanMode', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop']);
+        if (INTERNAL_TOOLS.has(toolEvent.tool_name || '')) return;
+
+        setMessagesFor(conversationId, prev => {
+          const newMsgs = [...prev];
+          const lastMsg = newMsgs[newMsgs.length - 1];
+          if (!lastMsg || lastMsg.role !== 'assistant') return prev;
+
+          const toolCalls = lastMsg.toolCalls || [];
+
+          if (toolEvent.type === 'start') {
+            // 保存当前思考块（工具周期开始前定格）
+            const currentThinking = lastMsg.thinking;
+            if (currentThinking && currentThinking.trim()) {
+              if (!lastMsg.thinkingBlocks) lastMsg.thinkingBlocks = [];
+              const last = lastMsg.thinkingBlocks[lastMsg.thinkingBlocks.length - 1];
+              if (!last || last.text !== currentThinking) {
+                lastMsg.thinkingBlocks.push({
+                  text: currentThinking,
+                  done: true,
+                  durationMs: (lastMsg as any).thinkingStartedAt ? Date.now() - (lastMsg as any).thinkingStartedAt : undefined,
+                });
+              }
+              lastMsg.thinking = '';
+            }
+
+            let existing = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (existing) {
+              existing.name = toolEvent.tool_name || existing.name;
+              if (toolEvent.tool_input && Object.keys(toolEvent.tool_input).length > 0) existing.input = toolEvent.tool_input;
+              if (toolEvent.textBefore) existing.textBefore = toolEvent.textBefore;
+            } else {
+              toolCalls.push({
+                id: toolEvent.tool_use_id,
+                name: toolEvent.tool_name || 'unknown',
+                input: toolEvent.tool_input || {},
+                status: 'running' as const,
+                textBefore: toolEvent.textBefore || '',
+              });
+            }
+          } else if (toolEvent.type === 'input') {
+            const tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (tc) tc.input = toolEvent.tool_input || {};
+          } else if (toolEvent.type === 'done') {
+            let tc = toolCalls.find((t: any) => t.id === toolEvent.tool_use_id);
+            if (!tc) {
+              tc = { id: toolEvent.tool_use_id, name: toolEvent.tool_name || 'unknown', input: {}, status: 'done' as const, result: toolEvent.content };
+              toolCalls.push(tc);
+            } else {
+              tc.status = toolEvent.is_error ? 'error' as const : 'done' as const;
+              tc.result = toolEvent.content;
+            }
+          }
+
+          lastMsg.toolCalls = toolCalls;
+          return newMsgs;
+        });
+      },
       controller.signal,
       currentModelString,
-      [...messages.slice(0, idx), tempUserMsg]
     );
   };
 
@@ -4300,9 +4527,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                       setInputText(val);
                       const slashMatch = val.match(/^(\/[a-zA-Z0-9_-]*)$/);
                       setSlashCommandFilter(slashMatch ? slashMatch[1].toLowerCase() : null);
-                      e.target.style.height = 'auto';
-                      e.target.style.height = Math.min(e.target.scrollHeight, 300) + 'px';
-                      e.target.style.overflowY = e.target.scrollHeight > 300 ? 'auto' : 'hidden';
+                      adjustTextareaHeight();
                     }}
                     onKeyDown={(e) => {
                       // Backspace deletes entire /skill-name as a unit
@@ -4670,12 +4895,12 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
                   <SkillInputOverlay
                     text={inputText}
                     className="px-4 pt-4 pb-0 text-[16px] font-sans font-[350]"
-                    style={{ height: `${inputBarBaseHeight}px`, minHeight: '16px', boxSizing: 'border-box', overflow: 'hidden' }}
+                    style={{ minHeight: `${inputBarBaseHeight}px`, boxSizing: 'border-box' }}
                   />
                   <textarea
                     ref={inputRef}
                     className={`w-full px-4 pt-4 pb-0 placeholder:text-claude-textSecondary text-[16px] outline-none resize-none bg-transparent font-sans font-[350] ${inputText.match(/^\/[a-zA-Z0-9_-]+/) ? 'text-transparent caret-claude-text' : 'text-claude-text'}`}
-                    style={{ height: `${inputBarBaseHeight}px`, minHeight: '16px', boxSizing: 'border-box', overflowY: 'hidden' }}
+                    style={{ minHeight: `${inputBarBaseHeight}px`, boxSizing: 'border-box', overflowY: 'hidden' }}
                     placeholder={selectedSkill ? `Describe what you want ${selectedSkill.name} to do...` : t('chat.inputPlaceholder')}
                     value={inputText}
                     onChange={(e) => {

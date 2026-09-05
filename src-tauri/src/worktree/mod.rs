@@ -87,10 +87,16 @@ impl WorktreeManager {
     }
 
     fn run_git(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.repo_root)
-            .output()?;
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(&self.repo_root);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let output = cmd.output()?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())

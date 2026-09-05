@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(dead_code, unused_variables, unused_imports, unused_mut, unused_assignments)]
 
+mod truncate;
 mod bridge;
 mod commands;
 mod engine;
@@ -30,6 +31,7 @@ mod native_engine;
 mod upload;
 mod project;
 mod computer_use;
+mod browser_use;
 mod ask_user;
 mod document;
 mod sandbox;

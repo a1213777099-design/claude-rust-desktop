@@ -25,7 +25,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "The absolute or relative path to the file to read" },
+                    "file_path": { "type": "string", "description": "The path to the file, relative to the workspace root (e.g. src/main.rs) or absolute" },
                     "offset": { "type": "number", "description": "Line number to start reading from (1-based)" },
                     "limit": { "type": "number", "description": "Max number of lines to read" }
                 },
@@ -38,7 +38,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "The path to the file" },
+                    "file_path": { "type": "string", "description": "The path to the file, relative to the workspace root or absolute" },
                     "content": { "type": "string", "description": "The full content to write" }
                 },
                 "required": ["file_path", "content"]
@@ -50,7 +50,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "file_path": { "type": "string", "description": "The path to the file" },
+                    "file_path": { "type": "string", "description": "The path to the file, relative to the workspace root or absolute" },
                     "old_string": { "type": "string", "description": "The exact text to find" },
                     "new_string": { "type": "string", "description": "The replacement text" },
                     "replace_all": { "type": "boolean", "description": "If true, replace ALL occurrences" }
@@ -77,7 +77,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Glob pattern" },
-                    "path": { "type": "string", "description": "Base directory to search in" }
+                    "path": { "type": "string", "description": "Base directory to search in, relative to the workspace root or absolute" }
                 },
                 "required": ["pattern"]
             }),
@@ -89,7 +89,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Regex pattern to search for" },
-                    "path": { "type": "string", "description": "File or directory to search in" },
+                    "path": { "type": "string", "description": "File or directory to search in, relative to the workspace root or absolute" },
                     "include": { "type": "string", "description": "Glob to filter files" }
                 },
                 "required": ["pattern"]
@@ -101,7 +101,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Directory path to list" }
+                    "path": { "type": "string", "description": "Directory path to list, relative to the workspace root or absolute" }
                 },
                 "required": ["path"]
             }),
@@ -288,6 +288,66 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["action_type"]
             }),
         },
+        ToolDefinition {
+            name: "browser_use".to_string(),
+            description: "Control an in-app real browser (headless Edge) via CDP. Recommended MCP-style workflow: 1) call action_type='snapshot' to get interactive elements with stable refs; 2) act by ref with 'click_ref' / 'fill' / 'select' / 'hover_ref' — far more reliable than screenshot coordinates. Also supports navigate/screenshot/scroll/key/text. Every screenshot result includes page_text so text-only models can understand the page without vision. Use this instead of computer_use (which controls the real desktop).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action_type": {
+                        "type": "string",
+                        "enum": ["navigate", "goto", "snapshot", "click_ref", "fill", "select", "hover_ref", "screenshot", "click", "move", "scroll", "type", "key", "text", "read", "url", "load", "home", "wait"],
+                        "description": "'snapshot' lists interactive elements with refs (start here); 'click_ref'/'fill'/'select'/'hover_ref' act by ref; 'text'/'read' returns page text (for non-vision models); 'wait' waits ms then screenshots."
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "URL to open (for navigate/goto)"
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "Element ref from snapshot, e.g. 'e12' (for click_ref/fill/select/hover_ref)"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to fill (for fill/type). For fill, set submit=true to press Enter afterwards."
+                    },
+                    "submit": {
+                        "type": "boolean",
+                        "description": "For fill: press Enter after filling (submit forms/search)"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Option value to select (for select)"
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down"],
+                        "description": "Scroll direction (default down)"
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "description": "Scroll pixels (default 600)"
+                    },
+                    "ms": {
+                        "type": "integer",
+                        "description": "Milliseconds to wait (for wait, max 5000)"
+                    },
+                    "coordinate": {
+                        "type": "object",
+                        "properties": {
+                            "x": { "type": "integer", "description": "X coordinate (pixels)" },
+                            "y": { "type": "integer", "description": "Y coordinate (pixels)" }
+                        },
+                        "description": "Page coordinate for legacy click/move/scroll (prefer snapshot+click_ref)"
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Key name for key action (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown')"
+                    }
+                },
+                "required": ["action_type"]
+            }),
+        },
     ]
 }
 
@@ -333,6 +393,7 @@ pub async fn execute_tool_async(name: &str, input: serde_json::Value, cwd: &str)
         "git_commit" => tool_git_commit(input),
         "git_add" => tool_git_add(input),
         "computer_use" => tool_computer_use(input),
+        "browser_use" => crate::browser_use::execute_browser_action(input).await,
         _ => Ok(serde_json::json!({ "error": format!("Unknown tool: {}", name) })),
     }
 }
@@ -567,9 +628,25 @@ fn tool_computer_use(input: serde_json::Value) -> Result<serde_json::Value> {
 
     let manager = ComputerUseManager::new(ComputerUseConfig::default());
 
+    // panic.log 9/3 连续 4 次崩溃的根因：同步函数在 tokio 上下文里（execute_tool_async
+    // 路径）直接 handle.block_on → "Cannot start a runtime from within a runtime" panic。
+    // 修复：有 tokio 上下文时把执行移到独立阻塞线程 + 独立 runtime（绝不嵌套 block_on）；
+    // 无上下文时（spawn_blocking 线程路径）维持原有临时 runtime。
     let rt = tokio::runtime::Handle::try_current();
     let result: crate::computer_use::ComputerActionResult = match rt {
-        Ok(handle) => handle.block_on(manager.execute_action(action))?,
+        Ok(_handle) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let res = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .and_then(|rt| rt.block_on(manager.execute_action(action)).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e))));
+                let _ = tx.send(res);
+            });
+            let joined = rx.recv().map_err(|e| anyhow!("computer_use worker thread dropped: {}", e))?
+                .map_err(|e| anyhow!("computer_use runtime/task failed: {}", e))?;
+            joined
+        }
         Err(_) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(manager.execute_action(action))?
@@ -687,6 +764,12 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         cmd.output()
@@ -750,9 +833,12 @@ fn truncate_str(s: &str, max_len: usize) -> (String, bool) {
     if s.len() <= max_len {
         (s.to_string(), false)
     } else {
-        let truncated = &s[..max_len];
-        // Don't break in the middle of a UTF-8 char
-        let safe_end = truncated.len();
+        // 回退到 UTF-8 字符边界：&s[..max_len] 若切在多字节字符中间会直接 panic
+        // （panic.log 里 tools/mod.rs 的多次崩溃源于此）。is_char_boundary 回退修复。
+        let mut safe_end = max_len;
+        while safe_end > 0 && !s.is_char_boundary(safe_end) {
+            safe_end -= 1;
+        }
         let truncated = &s[..safe_end];
         (format!("{}\n... (truncated, {} bytes total)", truncated, s.len()), true)
     }
@@ -779,6 +865,12 @@ fn tool_bash(input: serde_json::Value, cwd: &str) -> Result<serde_json::Value> {
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
 
     let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to spawn: {}", e))?;
     let start = std::time::Instant::now();
@@ -1170,7 +1262,7 @@ async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Va
     const MAX_CONTENT_SIZE: usize = 1_048_576;
     let body = response.text().await?;
     let truncated = body.len() > MAX_CONTENT_SIZE;
-    let body = if truncated { &body[..MAX_CONTENT_SIZE] } else { &body };
+    let body = if truncated { crate::truncate::safe_truncate(&body, MAX_CONTENT_SIZE) } else { &body };
 
     // For HTML content, convert to plain text
     let output = if content_type.contains("text/html") {
@@ -1303,13 +1395,19 @@ fn tool_web_search_blocking(input: serde_json::Value) -> Result<serde_json::Valu
 }
 
 fn run_git_command(args: &[&str], cwd: &str) -> Result<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| anyhow!("Failed to execute git: {}", e))
+        .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    cmd.output().map_err(|e| anyhow!("Failed to execute git: {}", e))
 }
 
 fn tool_git_status(input: serde_json::Value) -> Result<serde_json::Value> {
@@ -1327,7 +1425,8 @@ fn tool_git_status(input: serde_json::Value) -> Result<serde_json::Value> {
         }));
     }
 
-    let files: Vec<serde_json::Value> = stdout.lines().filter(|l| !l.is_empty()).map(|line| {
+    // 守卫短行：porcelain 合法行恒为 XY + 空格 + 路径（>=3 字节），len<3 时切切片会 panic
+    let files: Vec<serde_json::Value> = stdout.lines().filter(|l| l.len() >= 3).map(|line| {
         let status = &line[..2];
         let file_path = &line[3..];
         serde_json::json!({

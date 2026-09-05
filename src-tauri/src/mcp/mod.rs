@@ -694,6 +694,12 @@ impl McpConnector {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
         let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to start '{}': {}", command, e))?;
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to take stdin"))?;

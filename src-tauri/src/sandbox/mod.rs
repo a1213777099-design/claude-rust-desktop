@@ -147,6 +147,12 @@ impl CodeSandbox {
             }
         }
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
         let output = cmd.output();
         
         std::fs::remove_file(&script_path).ok();
@@ -215,6 +221,12 @@ impl CodeSandbox {
             }
         }
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
         let output = cmd.output();
         
         std::fs::remove_file(&script_path).ok();
@@ -270,6 +282,12 @@ impl CodeSandbox {
             }
         }
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
         let output = cmd.output();
 
         match output {
@@ -321,6 +339,12 @@ impl CodeSandbox {
             for (key, value) in env_vars {
                 cmd.env(key, value);
             }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
         let output = cmd.output();
@@ -382,11 +406,16 @@ impl CodeSandbox {
             };
         }
 
-        let compile_result = Command::new("rustc")
-            .arg(&source_path)
-            .arg("-o")
-            .arg(&exe_path)
-            .output();
+        let mut cmd = Command::new("rustc");
+        cmd.arg(&source_path).arg("-o").arg(&exe_path);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let compile_result = cmd.output();
 
         match compile_result {
             Ok(compile_output) => {
@@ -415,6 +444,12 @@ impl CodeSandbox {
                     for (key, value) in env_vars {
                         cmd.env(key, value);
                     }
+                }
+
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
                 }
 
                 let run_output = cmd.output();
@@ -500,6 +535,12 @@ impl CodeSandbox {
             for (key, value) in env_vars {
                 cmd.env(key, value);
             }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
         let output = cmd.output();

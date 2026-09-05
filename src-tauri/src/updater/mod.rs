@@ -120,9 +120,16 @@ impl AutoUpdater {
         #[cfg(windows)]
         {
             use std::process::Command;
-            Command::new("cmd.exe")
-                .args(["/C", "start", "", file_path.to_str().unwrap_or("")])
-                .spawn()?;
+            let mut cmd = Command::new("cmd.exe");
+            cmd.args(["/C", "start", "", file_path.to_str().unwrap_or("")]);
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+
+            cmd.spawn()?;
         }
 
         #[cfg(not(windows))]

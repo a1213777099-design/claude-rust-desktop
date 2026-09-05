@@ -1,6 +1,6 @@
 [package]
 name = "claude-desktop-tauri"
-version = "2.1.2"
+version = "2.1.28"
 description = "Claude Desktop - AI assistant with native capabilities (Tauri Edition)"
 authors = ["you"]
 edition = "2021"
@@ -19,13 +19,17 @@ tauri-build = { version = "2", features = [] }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# panic = "unwind" 是默认策略：portable-pty(ConPTY) 依赖 unwind 运行时，
+# 且对 GUI 应用更友好（线程 panic 不会让整个进程崩溃）
+panic = "unwind"
 strip = true
 incremental = false
 
+# 注意：不能设置 -C prefer-dynamic=false，因为与 lto = "thin" 冲突
+# （rustc: cannot prefer dynamic linking when performing LTO）。
+# 默认值即 prefer-dynamic=false（std 静态链入），删掉此 flag 行为不变。
 [target.'cfg(target_os = "windows")']
 rustflags = [
-  "-C", "prefer-dynamic=false",
   "-C", "target-feature=+crt-static",
   "-C", "link-arg=/SUBSYSTEM:CONSOLE",
 ]
@@ -75,6 +79,8 @@ windows = { version = "0.58", features = ["Win32_Graphics_Gdi", "Win32_UI_Window
 fastembed = "4"
 socket2 = "0.5"
 parking_lot = "0.12"
+portable-pty = { git = "https://github.com/wezterm/wezterm", package = "portable-pty" }
+tokio-tungstenite = "0.26"
 
 # Clustering & numerical computing (P2 features)
 linfa-clustering = "0.7"

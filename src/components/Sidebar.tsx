@@ -27,6 +27,7 @@ import { getConversations, deleteConversation, updateConversation, getUser, getU
 import SearchModal from './SearchModal';
 import CostTracker from './CostTracker';
 import EmbeddedBrowser from './EmbeddedBrowser';
+import BrowserLivePanel from './BrowserLivePanel';
 
 interface SidebarProps {
   isCollapsed: boolean;
@@ -1352,8 +1353,7 @@ const Sidebar = ({ isCollapsed, toggleSidebar, refreshTrigger, onNewChatClick, o
             borderRadius: '0 12px 12px 0'
           }}
         >
-          <EmbeddedBrowser
-            initialUrl={browserUrl}
+          <BrowserLivePanel
             onClose={() => setShowBrowser(false)}
             className="flex-1"
           />

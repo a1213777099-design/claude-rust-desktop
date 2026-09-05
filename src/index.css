@@ -465,3 +465,411 @@ html[data-chat-font] .chat-font-scope input,
 html[data-chat-font] .chat-font-scope .markdown-body {
   font-family: inherit;
 }
+
+/* ============================================================
+   DSH-style flow rows（参照 deepseek-harness ui-chat/ui-tool）
+   24px 单行折叠条 + 运行扫光 + 状态点 + IO 展开卡
+   ============================================================ */
+
+:root {
+  --dsh-row-h: 24px;
+  --dsh-row-font: 13px;
+  --dsh-label-primary: var(--text-claude-main);
+  --dsh-label-secondary: #565550;
+  --dsh-label-tertiary: #82817B;
+  --dsh-label-caption: #A5A49E;
+  --dsh-state-success: #16a34a;
+  --dsh-state-error: #dc2626;
+  --dsh-state-warn: #f59e0b;
+  --dsh-state-ongoing: #4b7bec;
+  --dsh-code-bg: #FAF9F5;
+  --dsh-border-l1: rgba(0, 0, 0, 0.05);
+  --dsh-border-l2: rgba(0, 0, 0, 0.1);
+}
+
+.dark {
+  --dsh-label-secondary: #B8B7B2;
+  --dsh-label-tertiary: #8A8985;
+  --dsh-label-caption: #676663;
+  --dsh-state-success: #22c55e;
+  --dsh-state-error: #f87171;
+  --dsh-state-warn: #fbbf24;
+  --dsh-state-ongoing: #6d9bff;
+  --dsh-code-bg: rgba(255, 255, 255, 0.04);
+  --dsh-border-l1: rgba(255, 255, 255, 0.06);
+  --dsh-border-l2: rgba(255, 255, 255, 0.1);
+}
+
+/* --- 24px 折叠条（DisclosureRow 等价物） --- */
+.dsh-flowrow-root {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-width: 0;
+}
+
+.dsh-flowrow {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  height: var(--dsh-row-h);
+  min-width: 0;
+  border-radius: 6px;
+}
+
+.dsh-flowrow[data-expandable] {
+  cursor: pointer;
+}
+
+.dsh-flowrow:hover {
+  background: rgba(0, 0, 0, 0.025);
+}
+
+.dark .dsh-flowrow:hover {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+/* 运行中扫光：固定宽度光带从左滑到右（deepsuite ShimmerText 模式） */
+.dsh-flowrow[data-state='running']::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 300px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--bg-claude-main) 60%, transparent) 55%,
+    transparent 100%
+  );
+  animation: dsh-row-sweep 2.6s ease-out infinite;
+  pointer-events: none;
+}
+
+@keyframes dsh-row-sweep {
+  0% { left: -300px; }
+  90%, 100% { left: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dsh-flowrow[data-state='running']::after {
+    animation: none;
+  }
+}
+
+.dsh-flowrow-leading {
+  position: relative;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 6px;
+  color: var(--dsh-label-tertiary);
+}
+
+/* hover 时图标淡出、chevron 淡入（previewChevron 行为） */
+.dsh-flowrow-leading .dsh-icon-idle {
+  display: inline-flex;
+  opacity: 1;
+  transition: opacity 100ms ease;
+}
+
+.dsh-flowrow-leading .dsh-chevron-hover {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  opacity: 0;
+  transition: opacity 100ms ease;
+  color: var(--dsh-label-secondary);
+}
+
+.dsh-flowrow:hover .dsh-icon-idle {
+  opacity: 0;
+}
+
+.dsh-flowrow:hover .dsh-chevron-hover {
+  opacity: 1;
+}
+
+.dsh-flowrow-title {
+  flex: none;
+  font-size: var(--dsh-row-font);
+  line-height: var(--dsh-row-h);
+  color: var(--dsh-label-secondary);
+}
+
+/* 标题与摘要之间的 2x2 分隔点 */
+.dsh-flowrow-sep {
+  flex: none;
+  width: 2px;
+  height: 2px;
+  border-radius: 1px;
+  margin: 0 8px;
+  background: var(--dsh-label-caption);
+}
+
+/* 摘要：次级灰，单行截断 */
+.dsh-flowrow-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--dsh-row-font);
+  line-height: var(--dsh-row-h);
+  color: var(--dsh-label-tertiary);
+}
+
+/* 流式中摘要跟随最新行：右对齐 + 不截断（随文本增长向左推进） */
+.dsh-flowrow-summary[data-follow-end] {
+  display: flex;
+  justify-content: flex-end;
+  flex: 1 1 auto;
+}
+
+.dsh-flowrow-summary[data-follow-end] .dsh-summary-text {
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 100%;
+  overflow: visible;
+  text-align: start;
+  text-overflow: clip;
+}
+
+.dsh-summary-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 错误行摘要红字 */
+.dsh-flowrow-summary[data-error] {
+  color: var(--dsh-state-error);
+}
+
+/* 文件路径：虚线下划线链接样式 */
+.dsh-flowrow-filelink {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  text-align: left;
+  font-size: var(--dsh-row-font);
+  line-height: var(--dsh-row-h);
+  color: var(--dsh-label-secondary);
+  text-decoration: underline dotted;
+  text-decoration-color: var(--dsh-label-tertiary);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.dsh-flowrow-filelink:hover {
+  color: var(--dsh-label-primary);
+  text-decoration-color: currentColor;
+}
+
+/* diff 统计后缀 */
+.dsh-flowrow-suffix {
+  flex: none;
+  margin-left: 4px;
+  white-space: nowrap;
+  font-size: calc(var(--dsh-row-font) - 2px);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--dsh-label-caption);
+}
+
+/* --- 状态点（StateDot 等价物） --- */
+.dsh-statedot {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 10px;
+  height: 10px;
+}
+
+.dsh-statedot::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.1;
+}
+
+.dsh-statedot::after {
+  content: '';
+  position: absolute;
+  inset: 20%;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.dsh-statedot[data-state='done'] { color: var(--dsh-state-success); }
+.dsh-statedot[data-state='warning'] { color: var(--dsh-state-warn); }
+.dsh-statedot[data-state='error'] { color: var(--dsh-state-error); }
+
+/* 像素追逐环：3x3 矩阵格，逐格点亮（running 态） */
+.dsh-chase {
+  flex: none;
+  color: var(--dsh-state-ongoing);
+}
+
+.dsh-chase rect {
+  fill: currentColor;
+  opacity: 0.15;
+  animation: dsh-state-chase 1s infinite;
+}
+
+@keyframes dsh-state-chase {
+  0%, 12.4% { opacity: 1; }
+  12.5%, 24.9% { opacity: 0.6; }
+  25%, 37.4% { opacity: 0.35; }
+  37.5%, 100% { opacity: 0.15; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dsh-chase rect { animation: none; opacity: 0.6; }
+}
+
+/* --- 展开体：IN/OUT 卡（等价 ioCard） --- */
+.dsh-iocard {
+  display: flex;
+  flex-direction: column;
+  margin: 4px 0 4px 20px;
+  border: 0.5px solid var(--dsh-border-l1);
+  border-radius: 12px;
+  background: var(--dsh-code-bg);
+  font-size: 12px;
+  line-height: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.dsh-iosection {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 14px;
+  align-items: baseline;
+  padding: 10px 14px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.dsh-iosection::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+
+.dsh-iolabel {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  color: var(--dsh-label-caption);
+  font-family: 'Figtree', sans-serif;
+}
+
+.dsh-iodivider {
+  flex: none;
+  height: 0.5px;
+  background: var(--dsh-border-l2);
+}
+
+.dsh-iotext {
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--dsh-label-secondary);
+}
+
+.dsh-iotext[data-error] {
+  color: var(--dsh-state-error);
+}
+
+/* --- 终端卡展开体 --- */
+.dsh-terminalbody {
+  margin: 4px 0 4px 20px;
+  border: 0.5px solid var(--dsh-border-l1);
+  border-radius: 12px;
+  background: var(--dsh-code-bg);
+  overflow: hidden;
+}
+
+.dsh-terminalbody pre {
+  max-height: 224px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 10px 14px;
+  font-size: 12px;
+  line-height: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--dsh-label-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* --- diff 卡展开体 --- */
+.dsh-diffbody {
+  margin: 4px 0 4px 20px;
+  border: 0.5px solid var(--dsh-border-l1);
+  border-radius: 12px;
+  background: var(--dsh-code-bg);
+  overflow: hidden;
+}
+
+.dsh-diffbody pre {
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* --- 思考行展开体 --- */
+.dsh-thinkbody {
+  padding: 4px 0 6px 22px;
+  color: var(--dsh-label-tertiary);
+  font-size: var(--dsh-row-font);
+  line-height: 20px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* --- 工具行之间交错的中间叙述文本（dsh 流程区 text node 等价物） --- */
+.dsh-process-text {
+  padding: 6px 0 6px 22px;
+  color: var(--dsh-label-secondary);
+  font-size: 13.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 88px;
+  overflow: hidden;
+  mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+}
+
+/* --- 头尾截断（head-tail-cap）：首尾保留、中段折叠 --- */
+.dsh-cap-skip {
+  color: var(--dsh-label-caption);
+  font-size: 11.5px;
+  padding: 2px 0;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+}
+
+.dsh-cap-skip:hover {
+  color: var(--dsh-label-secondary);
+}

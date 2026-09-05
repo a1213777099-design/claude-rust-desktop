@@ -30,9 +30,16 @@ impl NotificationManager {
             title, body
         );
 
-        Command::new("powershell")
-            .args(["-WindowStyle", "Hidden", "-Command", &script])
-            .spawn()?;
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-WindowStyle", "Hidden", "-Command", &script]);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        cmd.spawn()?;
 
         Ok(())
     }

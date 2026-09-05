@@ -220,6 +220,7 @@ pub async fn chat_send(
             web_search_enabled: None,
                 reasoning_effort: None,
                 extended_thinking: false,
+                enable_streaming: true,
         };
 
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;
@@ -265,6 +266,7 @@ pub async fn chat_stream(
             web_search_enabled: None,
                 reasoning_effort: None,
                 extended_thinking: false,
+                enable_streaming: true,
         };
 
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;
@@ -554,6 +556,7 @@ pub async fn native_chat(
             web_search_enabled: None,
                 reasoning_effort: None,
                 extended_thinking: false,
+                enable_streaming: true,
         };
     
     let mut rx = engine.send_message(chat_request).await.map_err(|e| e.to_string())?;

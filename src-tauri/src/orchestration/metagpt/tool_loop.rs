@@ -48,11 +48,18 @@ fn emit_phase(role: &str, phase: &str, msg: String, extra: Option<Value>) {
 /// Char-boundary-safe byte truncation. The old `&s[..8000]` slices could
 /// split a multi-byte UTF-8 char and panic, silently killing the whole role
 /// task (seen as the workflow stalling mid-run).
+///
+/// 截断标注明确写出"内容不完整"，避免 LLM 把残缺输出当作完整事实
+/// 进行脑补（程序级"幻觉"源头之一）。
 fn truncate_bytes_safe(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes { return s.to_string(); }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
-    format!("{}...[truncated, {} chars total]", &s[..end], s.chars().count())
+    let shown = crate::truncate::safe_truncate(s, max_bytes);
+    format!(
+        "{}\n[NOTICE: output truncated for length. The content above is INCOMPLETE — {} bytes total, {} shown. Do NOT guess or infer the missing portion; state that output was truncated if it matters.]",
+        shown,
+        s.len(),
+        shown.len(),
+    )
 }
 
 const HARD_MAX_ITERATIONS: usize = 200;

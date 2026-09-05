@@ -73,10 +73,16 @@ impl GitIntegration {
     }
 
     fn run_git(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&self.working_dir)
-            .output()?;
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(&self.working_dir);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let output = cmd.output()?;
 
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -91,6 +97,12 @@ impl GitIntegration {
         let mut cmd = AsyncCommand::new("git");
         cmd.args(args).current_dir(&self.working_dir);
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
         let output = cmd.output().await?;
 
         if output.status.success() {
@@ -102,10 +114,16 @@ impl GitIntegration {
     }
 
     pub fn is_repo(&self) -> bool {
-        Command::new("git")
-            .args(["rev-parse", "--git-dir"])
-            .current_dir(&self.working_dir)
-            .output()
+        let mut cmd = Command::new("git");
+        cmd.args(["rev-parse", "--git-dir"]).current_dir(&self.working_dir);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        cmd.output()
             .map(|o| o.status.success())
             .unwrap_or(false)
     }

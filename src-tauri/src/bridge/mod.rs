@@ -29,7 +29,7 @@ use crate::updater::AutoUpdater;
 use crate::watcher::FileWatcher;
 use anyhow::Result;
 use axum::{
-    extract::{Path, Query, State, Multipart},
+    extract::{Path, Query, State, Multipart, DefaultBodyLimit},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     routing::{delete, get, patch, post, put},
@@ -74,7 +74,6 @@ pub struct BridgeServer {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ChatRequest {
     pub conversation_id: String,
-    pub messages: Option<Vec<serde_json::Value>>,
     pub message: Option<String>,
     pub model: String,
     pub user_mode: Option<String>,
@@ -90,19 +89,11 @@ pub struct ChatRequest {
 }
 
 impl ChatRequest {
-    pub fn get_messages(&self) -> Vec<serde_json::Value> {
-        if let Some(msgs) = &self.messages {
-            if !msgs.is_empty() {
-                return msgs.clone();
-            }
-        }
-        if let Some(msg) = &self.message {
-            return vec![serde_json::json!({
-                "role": "user",
-                "content": msg
-            })];
-        }
-        vec![]
+    pub fn single_message(&self) -> Option<serde_json::Value> {
+        self.message.as_ref().map(|msg| serde_json::json!({
+            "role": "user",
+            "content": msg
+        }))
     }
 }
 
@@ -301,6 +292,11 @@ impl BridgeServer {
 
         let app = Router::new()
             .route("/api/system-status", get(system_status))
+            .route("/api/browser/view", get(browser_view_handler))
+            .route("/api/browser/status", get(browser_status_handler))
+            .route("/api/browser/navigate", post(browser_navigate_handler))
+            .route("/api/browser/interact", post(browser_interact_handler))
+            .route("/api/browser/snapshot", get(browser_snapshot_handler))
             .route("/api/open-folder", post(open_folder_handler))
             .route("/api/workspace-config", get(workspace_config_get))
             .route("/api/workspace-config", post(workspace_config_set))
@@ -323,6 +319,8 @@ impl BridgeServer {
             .route("/api/conversations/{id}/permission", post(conversation_permission_handler))
             .route("/api/conversations/{id}/warm", post(conversation_warm_handler))
             .route("/api/conversations/{id}/context-size", get(context_size_handler))
+            .route("/api/conversations/{id}/stream-status", get(conversation_stream_status_handler))
+            .route("/api/conversations/{id}/reconnect", get(conversation_reconnect_handler))
             .route("/api/conversations/{id}/compact", post(compact_handler))
             .route("/api/projects", get(projects_list).post(projects_create))
             .route("/api/projects/{id}", get(projects_get).patch(projects_update).delete(projects_delete))
@@ -384,11 +382,12 @@ impl BridgeServer {
             .route("/api/git/commit", post(git_commit_handler))
             .route("/api/git/push", post(git_push_handler))
             .route("/api/git/pull", post(git_pull_handler))
-            .route("/api/terminal/create", post(terminal_create))
-            .route("/api/terminal/write", post(terminal_write))
-            .route("/api/terminal/resize", post(terminal_resize))
-            .route("/api/terminal/close", post(terminal_close))
-            .route("/api/terminal/list", get(terminal_list))
+            .route("/api/terminals", post(terminal_create))
+            .route("/api/terminals", get(terminal_list))
+            .route("/api/terminals/{id}/write", post(terminal_write))
+            .route("/api/terminals/{id}/resize", post(terminal_resize))
+            .route("/api/terminals/{id}", delete(terminal_close))
+            .route("/api/terminals/{id}/stream", get(terminal_stream))
             .route("/api/process/spawn", post(process_spawn))
             .route("/api/process/{pid}", delete(process_kill))
             .route("/api/process/list", get(process_list))
@@ -451,6 +450,7 @@ impl BridgeServer {
             .route("/api/tdai/memory/{id}/promote", post(tdai_promote))
             .route("/api/tdai/stats", get(tdai_stats))
 
+            .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
             .layer(cors)
             .with_state(state);
 
@@ -482,6 +482,128 @@ async fn system_status() -> Json<SystemStatus> {
             path: git_bash_path,
         },
     })
+}
+
+/// 返回当前浏览器实时画面（base64 PNG），供前端侧边栏显示模型所见。
+async fn browser_view_handler() -> Json<serde_json::Value> {
+    match crate::browser_use::capture_png().await {
+        Ok(b64) => Json(serde_json::json!({
+            "success": true,
+            "data": b64,
+            "url": crate::browser_use::browser_session().get_url().await.unwrap_or_default(),
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e.to_string(),
+        })),
+    }
+}
+
+/// 返回浏览器会话状态（是否就绪、当前 URL）。
+async fn browser_status_handler() -> Json<serde_json::Value> {
+    let session = crate::browser_use::browser_session();
+    match session.ensure_ready().await {
+        Ok(_) => Json(serde_json::json!({
+            "ready": true,
+            "url": session.get_url().await.unwrap_or_default(),
+        })),
+        Err(e) => Json(serde_json::json!({ "ready": false, "error": e.to_string() })),
+    }
+}
+
+/// 前端地址栏导航（同时给模型与用户共用同一个会话画面）。
+async fn browser_navigate_handler(
+    Json(req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let session = crate::browser_use::browser_session();
+    let raw = req.get("url").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if raw.is_empty() {
+        return Json(serde_json::json!({ "success": false, "error": "url required" }));
+    }
+    // 特殊动作：后退 / 前进 / 起始页。
+    match raw.as_str() {
+        "__back__" => {
+            let r = session
+                .send_cmd("Runtime.evaluate", serde_json::json!({ "expression": "history.back()", "returnByValue": true }))
+                .await;
+            return match r {
+                Ok(_) => Json(serde_json::json!({ "success": true })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+            };
+        }
+        "__forward__" => {
+            let r = session
+                .send_cmd("Runtime.evaluate", serde_json::json!({ "expression": "history.forward()", "returnByValue": true }))
+                .await;
+            return match r {
+                Ok(_) => Json(serde_json::json!({ "success": true })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+            };
+        }
+        "home://start" => {
+            let r = session.navigate_home().await;
+            return match r {
+                Ok(_) => Json(serde_json::json!({ "success": true, "url": "home://start" })),
+                Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+            };
+        }
+        _ => {}
+    }
+    // 无协议时补 https://；纯关键词走必应搜索。
+    let looks_like_url = raw.starts_with("http://")
+        || raw.starts_with("https://")
+        || raw.starts_with("data:")
+        || raw.starts_with("file:")
+        || (raw.contains('.') && !raw.contains(' '));
+    let target = if looks_like_url {
+        if raw.starts_with("http") || raw.starts_with("data:") || raw.starts_with("file:") {
+            raw.clone()
+        } else {
+            format!("https://{}", raw)
+        }
+    } else {
+        format!("https://www.bing.com/search?q={}", urlencoding::encode(&raw))
+    };
+    match session.navigate(&target).await {
+        Ok(_) => {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            Json(serde_json::json!({ "success": true, "url": target }))
+        }
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// 人工面板交互：把用户在画面上的点击/滚轮/键盘转发给真实页面。
+async fn browser_interact_handler(
+    Json(req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let session = crate::browser_use::browser_session();
+    let action = req.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    let x = req.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+    let y = req.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+    let dx = req.get("dx").and_then(|v| v.as_i64()).unwrap_or(0);
+    let dy = req.get("dy").and_then(|v| v.as_i64()).unwrap_or(0);
+    let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("");
+    let text = req.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if action.is_empty() {
+        return Json(serde_json::json!({ "success": false, "error": "action required" }));
+    }
+    match session.interact(action, x, y, dx, dy, key, text).await {
+        Ok(_) => Json(serde_json::json!({ "success": true })),
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
+}
+
+/// 结构化快照（供面板/调试）：返回当前页面可交互元素列表。
+async fn browser_snapshot_handler() -> Json<serde_json::Value> {
+    let session = crate::browser_use::browser_session();
+    match session.ensure_ready().await {
+        Ok(_) => match session.snapshot().await {
+            Ok(elements) => Json(serde_json::json!({ "success": true, "elements": elements })),
+            Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+        },
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
+    }
 }
 
 #[derive(Deserialize)]
@@ -579,14 +701,19 @@ async fn chat_handler(
     let config_manager = state.config_manager.clone();
     let conv_id = req.conversation_id.clone();
     let model = req.model.clone();
-    let messages = req.get_messages();
+    // 从 DB 派生完整历史（含 tool_calls），前端仅传增量 message，避免请求体随历史膨胀
+    let mut messages = load_conversation_history(state.db_manager.clone(), &conv_id).await;
+    if let Some(msg) = &req.message {
+        messages.push(serde_json::json!({ "role": "user", "content": msg }));
+    }
+    let messages_len = messages.len();
 
-    log_to_file!("[Chat] Received request: conv_id={}, model={}, messages={}", conv_id, model, messages.len());
+    log_to_file!("[Chat] Received request: conv_id={}, model={}, messages={}", conv_id, model, messages_len);
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
     // Research mode: route to research pipeline
     if req.research_mode == Some(true) {
-        let query = messages.last().and_then(|m| m.get("content").and_then(|c| c.as_str())).unwrap_or("").to_string();
+        let query = req.message.clone().unwrap_or_default();
         let providers_sync = {
             let cm = config_manager.lock().await;
             if let Some(cm) = cm.as_ref() {
@@ -641,7 +768,7 @@ async fn chat_handler(
                     let _ = db.with_conn(|conn| {
                         let mid = uuid::Uuid::new_v4().to_string();
                         let now = chrono::Utc::now().to_rfc3339();
-                        let so = crate::db::message_repo::get_messages_by_conversation(conn, &cid).unwrap_or_default().len() as i64;
+                        let so = crate::db::message_repo::next_sort_order(conn, &cid);
                         let _ = crate::db::message_repo::insert_message(conn, &mid, &cid, "assistant", &report, None, &now, false, so);
                         let _ = crate::db::conversation_repo::increment_message_count(conn, &cid);
                         Ok::<(), rusqlite::Error>(())
@@ -716,6 +843,7 @@ async fn chat_handler(
                 web_search_enabled: req.web_search_enabled,
                 reasoning_effort: req.reasoning_effort.clone(),
                 extended_thinking: req.extended_thinking.unwrap_or(false) || model.ends_with("-thinking"),
+                enable_streaming: req.enable_streaming.unwrap_or(true),
             };
                     log_to_file!("[Chat] Calling send_message...");
             match engine.send_message(chat_req).await {
@@ -732,6 +860,15 @@ async fn chat_handler(
     };
 
     log_to_file!("[Chat] Creating SSE stream...");
+    // 服务端事件历史：任何 SSE 消费者（重连端点）都能从此重放，恢复工具卡片与用量。
+    {
+        let mut mgr = state.stream_manager.lock().await;
+        if !mgr.is_active(&conv_id) {
+            mgr.create_stream(&conv_id);
+        }
+    }
+    let sm_for_events = state.stream_manager.clone();
+    let conv_id_for_events = conv_id.clone();
     let stream = async_stream::stream! {
         let mut rx = match rx_opt {
             Some(rx) => rx,
@@ -838,6 +975,18 @@ async fn chat_handler(
             if let Some(data) = event_data {
                 let is_stop = data.get("type").and_then(|t| t.as_str()) == Some("message_stop")
                     || data.get("type").and_then(|t| t.as_str()) == Some("error");
+                // 写入服务端事件历史（供 stream-status / reconnect 重放）。
+                {
+                    let mut mgr = sm_for_events.lock().await;
+                    mgr.broadcast(
+                        &conv_id_for_events,
+                        crate::streaming::StreamEvent {
+                            event_type: data.get("type").and_then(|t| t.as_str()).unwrap_or("event").to_string(),
+                            data: data.clone(),
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                        },
+                    );
+                }
                 yield Ok::<Event, Infallible>(Event::default().data(data.to_string()));
                 if is_stop {
                     break;
@@ -845,6 +994,10 @@ async fn chat_handler(
             }
         }
 
+        {
+            let mut mgr = sm_for_events.lock().await;
+            mgr.end_stream(&conv_id_for_events);
+        }
         log_to_file!("[Chat] Stream ended for conv_id={}", conv_id);
     };
 
@@ -902,6 +1055,64 @@ async fn tools_handler(
     }
 }
 
+/// 查询会话是否有活跃的流（前端切回会话时判断是否需要重连）。
+async fn conversation_stream_status_handler(
+    Path(conv_id): Path<String>,
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let mut mgr = state.stream_manager.lock().await;
+    mgr.cleanup_done_streams();
+    let active = mgr.is_active(&conv_id);
+    let event_count = mgr.get_events(&conv_id).map(|e| e.len()).unwrap_or(0);
+    Json(serde_json::json!({ "active": active, "eventCount": event_count }))
+}
+
+/// 重连会话流：先重放服务端事件历史（含 tool_use_start/usage），再续传实时事件。
+/// 流结束时发 [DONE]。前端 reconnectStream 可据此恢复工具卡片、文本与 token 统计。
+async fn conversation_reconnect_handler(
+    Path(conv_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<axum::response::Response, StatusCode> {
+    let (rx, history) = {
+        let mut mgr = state.stream_manager.lock().await;
+        mgr.add_listener_with_replay(&conv_id)
+            .ok_or(StatusCode::NOT_FOUND)?
+    };
+    let stream = async_stream::stream! {
+        // 1) 重放历史事件
+        for ev in history {
+            let payload = serde_json::to_string(&ev.data).unwrap_or_default();
+            yield Ok::<Event, Infallible>(Event::default().data(payload));
+        }
+        // 2) 续传实时事件
+        let mut rx = rx;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.event_type == "stream_done" {
+                        yield Ok(Event::default().data("[DONE]"));
+                        break;
+                    }
+                    let payload = serde_json::to_string(&event.data).unwrap_or_default();
+                    yield Ok(Event::default().data(payload));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => {
+                    // 所有发送端已关闭（引擎流结束）：通知前端收尾。
+                    yield Ok(Event::default().data("[DONE]"));
+                    break;
+                }
+            }
+        }
+    };
+    let mut response = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        "text/event-stream; charset=utf-8".parse().unwrap(),
+    );
+    Ok(response)
+}
+
 async fn tool_execute_handler(
     State(_state): State<AppState>,
     Json(req): Json<ToolRequest>,
@@ -948,9 +1159,9 @@ async fn conversations_create(State(state): State<AppState>) -> Json<serde_json:
     Json(serde_json::json!({ "id": id }))
 }
 
-async fn conversation_get(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
-    let db = state.db_manager.clone();
-    let id_clone = id.clone();
+/// 从 DB 派生对话历史（含 tool_calls 聚合），模型上下文组装与 conversation_get 共用。
+async fn load_conversation_history(db: std::sync::Arc<crate::db::DbManager>, conv_id: &str) -> Vec<serde_json::Value> {
+    let id_clone = conv_id.to_string();
     let result = tokio::task::spawn_blocking(move || {
         db.with_conn(|conn| -> anyhow::Result<(Vec<crate::db::message_repo::MessageRow>, Vec<crate::db::message_repo::ToolCallRow>)> {
             let messages = crate::db::message_repo::get_messages_by_conversation(conn, &id_clone)?;
@@ -965,7 +1176,7 @@ async fn conversation_get(Path(id): Path<String>, State(state): State<AppState>)
             for tc in &tool_calls {
                 by_msg.entry(tc.message_id.clone()).or_default().push(tc);
             }
-            let messages: Vec<serde_json::Value> = messages.into_iter().map(|m| {
+            messages.into_iter().map(|m| {
                 let mut v = serde_json::to_value(&m).unwrap_or(serde_json::json!({}));
                 let mid = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
                 if let Some(list) = by_msg.get(&mid) {
@@ -978,11 +1189,15 @@ async fn conversation_get(Path(id): Path<String>, State(state): State<AppState>)
                     })).collect::<Vec<_>>());
                 }
                 v
-            }).collect();
-            Json(serde_json::json!({ "id": id, "messages": messages }))
+            }).collect()
         }
-        _ => Json(serde_json::json!({ "id": id, "messages": [] })),
+        _ => Vec::new(),
     }
+}
+
+async fn conversation_get(Path(id): Path<String>, State(state): State<AppState>) -> Json<serde_json::Value> {
+    let messages = load_conversation_history(state.db_manager.clone(), &id).await;
+    Json(serde_json::json!({ "id": id, "messages": messages }))
 }
 
 async fn conversation_update(Path(id): Path<String>, State(state): State<AppState>, Json(messages): Json<Vec<serde_json::Value>>) -> Json<serde_json::Value> {
@@ -2648,9 +2863,7 @@ async fn research_start_handler(State(state): State<AppState>, Json(req): Json<C
     let active_research = state.active_research.clone();
 
     let model = if req.model.is_empty() { "claude-sonnet-4-20250514".to_string() } else { req.model.clone() };
-    let query = req.get_messages().last()
-        .and_then(|m| m.get("content").and_then(|c| c.as_str()).map(String::from))
-        .unwrap_or_default();
+    let query = req.message.clone().unwrap_or_default();
 
     let providers_to_sync = {
         let cm_guard: tokio::sync::MutexGuard<'_, Option<ConfigManager>> = config_manager.lock().await;
@@ -3007,27 +3220,30 @@ async fn git_pull_handler(State(_state): State<AppState>, Json(req): Json<GitReq
 pub struct TerminalCreateRequest {
     pub cwd: Option<String>,
     pub shell: Option<String>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub rows: Option<u16>,
 }
 
 async fn terminal_create(State(state): State<AppState>, Json(req): Json<TerminalCreateRequest>) -> Json<serde_json::Value> {
     let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
-    match manager.create_session(req.cwd, req.shell).await {
-        Ok(session) => Json(serde_json::to_value(session).unwrap_or_default()),
+    match manager.create_session(req.cwd, req.shell, req.cols, req.rows).await {
+        Ok(session) => Json(serde_json::json!({ "terminal_id": session.id, "session": session })),
         Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
     }
 }
 
 #[derive(Deserialize)]
 pub struct TerminalWriteRequest {
-    pub session_id: String,
     pub data: String,
 }
 
-async fn terminal_write(State(state): State<AppState>, Json(req): Json<TerminalWriteRequest>) -> Json<serde_json::Value> {
+async fn terminal_write(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<TerminalWriteRequest>) -> Json<serde_json::Value> {
     let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
-    match manager.write_input(&req.session_id, &req.data).await {
+    match manager.write_input(&id, &req.data).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
         Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
     }
@@ -3035,24 +3251,23 @@ async fn terminal_write(State(state): State<AppState>, Json(req): Json<TerminalW
 
 #[derive(Deserialize)]
 pub struct TerminalResizeRequest {
-    pub session_id: String,
     pub cols: u16,
     pub rows: u16,
 }
 
-async fn terminal_resize(State(state): State<AppState>, Json(req): Json<TerminalResizeRequest>) -> Json<serde_json::Value> {
+async fn terminal_resize(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<TerminalResizeRequest>) -> Json<serde_json::Value> {
     let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
-    match manager.resize(&req.session_id, req.cols, req.rows).await {
+    match manager.resize(&id, req.cols, req.rows).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
         Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
     }
 }
 
-async fn terminal_close(State(state): State<AppState>, Json(session_id): Json<String>) -> Json<serde_json::Value> {
+async fn terminal_close(State(state): State<AppState>, Path(id): Path<String>) -> Json<serde_json::Value> {
     let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
-    match manager.close_session(&session_id).await {
+    match manager.close_session(&id).await {
         Ok(_) => Json(serde_json::json!({ "ok": true })),
         Err(e) => Json(serde_json::json!({ "error": format!("{}", e) })),
     }
@@ -3062,7 +3277,69 @@ async fn terminal_list(State(state): State<AppState>) -> Json<serde_json::Value>
     let terminal_manager = state.terminal_manager.clone();
     let manager: tokio::sync::MutexGuard<'_, PtyManager> = terminal_manager.lock().await;
     let sessions = manager.list_sessions().await;
-    Json(serde_json::json!({ "sessions": sessions }))
+    Json(serde_json::to_value(sessions).unwrap_or_default())
+}
+
+/// SSE endpoint: streams PTY output to the frontend.
+/// Event data format: {"type":"data","data":"..."} or {"type":"exit","code":N}
+async fn terminal_stream(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    let terminal_manager = state.terminal_manager.clone();
+    let manager = terminal_manager.lock().await;
+    let Some((mut output_rx, mut exit_rx, _session)) = manager.get_stream(&id).await else {
+        let es = async_stream::stream! {
+            yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"error","error":"session not found"}).to_string()));
+        };
+        let mut r = Sse::new(es).keep_alive(KeepAlive::default()).into_response();
+        r.headers_mut().insert(CONTENT_TYPE, "text/event-stream; charset=utf-8".parse().unwrap());
+        return r;
+    };
+    drop(manager);
+
+    // If the session already exited, report it immediately
+    let initial_exit = *exit_rx.borrow();
+    let stream = async_stream::stream! {
+        if let Some(code) = initial_exit {
+            yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"exit","code":code}).to_string()));
+            yield Ok::<Event, Infallible>(Event::default().data("[CLOSED]".to_string()));
+            return;
+        }
+        loop {
+            tokio::select! {
+                res = output_rx.recv() => {
+                    match res {
+                        Ok(data) => {
+                            yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"data","data":data}).to_string()));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Channel closed: session gone, treat as exit
+                            yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"exit","code":null}).to_string()));
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            continue;
+                        }
+                    }
+                }
+                res = exit_rx.changed() => {
+                    if res.is_ok() {
+                        let code = *exit_rx.borrow();
+                        yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"exit","code":code}).to_string()));
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        yield Ok::<Event, Infallible>(Event::default().data("[CLOSED]".to_string()));
+    };
+
+    let mut resp = Sse::new(stream).keep_alive(KeepAlive::default()).into_response();
+    resp.headers_mut().insert(CONTENT_TYPE, "text/event-stream; charset=utf-8".parse().unwrap());
+    resp
 }
 
 #[derive(Deserialize)]

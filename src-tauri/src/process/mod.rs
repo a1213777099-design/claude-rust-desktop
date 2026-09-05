@@ -58,6 +58,12 @@ impl ProcessManager {
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
         if let Some(env) = env_vars {
             cmd.envs(env);
         }
@@ -95,6 +101,13 @@ impl ProcessManager {
         let _result = timeout(duration, async {
             let mut cmd = Command::new("wait");
             cmd.arg(pid.to_string());
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+
             cmd.output().await
         }).await;
 
@@ -117,10 +130,16 @@ impl ProcessManager {
 
         #[cfg(windows)]
         {
-            Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .output()
-                .await?;
+            let mut cmd = Command::new("taskkill");
+            cmd.args(["/F", "/PID", &pid.to_string()]);
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            }
+
+            cmd.output().await?;
         }
 
         #[cfg(not(windows))]

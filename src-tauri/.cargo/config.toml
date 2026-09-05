@@ -1,6 +1,8 @@
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
-rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=/STACK:33554432", "-C", "prefer-dynamic"]
+# prefer-dynamic 与 release 的 lto="thin" 冲突（rustc: cannot prefer dynamic linking when performing LTO）
+# 移除后 std 默认静态链接（prefer-dynamic=false），所有 profile 保持一致
+rustflags = ["-C", "link-arg=-fuse-ld=lld", "-C", "link-arg=/STACK:33554432"]
 
 [profile.dev]
 opt-level = 0

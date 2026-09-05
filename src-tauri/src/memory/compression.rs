@@ -109,10 +109,10 @@ impl ContextCompressor {
     fn simple_compress(&self, messages: &[CompressibleMessage]) -> Vec<CompressibleMessage> {
         let joined: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
         let text = joined.join("\n");
-        let max_chars = 500.min(text.len());
+        let max_bytes = 500.min(text.len());
         vec![CompressibleMessage {
             role: "system".to_string(),
-            content: format!("[Previous context summary ({} messages): {}]", messages.len(), &text[..max_chars]),
+            content: format!("[Previous context summary ({} messages): {}]", messages.len(), crate::truncate::safe_truncate(&text, max_bytes)),
             timestamp: messages.first().map(|m| m.timestamp).unwrap_or(0),
         }]
     }

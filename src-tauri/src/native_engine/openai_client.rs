@@ -228,7 +228,11 @@ impl OpenAIClient {
         }
 
         if extended_thinking {
+            // Anthropic 形态（部分网关识别）+ OpenAI o 系形态 + Qwen/DashScope 形态
+            // 三者同时下发：不识别的字段会被标准 OpenAI 端点忽略，识别其一即生效
             body["thinking"] = json!({"type": "enabled", "budget_tokens": 10000});
+            body["reasoning"] = json!({"effort": "medium"});
+            body["enable_thinking"] = json!(true);
         }
 
         if !tools.is_empty() {
@@ -306,7 +310,11 @@ impl OpenAIClient {
         }
 
         if extended_thinking {
+            // Anthropic 形态（部分网关识别）+ OpenAI o 系形态 + Qwen/DashScope 形态
+            // 三者同时下发：不识别的字段会被标准 OpenAI 端点忽略，识别其一即生效
             body["thinking"] = json!({"type": "enabled", "budget_tokens": 10000});
+            body["reasoning"] = json!({"effort": "medium"});
+            body["enable_thinking"] = json!(true);
         }
 
         if !tools.is_empty() {

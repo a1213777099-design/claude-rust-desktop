@@ -1,7 +1,7 @@
 {
   "name": "claude-desktop-tauri",
   "private": true,
-  "version": "2.1.2",
+  "version": "2.1.28",
   "type": "module",
   "scripts": {
     "dev": "vite",

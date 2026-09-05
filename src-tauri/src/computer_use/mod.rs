@@ -476,8 +476,16 @@ $bmp.Dispose()
 [Convert]::ToBase64String($ms.ToArray())
 "#;
 
-    let output = std::process::Command::new("powershell")
-        .args(&["-NoProfile", "-NonInteractive", "-Command", ps_script])
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(&["-NoProfile", "-NonInteractive", "-Command", ps_script]);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let output = cmd
         .output()
         .map_err(|e| anyhow!("Failed to spawn PowerShell for screenshot: {}", e))?;
 

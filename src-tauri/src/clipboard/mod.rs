@@ -18,9 +18,16 @@ impl ClipboardManager {
     #[cfg(windows)]
     pub fn read_text(&self) -> Result<String> {
         use std::process::Command;
-        let output = Command::new("powershell")
-            .args(["-Command", "Get-Clipboard -Text"])
-            .output()?;
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-Command", "Get-Clipboard -Text"]);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let output = cmd.output()?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
@@ -35,9 +42,16 @@ impl ClipboardManager {
     #[cfg(windows)]
     pub fn write_text(&self, text: &str) -> Result<()> {
         use std::process::Command;
-        Command::new("powershell")
-            .args(["-Command", &format!("Set-Clipboard -Value '{}'", text.replace("'", "''"))])
-            .output()?;
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-Command", &format!("Set-Clipboard -Value '{}'", text.replace("'", "''"))]);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        cmd.output()?;
         Ok(())
     }
 

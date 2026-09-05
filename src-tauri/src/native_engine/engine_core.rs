@@ -27,6 +27,7 @@ pub struct ChatRequest {
     pub web_search_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub extended_thinking: bool,
+    pub enable_streaming: bool,
 }
 
 #[derive(Debug)]
@@ -370,6 +371,23 @@ impl QueryEngine {
                 if content.is_empty() { None } else { Some((Uuid::new_v4().to_string(), content)) }
             })
             .collect();
+        // 工作区上下文块：把当前工作区绝对路径注入系统提示。弱工具调用模型
+        // （如 MiniMax-M3）不知道工作区根路径时往往不调用工具、凭记忆直接生成
+        // 文本（幻觉）。必须明确告诉它工作区在哪、必须用工具、路径怎么构造。
+        let workspace_block = if !workspace_path.is_empty() && workspace_path != "." {
+            Some(format!(
+                "当前工作区目录：{}\n\n你必须使用工具（Read / Write / Edit / Bash / Glob / Grep / ListDir）来读取和修改工作区内的文件，绝对不要凭记忆编造文件内容。\n文件路径请基于工作区根目录：可用相对路径（如 src/main.rs），也可用完整绝对路径。需要了解目录结构时先用 ListDir 或 Glob 查看。",
+                workspace_path
+            ))
+        } else {
+            None
+        };
+        let base_prompt = match (workspace_block, request.system_prompt.clone()) {
+            (Some(ws), Some(usr)) => format!("{}\n\n{}", ws, usr),
+            (Some(ws), None) => ws,
+            (None, Some(usr)) => usr,
+            (None, None) => String::new(),
+        };
         // Retrieve relevant memories for cross-session context (improved).
         // Primary path: TencentDB Agent Memory client (remote → local tiered fallback).
         let enhanced_system_prompt = {
@@ -424,13 +442,12 @@ impl QueryEngine {
                         .collect::<Vec<_>>()
                         .join("\n");
 
-                    let base_prompt = request.system_prompt.clone().unwrap_or_default();
                     Some(format!("{}\n\n[Relevant Memories — TencentDB]\n{}", base_prompt, memory_section))
                 } else {
-                    request.system_prompt.clone()
+                    Some(base_prompt)
                 }
             } else {
-                request.system_prompt.clone()
+                Some(base_prompt)
             }
         };
 
@@ -447,7 +464,8 @@ impl QueryEngine {
         .with_permission_manager(self.permission_manager.clone())
         .with_web_search_enabled(request.web_search_enabled.unwrap_or(false))
                 .with_reasoning_effort(request.reasoning_effort)
-                .with_extended_thinking(request.extended_thinking);
+                .with_extended_thinking(request.extended_thinking)
+                .with_streaming(request.enable_streaming);
         if let Some(ref registry) = self.mcp_registry {
             executor = executor.with_mcp_registry(registry.clone());
         }
@@ -471,18 +489,10 @@ impl QueryEngine {
                             let content = content.clone();
                             tokio::task::spawn_blocking(move || {
                                 db_user.with_conn(|conn| {
-                                    let existing: i64 = conn.query_row(
-                                        "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND role=?2 AND content=?3",
-                                        rusqlite::params![conv_id_user, "user", content],
-                                        |row| row.get(0),
-                                    ).unwrap_or(0);
-                                    if existing == 0 {
-                                        let now = Utc::now().to_rfc3339();
-                                        let so = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_user)
-                                            .unwrap_or_default().len() as i64;
-                                        let _ = crate::db::message_repo::insert_message(conn, &msg_id, &conv_id_user, "user", &content, None, &now, false, so);
-                                        let _ = crate::db::conversation_repo::increment_message_count(conn, &conv_id_user);
-                                    }
+                                    let now = Utc::now().to_rfc3339();
+                                    let so = crate::db::message_repo::next_sort_order(conn, &conv_id_user);
+                                    let _ = crate::db::message_repo::insert_message(conn, &msg_id, &conv_id_user, "user", &content, None, &now, false, so);
+                                    let _ = crate::db::conversation_repo::increment_message_count(conn, &conv_id_user);
                                 })
                             }).await.ok();
                         }
@@ -494,9 +504,7 @@ impl QueryEngine {
                             db.with_conn(|conn| {
                                 let msg_id = Uuid::new_v4().to_string();
                                 let now = Utc::now().to_rfc3339();
-                                let sort_order = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id)
-                                    .unwrap_or_default()
-                                    .len() as i64;
+                                let sort_order = crate::db::message_repo::next_sort_order(conn, &conv_id);
                                 crate::db::message_repo::insert_message(
                                     conn, &msg_id, &conv_id, "assistant", &full_text, None, &now, false, sort_order,
                                 )?;

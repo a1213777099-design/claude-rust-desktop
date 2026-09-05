@@ -253,6 +253,9 @@ const ProviderSettings: React.FC = () => {
   // Absence means "never tested" (show as not supported).
   const [webSearchTestState, setWebSearchTestState] = useState<Record<string, 'testing' | 'success' | 'failed'>>({});
 
+  // 请求模式：非流式（更稳定）vs 流式。全局开关，与 reasoning_effort 同存于 localStorage。
+  const [nonStreaming, setNonStreaming] = useState(() => { try { return localStorage.getItem('non_streaming') === '1'; } catch { return false; } });
+
   // New provider form
   const [showAdd, setShowAdd] = useState(false);
   const [newUrl, setNewUrl] = useState('');
@@ -568,6 +571,29 @@ const ProviderSettings: React.FC = () => {
               </div>
             );
           })}
+        </div>
+
+        {/* 请求模式：非流式（更稳定） vs 流式 */}
+        <div className="flex items-center justify-between px-4 py-3 rounded-[12px] border border-claude-border/40 bg-claude-input">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-medium text-claude-text">非流式请求模式</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-medium">更稳定</span>
+            </div>
+            <div className="text-[11px] text-claude-textSecondary/70 leading-relaxed mt-0.5">
+              实验性：部分模型供应商的流式 tools 路径偶发卡顿/超时。开启后改为一次性非流式请求（模拟流式出字），工具调用路径更稳定。
+            </div>
+          </div>
+          <button
+            onClick={() => {
+              const next = !nonStreaming;
+              try { localStorage.setItem('non_streaming', next ? '1' : '0'); } catch {}
+              setNonStreaming(next);
+            }}
+            className={`w-10 h-6 rounded-full relative transition-colors flex-shrink-0 ml-3 ${nonStreaming ? 'bg-[#387ee0]' : 'bg-claude-border'}`}
+          >
+            <div className={`absolute top-1 w-4 h-4 rounded-full bg-white shadow-sm transition-transform ${nonStreaming ? 'left-5' : 'left-1'}`} />
+          </button>
         </div>
 
         
